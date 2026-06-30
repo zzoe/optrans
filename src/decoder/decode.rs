@@ -1,0 +1,523 @@
+//! 帧解码模块
+//!
+//! 从截屏像素中完整解码一帧：
+//! 1. 提取格式信息并解码（三重投票 + CRC 校验）
+//! 2. 提取数据载荷并 RS 解码
+//! v0.2 新增：frame_kind / encoding_mode 解析、P 帧 payload 解析、自动检测。
+
+use crate::common::constants::FORMAT_INFO_ENCODED_BITS;
+use crate::common::crc::crc16_xmodem;
+use crate::common::error::{OptransError, OptransResult};
+use crate::common::types::{
+    DecodedFrame, DiffEntry, EncodingMode, FormatInfo, FrameKind, FrameLocation, FrameType,
+    GrayEncodingConfig, MetaPayload,
+};
+use crate::decoder::extract;
+use crate::decoder::reed_solomon::rs_decode_data;
+
+/// 从截屏中解码格式信息
+pub fn decode_format_info(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+) -> OptransResult<FormatInfo> {
+    let raw_bits = extract::extract_format_modules(pixels, img_width, img_height, loc);
+
+    if raw_bits.len() < FORMAT_INFO_ENCODED_BITS {
+        return Err(OptransError::InvalidFormatInfo(format!(
+            "格式信息比特不足: 需要 {} bits，实际 {} bits",
+            FORMAT_INFO_ENCODED_BITS,
+            raw_bits.len()
+        )));
+    }
+
+    let encoded_bits = &raw_bits[..FORMAT_INFO_ENCODED_BITS];
+
+    let mut decoded_15bytes = vec![0u8; 15];
+    for byte_idx in 0..15 {
+        let mut byte_val: u8 = 0;
+        for bit in 0..8 {
+            let bit_pos = byte_idx * 8 + bit;
+            let v0 = encoded_bits[bit_pos] as u32;
+            let v1 = encoded_bits[bit_pos + 120] as u32;
+            let v2 = encoded_bits[bit_pos + 240] as u32;
+            let majority = if v0 + v1 + v2 >= 2 { 1 } else { 0 };
+            byte_val |= majority << bit;
+        }
+        decoded_15bytes[byte_idx] = byte_val;
+    }
+
+    let data_part = &decoded_15bytes[..13];
+    let crc_received = u16::from_le_bytes(
+        decoded_15bytes[13..15]
+            .try_into()
+            .map_err(|_| OptransError::InvalidFormatInfo("CRC 提取失败".to_string()))?,
+    );
+
+    let crc_computed = crc16_xmodem(data_part);
+    if crc_computed != crc_received {
+        return Err(OptransError::InvalidFormatInfo(format!(
+            "CRC 校验失败: 计算 0x{:04X}, 收到 0x{:04X}",
+            crc_computed, crc_received
+        )));
+    }
+
+    unpack_format_info(data_part)
+}
+
+/// 从格式信息中检测编码模式
+pub fn detect_encoding_mode(format_info: &FormatInfo) -> EncodingMode {
+    if format_info.encoding_mode_bit == 0 {
+        EncodingMode::Binary
+    } else {
+        EncodingMode::Gray(crate::common::constants::GRAY_LEVELS_DEFAULT)
+    }
+}
+
+/// 计算灰度编码模式下的模块数
+fn calc_gray_module_count(byte_count: usize, levels: u32) -> usize {
+    match levels {
+        2 => byte_count * 8,
+        4 => byte_count * 4,
+        5 => ((byte_count + 1) / 2) * 7,
+        8 => (byte_count * 8 + 2) / 3,
+        16 => byte_count * 2,
+        _ => byte_count * 8,
+    }
+}
+
+/// 解码帧的数据载荷（含模块灰度值）
+///
+/// v0.2: 返回 (RS解码后的载荷, 数据模块原始值序列)
+/// - I 帧：模块值用于缓存（供后续 P 帧合并）
+/// - P 帧：模块值为空（P 帧 payload 已是 diff entries）
+pub fn decode_payload(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+    info: &FormatInfo,
+    encoding_mode: &EncodingMode,
+) -> OptransResult<(Vec<u8>, Vec<u8>)> {
+    if info.payload_bytes == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let payload_bytes = info.payload_bytes as usize;
+    let num_rs_blocks = (payload_bytes + crate::common::constants::RS_DATA_LEN - 1)
+        / crate::common::constants::RS_DATA_LEN;
+    let encoded_bytes = 4 + num_rs_blocks * crate::common::constants::RS_TOTAL_LEN;
+
+    let encoded_bits = match encoding_mode {
+        EncodingMode::Gray(levels) => calc_gray_module_count(encoded_bytes, *levels),
+        _ => encoded_bytes * 8,
+    };
+
+    // 提取数据模块原始值
+    let module_values = extract::extract_data_modules(
+        pixels,
+        img_width,
+        img_height,
+        loc,
+        encoded_bits,
+        encoding_mode,
+    );
+
+    if module_values.len() < encoded_bits {
+        return Err(OptransError::FrameDecode(format!(
+            "数据模块值不足: 需要 {} modules，实际 {} modules",
+            encoded_bits,
+            module_values.len()
+        )));
+    }
+
+    // 模块值 → 字节（仅使用需要的模块数）
+    let relevant_modules = &module_values[..encoded_bits];
+    let encoded_data = match encoding_mode {
+        EncodingMode::Gray(levels) => {
+            let config = GrayEncodingConfig::new(*levels);
+            extract::decode_gray_n(relevant_modules, *levels, &config.thresholds, encoded_bytes)
+        }
+        _ => {
+            let mut data = Vec::with_capacity(encoded_bytes);
+            for byte_idx in 0..encoded_bytes {
+                let mut byte_val: u8 = 0;
+                for bit in 0..8 {
+                    let bit_pos = byte_idx * 8 + bit;
+                    if bit_pos < relevant_modules.len() && relevant_modules[bit_pos] == 1 {
+                        byte_val |= 1 << bit;
+                    }
+                }
+                data.push(byte_val);
+            }
+            data
+        }
+    };
+
+    // v0.6: 反向应用数据掩码（XOR 自反），恢复原始 RS 编码字节
+    let encoded_data = crate::common::mask::apply_mask(&encoded_data);
+
+    // RS 解码
+    let decoded = rs_decode_data(&encoded_data)?;
+
+    // 返回 (解码后载荷, 模块原始值) — 模块值用于 I 帧缓存
+    Ok((decoded, relevant_modules.to_vec()))
+}
+
+/// 解析 P 帧载荷中的 diff entries
+pub fn decode_p_frame_payload(payload: &[u8]) -> OptransResult<(u16, Vec<DiffEntry>)> {
+    if payload.len() < 4 {
+        return Err(OptransError::FrameDecode("P 帧载荷不足，无法解析".to_string()));
+    }
+
+    let base_frame_seq = u16::from_le_bytes(
+        payload[..2]
+            .try_into()
+            .map_err(|_| OptransError::FrameDecode("base_frame_seq 解析失败".to_string()))?,
+    );
+
+    let module_count = u16::from_le_bytes(
+        payload[2..4]
+            .try_into()
+            .map_err(|_| OptransError::FrameDecode("module_count 解析失败".to_string()))?,
+    ) as usize;
+
+    let expected_len = 4 + module_count * 3;
+    if payload.len() < expected_len {
+        return Err(OptransError::FrameDecode(format!(
+            "P 帧载荷不足: 需要 {} bytes，实际 {} bytes",
+            expected_len,
+            payload.len()
+        )));
+    }
+
+    let mut entries = Vec::with_capacity(module_count);
+    for i in 0..module_count {
+        let offset = 4 + i * 3;
+        let module_index = u16::from_le_bytes(
+            payload[offset..offset + 2]
+                .try_into()
+                .map_err(|_| OptransError::FrameDecode("module_index 解析失败".to_string()))?,
+        );
+        let module_value = payload[offset + 2];
+        entries.push(DiffEntry {
+            module_index,
+            module_value,
+        });
+    }
+
+    Ok((base_frame_seq, entries))
+}
+
+/// 完整解码一帧（格式信息 + 载荷 + 模块值）
+pub fn decode_frame(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+    encoding_mode: &EncodingMode,
+) -> OptransResult<DecodedFrame> {
+    let format_info = decode_format_info(pixels, img_width, img_height, loc)?;
+
+    let actual_mode = match encoding_mode {
+        EncodingMode::Auto => detect_encoding_mode(&format_info),
+        other => other.clone(),
+    };
+
+    let (payload, module_values) =
+        decode_payload(pixels, img_width, img_height, loc, &format_info, &actual_mode)?;
+
+    // P 帧：从 payload 提取 base_frame_seq
+    let base_frame_seq = match format_info.frame_kind {
+        FrameKind::P => {
+            if payload.len() >= 4 {
+                Some(u16::from_le_bytes(payload[..2].try_into().unwrap_or([0, 0])))
+            } else {
+                None
+            }
+        }
+        FrameKind::I => None,
+    };
+
+    Ok(DecodedFrame {
+        frame_type: format_info.frame_type,
+        frame_sequence: format_info.frame_sequence,
+        block_index: format_info.block_index,
+        total_blocks: format_info.total_blocks,
+        payload,
+        frame_kind: format_info.frame_kind,
+        encoding_mode: actual_mode,
+        base_frame_seq,
+        data_module_values: module_values,
+    })
+}
+
+/// 从解码后的元数据帧载荷中解析 MetaPayload
+pub fn parse_meta_payload(payload: &[u8]) -> OptransResult<MetaPayload> {
+    if payload.is_empty() {
+        return Err(OptransError::FrameDecode("元数据载荷为空".to_string()));
+    }
+
+    let mut offset = 0usize;
+
+    if offset >= payload.len() {
+        return Err(OptransError::FrameDecode(
+            "元数据格式错误：缺少文件名长度".to_string(),
+        ));
+    }
+    let name_len = payload[offset] as usize;
+    offset += 1;
+
+    if offset + name_len > payload.len() {
+        return Err(OptransError::FrameDecode(
+            "元数据格式错误：文件名超出边界".to_string(),
+        ));
+    }
+    let file_name = String::from_utf8(payload[offset..offset + name_len].to_vec())
+        .map_err(|e| OptransError::FrameDecode(format!("文件名 UTF-8 解码失败: {}", e)))?;
+    offset += name_len;
+
+    if offset + 8 > payload.len() {
+        return Err(OptransError::FrameDecode(
+            "元数据格式错误：缺少文件大小".to_string(),
+        ));
+    }
+    let file_size = u64::from_le_bytes(
+        payload[offset..offset + 8]
+            .try_into()
+            .map_err(|_| OptransError::FrameDecode("文件大小解析失败".to_string()))?,
+    );
+    offset += 8;
+
+    if offset + 32 > payload.len() {
+        return Err(OptransError::FrameDecode(
+            "元数据格式错误：缺少 SHA-256".to_string(),
+        ));
+    }
+    let mut sha256 = [0u8; 32];
+    sha256.copy_from_slice(&payload[offset..offset + 32]);
+    offset += 32;
+
+    if offset + 4 > payload.len() {
+        return Err(OptransError::FrameDecode(
+            "元数据格式错误：缺少总块数".to_string(),
+        ));
+    }
+    let total_blocks = u32::from_le_bytes(
+        payload[offset..offset + 4]
+            .try_into()
+            .map_err(|_| OptransError::FrameDecode("总块数解析失败".to_string()))?,
+    );
+
+    Ok(MetaPayload {
+        file_name,
+        file_size,
+        sha256,
+        total_blocks,
+    })
+}
+
+/// 从 FormatInfo 打包的 13 字节解包
+fn unpack_format_info(data: &[u8]) -> OptransResult<FormatInfo> {
+    if data.len() < 13 {
+        return Err(OptransError::InvalidFormatInfo(format!(
+            "格式信息数据不足: 需要 13 bytes，实际 {} bytes",
+            data.len()
+        )));
+    }
+
+    let mut val: u128 = 0;
+    for i in 0..13 {
+        val |= (data[i] as u128) << (i * 8);
+    }
+
+    let frame_type_raw = (val & 0x3) as u8;
+    let frame_sequence = ((val >> 2) & 0xFFFF) as u16;
+    let block_index = ((val >> 18) & 0xFFFF_FFFF) as u32;
+    let total_blocks = ((val >> 50) & 0xFFFF_FFFF) as u32;
+    let payload_bytes = ((val >> 82) & 0xFFFF) as u16; // 16 bits (v0.6)
+    let frame_kind_val = ((val >> 98) & 0x1) as u8;
+    let encoding_mode_bit = ((val >> 99) & 0x1) as u8;
+
+    let frame_type = FrameType::from_u8(frame_type_raw).ok_or_else(|| {
+        OptransError::InvalidFormatInfo(format!("未知帧类型: {}", frame_type_raw))
+    })?;
+
+    let frame_kind = FrameKind::from_u8(frame_kind_val).unwrap_or(FrameKind::I);
+
+    Ok(FormatInfo {
+        frame_type,
+        frame_sequence,
+        block_index,
+        total_blocks,
+        payload_bytes,
+        frame_kind,
+        encoding_mode_bit,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unpack_format_info_roundtrip() {
+        let info = FormatInfo {
+            frame_type: FrameType::Data,
+            frame_sequence: 42,
+            block_index: 100,
+            total_blocks: 500,
+            payload_bytes: 2000,
+            frame_kind: FrameKind::I,
+            encoding_mode_bit: 0,
+        };
+
+        let mut packed = vec![0u8; 13];
+        {
+            let mut val: u128 = 0;
+            val |= info.frame_type as u128;
+            val |= (info.frame_sequence as u128) << 2;
+            val |= (info.block_index as u128) << 18;
+            val |= (info.total_blocks as u128) << 50;
+            val |= (info.payload_bytes as u128) << 82;
+            val |= (info.frame_kind as u128) << 98;
+            val |= (info.encoding_mode_bit as u128) << 99;
+            for i in 0..13 {
+                packed[i] = ((val >> (i * 8)) & 0xFF) as u8;
+            }
+        }
+
+        let unpacked = unpack_format_info(&packed).unwrap();
+        assert_eq!(unpacked.frame_type, FrameType::Data);
+        assert_eq!(unpacked.frame_sequence, 42);
+        assert_eq!(unpacked.block_index, 100);
+        assert_eq!(unpacked.total_blocks, 500);
+        assert_eq!(unpacked.payload_bytes, 2000);
+        assert_eq!(unpacked.frame_kind, FrameKind::I);
+        assert_eq!(unpacked.encoding_mode_bit, 0);
+    }
+
+    #[test]
+    fn test_unpack_format_info_v02() {
+        let info = FormatInfo {
+            frame_type: FrameType::Data,
+            frame_sequence: 7,
+            block_index: 3,
+            total_blocks: 10,
+            payload_bytes: 500,
+            frame_kind: FrameKind::P,
+            encoding_mode_bit: 1,
+        };
+
+        let mut packed = vec![0u8; 13];
+        {
+            let mut val: u128 = 0;
+            val |= info.frame_type as u128;
+            val |= (info.frame_sequence as u128) << 2;
+            val |= (info.block_index as u128) << 18;
+            val |= (info.total_blocks as u128) << 50;
+            val |= (info.payload_bytes as u128) << 82;
+            val |= (info.frame_kind as u128) << 98;
+            val |= (info.encoding_mode_bit as u128) << 99;
+            for i in 0..13 {
+                packed[i] = ((val >> (i * 8)) & 0xFF) as u8;
+            }
+        }
+
+        let unpacked = unpack_format_info(&packed).unwrap();
+        assert_eq!(unpacked.frame_type, FrameType::Data);
+        assert_eq!(unpacked.frame_kind, FrameKind::P);
+        assert_eq!(unpacked.encoding_mode_bit, 1);
+    }
+
+    #[test]
+    fn test_unpack_format_info_payload_16bit() {
+        // v0.6: payload_bytes 扩展到 16 bits，测试边界值 65535
+        let info = FormatInfo {
+            frame_type: FrameType::Data,
+            frame_sequence: 1,
+            block_index: 0,
+            total_blocks: 1,
+            payload_bytes: 65535,
+            frame_kind: FrameKind::I,
+            encoding_mode_bit: 0,
+        };
+
+        let mut packed = vec![0u8; 13];
+        let mut val: u128 = 0;
+        val |= info.frame_type as u128;
+        val |= (info.frame_sequence as u128) << 2;
+        val |= (info.block_index as u128) << 18;
+        val |= (info.total_blocks as u128) << 50;
+        val |= (info.payload_bytes as u128) << 82;
+        val |= (info.frame_kind as u128) << 98;
+        val |= (info.encoding_mode_bit as u128) << 99;
+        for i in 0..13 {
+            packed[i] = ((val >> (i * 8)) & 0xFF) as u8;
+        }
+
+        let unpacked = unpack_format_info(&packed).unwrap();
+        assert_eq!(unpacked.payload_bytes, 65535);
+    }
+
+    #[test]
+    fn test_parse_meta_payload() {
+        let mut payload = Vec::new();
+        let file_name = "test.dat";
+        payload.push(file_name.len() as u8);
+        payload.extend_from_slice(file_name.as_bytes());
+        payload.extend_from_slice(&12345u64.to_le_bytes());
+        payload.extend_from_slice(&[0xAB; 32]);
+        payload.extend_from_slice(&10u32.to_le_bytes());
+
+        let meta = parse_meta_payload(&payload).unwrap();
+        assert_eq!(meta.file_name, "test.dat");
+        assert_eq!(meta.file_size, 12345);
+        assert_eq!(meta.sha256, [0xAB; 32]);
+        assert_eq!(meta.total_blocks, 10);
+    }
+
+    #[test]
+    fn test_decode_p_frame_payload() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&3u16.to_le_bytes());
+        payload.extend_from_slice(&2u16.to_le_bytes());
+        payload.extend_from_slice(&10u16.to_le_bytes());
+        payload.push(128u8);
+        payload.extend_from_slice(&20u16.to_le_bytes());
+        payload.push(64u8);
+
+        let (base_seq, entries) = decode_p_frame_payload(&payload).unwrap();
+        assert_eq!(base_seq, 3);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].module_index, 10);
+        assert_eq!(entries[0].module_value, 128);
+        assert_eq!(entries[1].module_index, 20);
+        assert_eq!(entries[1].module_value, 64);
+    }
+
+    #[test]
+    fn test_detect_encoding_mode() {
+        let binary_info = FormatInfo {
+            encoding_mode_bit: 0,
+            ..FormatInfo::new_eot(0)
+        };
+        assert_eq!(detect_encoding_mode(&binary_info), EncodingMode::Binary);
+
+        let gray_info = FormatInfo {
+            encoding_mode_bit: 1,
+            ..FormatInfo::new_eot(0)
+        };
+        assert!(matches!(detect_encoding_mode(&gray_info), EncodingMode::Gray(_)));
+    }
+
+    #[test]
+    fn test_calc_gray_module_count() {
+        assert_eq!(calc_gray_module_count(100, 2), 800);
+        assert_eq!(calc_gray_module_count(100, 4), 400);
+        assert_eq!(calc_gray_module_count(100, 5), 350);
+        assert_eq!(calc_gray_module_count(100, 8), 267);
+        assert_eq!(calc_gray_module_count(100, 16), 200);
+    }
+}
