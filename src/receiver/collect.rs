@@ -64,46 +64,95 @@ impl FrameCollector {
 
     /// 摄入 I 帧：正常处理 + 缓存模块值
     fn ingest_i_frame(&mut self, frame: DecodedFrame) -> OptransResult<IngestResult> {
-        match frame.frame_type {
+        let result = match frame.frame_type {
             FrameType::Meta => {
                 let meta = parse_meta_payload(&frame.payload)?;
                 self.total_blocks = meta.total_blocks;
                 self.meta = Some(meta.clone());
-                Ok(IngestResult::NewMeta(meta))
+                IngestResult::NewMeta(meta)
             }
-            FrameType::Data => self.ingest_data_blocks(&frame),
-            FrameType::EOT => Ok(IngestResult::EotReceived),
-        }
+            FrameType::Data => {
+                // v0.9: 尝试多块合并格式 [count: u16 LE][entries...]
+                // 如果 payload 以 count 开头且可以成功解析，则按多块处理；
+                // 否则回退到单块格式 [block_index: u32 LE][data]
+                if let Some(result) = self.try_ingest_multi_block(&frame) {
+                    return Ok(result);
+                }
+
+                if frame.payload.len() < 4 {
+                    return Err(OptransError::FrameDecode(
+                        "数据帧载荷不足，无法提取 block_index".to_string(),
+                    ));
+                }
+                let block_index = u32::from_le_bytes(
+                    frame.payload[..4]
+                        .try_into()
+                        .map_err(|_| {
+                            OptransError::FrameDecode("block_index 解析失败".to_string())
+                        })?,
+                );
+                let block_data_len = frame.payload[4..].len();
+                let block_data = frame.payload[4..].to_vec();
+                self.data_blocks.insert(block_index, block_data);
+
+                // 缓存 I 帧数据模块值（用于后续 P 帧合并）
+                if !frame.data_module_values.is_empty() {
+                    self.cache_i_frame(
+                        frame.data_module_values,
+                        frame.frame_sequence,
+                        (block_data_len + 4) as u16,
+                    );
+                }
+
+                IngestResult::NewBlock(block_index)
+            }
+            FrameType::EOT => IngestResult::EotReceived,
+        };
+
+        Ok(result)
     }
 
-    /// 解析数据帧 payload，v0.9 支持多块合并格式 [count: u16 LE][entries...]
-    fn ingest_data_blocks(&mut self, frame: &DecodedFrame) -> OptransResult<IngestResult> {
+    /// v0.9: 尝试解析多块合并数据帧格式 [count: u16 LE][entries...]
+    /// 成功返回 Some(IngestResult)，格式不匹配返回 None
+    fn try_ingest_multi_block(&mut self, frame: &DecodedFrame) -> Option<IngestResult> {
         let payload = &frame.payload;
         if payload.len() < 2 {
-            return Err(OptransError::FrameDecode("数据帧载荷不足".to_string()));
+            return None;
         }
 
         let count = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+        if count == 0 || count > 1000 {
+            return None;
+        }
+
         let mut offset = 2usize;
         let mut last_result = IngestResult::NewBlock(0);
+        let mut blocks_ingested = 0usize;
 
         for _ in 0..count {
-            if offset + 6 > payload.len() { break; }
+            if offset + 6 > payload.len() {
+                return None; // 格式不完整
+            }
             let block_index = u32::from_le_bytes(
-                payload[offset..offset+4].try_into()
-                    .map_err(|_| OptransError::FrameDecode("block_index 解析失败".to_string()))?
+                payload[offset..offset+4].try_into().ok()?
             );
             let data_len = u16::from_le_bytes(
-                payload[offset+4..offset+6].try_into()
-                    .map_err(|_| OptransError::FrameDecode("data_len 解析失败".to_string()))?
+                payload[offset+4..offset+6].try_into().ok()?
             ) as usize;
             offset += 6;
-            if offset + data_len > payload.len() { break; }
+            if offset + data_len > payload.len() {
+                return None;
+            }
             let block_data = payload[offset..offset+data_len].to_vec();
             offset += data_len;
 
             self.data_blocks.insert(block_index, block_data);
             last_result = IngestResult::NewBlock(block_index);
+            blocks_ingested += 1;
+        }
+
+        if blocks_ingested == 0 {
+            return None;
         }
 
         // 缓存 I 帧数据模块值（用于后续 P 帧合并）
@@ -115,7 +164,7 @@ impl FrameCollector {
             );
         }
 
-        Ok(last_result)
+        Some(last_result)
     }
 
     /// 摄入 P 帧：校验 → merge → 灰度解码 → RS 解码 → 模拟 I 帧
