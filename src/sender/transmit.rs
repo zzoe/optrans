@@ -150,54 +150,6 @@ fn frame_capacity_for_modules(
     (modules_w, modules_h, max_payload)
 }
 
-/// 根据实际 payload 大小反算最小帧尺寸（不超过 max_w × max_h）
-///
-/// 小文件用小帧避免 90% 空白，大文件用全屏最大化效率。
-fn fit_frame_for_payload(
-    payload_bytes: usize,
-    gray_config: &GrayEncodingConfig,
-    max_w: u32,
-    max_h: u32,
-) -> (u32, u32) {
-    use crate::common::constants::{RS_DATA_LEN, RS_TOTAL_LEN};
-
-    let gray_levels = gray_config.levels;
-    let num_rs_blocks = (payload_bytes + RS_DATA_LEN - 1) / RS_DATA_LEN;
-    let encoded_bytes = 4 + num_rs_blocks * RS_TOTAL_LEN;
-    let needed_modules = match gray_levels {
-        2 => encoded_bytes * 8,
-        4 => encoded_bytes * 4,
-        5 => ((encoded_bytes + 1) / 2) * 7,
-        8 => (encoded_bytes * 8 + 2) / 3,
-        16 => encoded_bytes * 2,
-        _ => encoded_bytes * 8,
-    };
-
-    // 从 min_w=194 开始逐次增大，找到刚好够用的尺寸
-    let min_w = 194u32;
-    let mut mw = min_w;
-    let mut mh = 50u32;
-
-    loop {
-        if mw > max_w {
-            mh += 5;
-            mw = min_w;
-            if mh > max_h {
-                return (max_w, max_h); // 回退到全屏
-            }
-            continue;
-        }
-        let available = (mw as usize * mh as usize)
-            .saturating_sub(147 + 2 * (mw as usize - 14));
-        if available >= needed_modules && 2 * (mw as usize - 14) >= 360 {
-            break;
-        }
-        mw += 5;
-    }
-
-    (mw.min(max_w), mh.min(max_h))
-}
-
 /// 将单个 block 的 RS 编码数据渲染为数据模块灰度值序列
 fn block_to_gray_modules(
     payload: &[u8],
@@ -246,7 +198,7 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
     );
 
     // 1. 根据屏幕尺寸计算每帧最大容量
-    let (_modules_w, _modules_h, max_payload_per_frame) = calculate_frame_capacity(
+    let (modules_w, modules_h, max_payload_per_frame) = calculate_frame_capacity(
         module_pixels,
         &gray_config,
     );
@@ -271,49 +223,31 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
 
     let total_blocks = manifest.blocks.len() as u32;
 
-    // 3. 根据实际数据量动态调整帧尺寸
-    //    大文件用全屏最大化效率，小文件缩到刚好容纳数据（避免 90% 空白）
-    let meta_payload_len = 1 + manifest.file_name.len() + 8 + 32 + 4;
-    let max_data_payload = manifest.blocks.iter()
-        .map(|b| 4 + b.data.len())
-        .max()
-        .unwrap_or(0);
-    let actual_max_payload = meta_payload_len.max(max_data_payload);
-
-    // 反算容纳此 payload 需要的帧尺寸
-    let (modules_w, modules_h) = {
-        let screen_w = unsafe { crate::win32::ffi::GetSystemMetrics(crate::win32::ffi::SM_CXSCREEN) };
-        let screen_h = unsafe { crate::win32::ffi::GetSystemMetrics(crate::win32::ffi::SM_CYSCREEN) };
-        let max_w = screen_w as u32 / module_pixels;
-        let max_h = screen_h as u32 / module_pixels;
-        fit_frame_for_payload(actual_max_payload, &gray_config, max_w, max_h)
-    };
-
-    // 4. 预构建元数据帧和 EOT 帧
+    // 3. 预构建元数据帧和 EOT 帧（始终 I 帧、二值模式）
     let meta_frame = Frame::new_metadata(&manifest, 0)?;
-    let eot_seq = 1u16 + total_blocks as u16;
+
+    let eot_seq = 1u16 + total_blocks as u16; // meta(seq=0) + data blocks
     let eot_frame = Frame::new_eot(eot_seq)?;
 
-    // 5. 创建窗口（尺寸按实际数据量动态适配）
+    // 4. 创建全屏最大化窗口
     let mut window = SenderWindow::create_sized(module_pixels, modules_w, modules_h)?;
 
     let n_w = modules_w as usize;
     let n_h = modules_h as usize;
 
     eprintln!(
-        "[optrans] 帧尺寸: {}w×{}h modules ({}×{}px, payload≤{}B → {:.0}%填充)",
+        "[optrans] 帧尺寸: {}w×{}h modules ({}×{}px, max_payload={}B)",
         modules_w, modules_h,
         modules_w * module_pixels, modules_h * module_pixels,
-        actual_max_payload,
-        actual_max_payload as f64 / max_payload_per_frame as f64 * 100.0
+        max_payload_per_frame
     );
     eprintln!("[optrans] 开始发送...");
 
-    // 6. 维护发送端缓存和状态
+    // 4. 维护发送端缓存和状态
     let mut cache: Option<SenderCache> = None;
     let mut global_seq: u16 = 0; // 跨轮全局序号
 
-    // 7. 循环发送
+    // 5. 循环发送
     for round in 0..rounds {
         if !window.process_messages() {
             eprintln!("[optrans] 用户中止发送");
