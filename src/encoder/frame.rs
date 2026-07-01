@@ -93,6 +93,53 @@ impl Frame {
         })
     }
 
+    /// 构建多块合并数据帧（I 帧，v0.9）
+    ///
+    /// 将多个数据块打包到一个帧中，填满 payload 容量。
+    /// 载荷格式：[count: u16 LE][entries...]
+    /// 每个 entry：[block_index: u32 LE][data_len: u16 LE][data: data_len bytes]
+    pub fn new_data_merged(
+        blocks: &[&BlockData],
+        seq: u16,
+        total_blocks: u32,
+        encoding_mode_bit: u8,
+    ) -> OptransResult<Frame> {
+        // 计算总载荷大小
+        let payload_len: usize = 2 + blocks.iter()
+            .map(|b| 4 + 2 + b.data.len()) // index(4) + len(2) + data
+            .sum::<usize>();
+
+        let mut payload = Vec::with_capacity(payload_len);
+        let count = blocks.len() as u16;
+        payload.extend_from_slice(&count.to_le_bytes());
+
+        for block in blocks {
+            payload.extend_from_slice(&block.index.to_le_bytes());
+            let data_len = block.data.len() as u16;
+            payload.extend_from_slice(&data_len.to_le_bytes());
+            payload.extend_from_slice(&block.data);
+        }
+
+        let first_index = blocks.first().map(|b| b.index).unwrap_or(0);
+        let info = FormatInfo::new_data(
+            seq,
+            first_index,
+            total_blocks,
+            payload.len() as u16,
+            FrameKind::I,
+            encoding_mode_bit,
+        );
+
+        let encoder = RsEncoder::new();
+        let encoded_payload = encoder.encode(&payload)?;
+
+        Ok(Frame {
+            format_info: info,
+            encoded_payload,
+            frame_kind: FrameKind::I,
+        })
+    }
+
     /// 构建 P 帧（差分帧）
     ///
     /// P 帧 payload 结构（RS 编码前）：
