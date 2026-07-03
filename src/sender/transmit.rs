@@ -154,6 +154,22 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
 
     let mut global_seq: u16 = 0;
 
+    // 元数据 payload 大小
+    let meta_payload = {
+        let mut p = Vec::new();
+        p.push(manifest.file_name.as_bytes().len() as u8);
+        p.extend_from_slice(manifest.file_name.as_bytes());
+        p.extend_from_slice(&manifest.file_size.to_le_bytes());
+        p.extend_from_slice(&manifest.sha256);
+        p.extend_from_slice(&(manifest.blocks.len() as u32).to_le_bytes());
+        p
+    };
+    let meta_payload_len = meta_payload.len();
+
+    // 检查是否可以将元数据合并到第一个数据帧（小文件优化）
+    let can_merge_meta = total_blocks == 1
+        && 2 + 4 + 2 + meta_payload_len + 4 + 2 + manifest.blocks[0].data.len() <= max_payload_per_frame;
+
     // 循环发送
     for round in 0..rounds {
         if !window.process_messages() {
@@ -163,33 +179,40 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
 
         eprintln!("[optrans] --- 第 {} 轮 (共 {} 轮) ---", round + 1, rounds);
 
-        // 每轮先发送元数据帧（始终 I 帧、二值渲染）
-        {
-            if !window.process_messages() {
-                eprintln!("[optrans] 用户中止发送");
-                return Ok(());
-            }
-            let meta_gray_config = GrayEncodingConfig::new(2); // 元数据帧始终二值
-            let pixels = render_frame_default(&meta_frame, module_pixels, modules_w, modules_h, &meta_gray_config, false, None);
-            window.update_bitmap(&pixels);
-            eprintln!("  [META] seq={}", meta_frame.sequence());
-            global_seq += 1;
-
-            // 首轮：元数据帧已显示，3 秒倒计时后自动开始发送数据
+        if can_merge_meta {
+            // 小文件：元数据 + 数据合并到一个帧，直接进入数据发送
             if round == 0 {
-                eprintln!("[optrans] □ 确认帧已显示，3 秒后自动开始发送...");
-                for i in (1..=3).rev() {
-                    eprintln!("[optrans]   {}...", i);
-                    if !window.sleep_with_messages(1000) {
+                eprintln!("[optrans] ▶ 小文件模式：元数据+数据合并为单帧，开始发送...");
+            }
+        } else {
+            // 每轮先发送元数据帧（始终 I 帧、二值渲染）
+            {
+                if !window.process_messages() {
+                    eprintln!("[optrans] 用户中止发送");
+                    return Ok(());
+                }
+                let meta_gray_config = GrayEncodingConfig::new(2); // 元数据帧始终二值
+                let pixels = render_frame_default(&meta_frame, module_pixels, modules_w, modules_h, &meta_gray_config, false, None);
+                window.update_bitmap(&pixels);
+                eprintln!("  [META] seq={}", meta_frame.sequence());
+                global_seq += 1;
+
+                // 首轮：元数据帧已显示，3 秒倒计时后自动开始发送数据
+                if round == 0 {
+                    eprintln!("[optrans] □ 确认帧已显示，3 秒后自动开始发送...");
+                    for i in (1..=3).rev() {
+                        eprintln!("[optrans]   {}...", i);
+                        if !window.sleep_with_messages(1000) {
+                            eprintln!("[optrans] 用户中止发送");
+                            return Ok(());
+                        }
+                    }
+                    eprintln!("[optrans] ▶ 开始发送数据帧");
+                } else {
+                    if !window.sleep_with_messages(interval_ms) {
                         eprintln!("[optrans] 用户中止发送");
                         return Ok(());
                     }
-                }
-                eprintln!("[optrans] ▶ 开始发送数据帧");
-            } else {
-                if !window.sleep_with_messages(interval_ms) {
-                    eprintln!("[optrans] 用户中止发送");
-                    return Ok(());
                 }
             }
         }
@@ -198,7 +221,7 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
         let mut block_iter = manifest.blocks.iter().peekable();
         let mut frame_idx: usize = 0;
 
-        while block_iter.peek().is_some() {
+        while block_iter.peek().is_some() || (can_merge_meta && frame_idx == 0) {
             if !window.process_messages() {
                 eprintln!("[optrans] 用户中止发送");
                 return Ok(());
@@ -207,6 +230,11 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
             // 收集本帧的块，直到 payload 填满或块用完
             let mut merged_blocks: Vec<&BlockData> = Vec::new();
             let mut accumulated = 2usize; // count prefix: 2B
+
+            // 合并模式：第一个"块"是元数据
+            if can_merge_meta && frame_idx == 0 {
+                accumulated += 4 + 2 + meta_payload_len; // index(4) + len(2) + meta_data
+            }
 
             while let Some(block) = block_iter.peek() {
                 let entry_size = 4 + 2 + block.data.len(); // index(4) + len(2) + data
@@ -218,14 +246,20 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
                 block_iter.next();
             }
 
-            if merged_blocks.is_empty() {
+            if merged_blocks.is_empty() && !(can_merge_meta && frame_idx == 0) {
                 break;
             }
 
-            // 构建合并帧（始终 I 帧，简化实现）
-            let frame = Frame::new_data_merged(
-                &merged_blocks, global_seq, total_blocks, encoding_mode_bit,
-            )?;
+            // 构建帧
+            let frame = if can_merge_meta && frame_idx == 0 {
+                // 元数据+数据合并帧：用特殊 block_index 标识元数据块
+                Frame::new_merged_with_meta(global_seq, total_blocks, encoding_mode_bit,
+                    &meta_payload, &merged_blocks)?
+            } else {
+                Frame::new_data_merged(
+                    &merged_blocks, global_seq, total_blocks, encoding_mode_bit,
+                )?
+            };
 
             // 渲染帧
             let pixels = render_frame_default(

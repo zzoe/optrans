@@ -117,6 +117,7 @@ impl FrameCollector {
     }
 
     /// v0.9: 尝试解析多块合并数据帧格式 [count: u16 LE][entries...]
+    /// v0.10: 支持元数据嵌入（block_index == 0xFFFFFFFF 表示元数据块）
     /// 成功返回 Some(IngestResult)，格式不匹配返回 None
     fn try_ingest_multi_block(&mut self, frame: &DecodedFrame) -> Option<IngestResult> {
         let payload = &frame.payload;
@@ -133,9 +134,11 @@ impl FrameCollector {
         let mut last_result = IngestResult::NewBlock(0);
         let mut blocks_ingested = 0usize;
 
+        const META_BLOCK_INDEX: u32 = 0xFFFF_FFFF;
+
         for _ in 0..count {
             if offset + 6 > payload.len() {
-                return None; // 格式不完整
+                return None;
             }
             let block_index = u32::from_le_bytes(
                 payload[offset..offset+4].try_into().ok()?
@@ -150,8 +153,23 @@ impl FrameCollector {
             let block_data = payload[offset..offset+data_len].to_vec();
             offset += data_len;
 
-            self.data_blocks.insert(block_index, block_data);
-            last_result = IngestResult::NewBlock(block_index);
+            if block_index == META_BLOCK_INDEX {
+                // 嵌入的元数据块：解析并设置 collector 元数据
+                match parse_meta_payload(&block_data) {
+                    Ok(meta) => {
+                        self.total_blocks = meta.total_blocks;
+                        self.meta = Some(meta);
+                        last_result = IngestResult::NewMeta(self.meta.clone().unwrap());
+                    }
+                    Err(_) => {
+                        // 元数据解析失败，跳过（可能为假阳性）
+                        continue;
+                    }
+                }
+            } else {
+                self.data_blocks.insert(block_index, block_data);
+                last_result = IngestResult::NewBlock(block_index);
+            }
             blocks_ingested += 1;
         }
 

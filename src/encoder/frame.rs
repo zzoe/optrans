@@ -104,9 +104,8 @@ impl Frame {
         total_blocks: u32,
         encoding_mode_bit: u8,
     ) -> OptransResult<Frame> {
-        // 计算总载荷大小
         let payload_len: usize = 2 + blocks.iter()
-            .map(|b| 4 + 2 + b.data.len()) // index(4) + len(2) + data
+            .map(|b| 4 + 2 + b.data.len())
             .sum::<usize>();
 
         let mut payload = Vec::with_capacity(payload_len);
@@ -122,22 +121,57 @@ impl Frame {
 
         let first_index = blocks.first().map(|b| b.index).unwrap_or(0);
         let info = FormatInfo::new_data(
-            seq,
-            first_index,
-            total_blocks,
-            payload.len() as u16,
-            FrameKind::I,
-            encoding_mode_bit,
+            seq, first_index, total_blocks,
+            payload.len() as u16, FrameKind::I, encoding_mode_bit,
         );
 
         let encoder = RsEncoder::new();
         let encoded_payload = encoder.encode(&payload)?;
 
-        Ok(Frame {
-            format_info: info,
-            encoded_payload,
-            frame_kind: FrameKind::I,
-        })
+        Ok(Frame { format_info: info, encoded_payload, frame_kind: FrameKind::I })
+    }
+
+    /// 构建元数据+数据合并帧（v0.10）
+    ///
+    /// 首条 entry 为元数据（block_index = META_BLOCK_INDEX = 0xFFFFFFFF），
+    /// 后续 entries 为正常数据块。用于小文件单帧传输。
+    pub fn new_merged_with_meta(
+        seq: u16,
+        total_blocks: u32,
+        encoding_mode_bit: u8,
+        meta_payload: &[u8],
+        blocks: &[&BlockData],
+    ) -> OptransResult<Frame> {
+        let meta_entry_len = 4 + 2 + meta_payload.len(); // index(4) + len(2) + data
+        let data_len: usize = blocks.iter().map(|b| 4 + 2 + b.data.len()).sum();
+        let payload_len = 2 + meta_entry_len + data_len; // 2B count
+
+        let mut payload = Vec::with_capacity(payload_len);
+        let count = 1u16 + blocks.len() as u16;
+        payload.extend_from_slice(&count.to_le_bytes());
+
+        // 元数据 entry: block_index = 0xFFFFFFFF
+        payload.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
+        payload.extend_from_slice(&(meta_payload.len() as u16).to_le_bytes());
+        payload.extend_from_slice(meta_payload);
+
+        // 数据 entries
+        for block in blocks {
+            payload.extend_from_slice(&block.index.to_le_bytes());
+            let dlen = block.data.len() as u16;
+            payload.extend_from_slice(&dlen.to_le_bytes());
+            payload.extend_from_slice(&block.data);
+        }
+
+        let info = FormatInfo::new_data(
+            seq, 0, total_blocks,
+            payload.len() as u16, FrameKind::I, encoding_mode_bit,
+        );
+
+        let encoder = RsEncoder::new();
+        let encoded_payload = encoder.encode(&payload)?;
+
+        Ok(Frame { format_info: info, encoded_payload, frame_kind: FrameKind::I })
     }
 
     /// 构建 P 帧（差分帧）
