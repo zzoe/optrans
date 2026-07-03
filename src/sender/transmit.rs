@@ -120,8 +120,9 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
         ));
     }
 
-    // max_payload 含 block_index(4B)，数据块大小 = max_payload - 4
-    let block_size = max_payload_per_frame - 4;
+    // 多块合并格式每块 overhead：2B count + (4B index + 2B len) × N
+    // 最少 1 块 → 8B overhead → block_size = max_payload - 8
+    let block_size = max_payload_per_frame.saturating_sub(8);
 
     // 2. 读取文件并分块
     let manifest = crate::sender::chunker::read_file_with_block_size(&Path::new(&args.path), block_size)?;
