@@ -54,12 +54,16 @@ impl FrameCollector {
         if self.seen_seqs.contains(&seq) {
             return Ok(IngestResult::Duplicate);
         }
-        self.seen_seqs.insert(seq);
 
-        match frame.frame_kind {
+        // 先尝试摄入，成功后再标记为已处理
+        // 如果摄入失败（如元数据载荷为空），不占用 seq，允许后续重试
+        let result = match frame.frame_kind {
             FrameKind::I => self.ingest_i_frame(frame),
             FrameKind::P => self.ingest_p_frame(frame),
-        }
+        }?;
+
+        self.seen_seqs.insert(seq);
+        Ok(result)
     }
 
     /// 摄入 I 帧：正常处理 + 缓存模块值
