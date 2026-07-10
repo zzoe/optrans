@@ -1,6 +1,6 @@
 [package]
 name = "optrans"
-version = "0.2.0"
+version = "0.19.0"
 edition = "2024"
 description = "通过屏幕视觉编码在 Horizon 远程桌面两端传输文件"
 

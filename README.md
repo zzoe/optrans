@@ -6,6 +6,11 @@
 ## 快速开始
 
 ```powershell
+# win7
+cargo +nightly build --release --target x86_64-win7-windows-msvc -Z build-std
+# win8+
+cargo build -r
+
 # 发送
 optrans send ./file.bin
 
@@ -22,15 +27,15 @@ optrans test send --frame-margin 120
 
 ## 命令行参数
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--module-pixels` | 4 | 每模块像素数 (2-8 偶数) |
-| `--interval-ms` | 150/300 | 帧间隔毫秒 |
-| `--gray-levels` | 5/2 | 灰度级数 (2/4/5/8/16)，测试默认2 |
-| `--frame-margin` | 20 | 帧边距像素（远程桌面建议 120） |
-| `--no-diff` | false | 禁用 P 帧，全发 I 帧 |
-| `--encoding-mode` | auto | 接收端编码模式 (auto/binary/gray-N) |
-| `--debug` | false | 接收端调试：失败截图存 optrans_debug/ |
+| 参数              | 默认值  | 说明                                  |
+| ----------------- | ------- | ------------------------------------- |
+| `--module-pixels` | 4       | 每模块像素数 (2-8 偶数)               |
+| `--interval-ms`   | 150/300 | 帧间隔毫秒                            |
+| `--gray-levels`   | 5/2     | 灰度级数 (2/4/5/8/16)，测试默认2      |
+| `--frame-margin`  | 20      | 帧边距像素（远程桌面建议 120）        |
+| `--no-diff`       | false   | 禁用 P 帧，全发 I 帧                  |
+| `--encoding-mode` | auto    | 接收端编码模式 (auto/binary/gray-N)   |
+| `--debug`         | false   | 接收端调试：失败截图存 optrans_debug/ |
 
 ## 架构
 
