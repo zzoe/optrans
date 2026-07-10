@@ -1,24 +1,63 @@
-//! 最小化测试模式
+//! 测试模式
 //!
-//! 用于调试端到端传输，验证 finder pattern 检测是否正常工作。
-//!
-//! # 简化策略
-//! - **二值模式**（gray_levels=2）：不用灰度编码、不用中值采样
-//! - **单帧**：元数据帧，payload = "HELLO OPTRANS TEST"
-//! - **无握手**：发送端显示 10 秒后退出
-//! - **无 EOT**：接收端收到第一帧就打印并退出
-//! - **保留 finder pattern**：与完整版相同的 finder + 格式信息链路
-//! - v0.7: 使用全屏扫描定位（不依赖固定角落位置，支持任意窗口尺寸/缩放）
+//! test send / test receive 复用正常 send/receive 的完整流程（run_send / run_receive），
+//! 仅 test send 的文件内容固定为测试数据，使测试结果能反映真实传输效果。
+//! test decode-image 保留离线调试能力：从 PNG 截图直接解码。
 
-use std::time::{Duration, Instant};
-
+use crate::cli::{ReceiveArgs, SendArgs};
 use crate::common::error::{OptransError, OptransResult};
-use crate::common::types::{FrameKind, FormatInfo, FrameLocation, GrayEncodingConfig};
+use crate::common::types::FrameLocation;
+
+#[cfg(test)]
+use crate::common::types::{BlockData, FormatInfo, FrameKind, GrayEncodingConfig};
+#[cfg(test)]
 use crate::encoder::frame::Frame;
+#[cfg(test)]
 use crate::encoder::reed_solomon::RsEncoder;
+#[cfg(test)]
 use crate::encoder::render::render_frame_default;
-use crate::receiver::capture::capture_full_screen;
-use crate::sender::window::SenderWindow;
+
+// === test send / test receive：复用正常流程 ===
+
+/// 发送固定测试内容（复用 run_send 完整流程）
+///
+/// 生成临时测试文件（"HELLO OPTRANS TEST\n" 重复填充至 64KB），
+/// 用与正常 send 完全相同的参数和发送流程（分块、RS、渲染、单轮、EOT）发送。
+/// 这样测试结果能反映真实传输效果，而非简化链路的虚假成功。
+pub fn test_send(mut args: SendArgs) -> OptransResult<()> {
+    let template = b"HELLO OPTRANS TEST\n";
+    let target_size = 64 * 1024; // 64KB
+    let mut data = Vec::with_capacity(target_size);
+    while data.len() + template.len() <= target_size {
+        data.extend_from_slice(template);
+    }
+    let remaining = target_size - data.len();
+    if remaining > 0 {
+        data.extend_from_slice(&template[..remaining.min(template.len())]);
+    }
+
+    let test_path = std::env::temp_dir().join("optrans_test_payload.bin");
+    std::fs::write(&test_path, &data)?;
+    eprintln!(
+        "[test] 测试内容已写入临时文件: {:?} ({} bytes, 模板 {:?} 重复)",
+        test_path,
+        data.len(),
+        template
+    );
+
+    args.path = test_path;
+    crate::sender::transmit::run_send(args)
+}
+
+/// 接收测试帧（复用 run_receive 完整流程）
+///
+/// 使用与正常 receive 完全相同的主循环、定位、解码、降级重试、统计、EOT 处理。
+pub fn test_receive(args: ReceiveArgs) -> OptransResult<()> {
+    eprintln!("[test] 接收端：使用与正常 receive 相同的流程");
+    crate::receiver::mod_impl::run_receive(args)
+}
+
+// === 离线调试：从 PNG 图片解码 ===
 
 /// 从 PNG 图片文件加载 RGBA 像素数据
 fn load_png_rgba(path: &str) -> OptransResult<(Vec<u8>, i32, i32)> {
@@ -30,259 +69,38 @@ fn load_png_rgba(path: &str) -> OptransResult<(Vec<u8>, i32, i32)> {
     Ok((rgba.into_raw(), w, h))
 }
 
-/// 发送测试帧（持续显示，Ctrl+C 退出）
+/// 从 PNG 图片文件解码测试帧（离线调试用）
 ///
-/// 1. 根据窗口尺寸计算每帧最大 payload
-/// 2. 用 "HELLO OPTRANS TEST\n" 重复填充到满帧
-/// 3. 二值模式 RS(255,217) 编码 → 渲染
-/// 4. 创建全屏长方形窗口，持续显示直到窗口关闭或 Ctrl+C
-pub fn test_send() -> OptransResult<()> {
-    let module_pixels: u32 = 4;
-    let gray_config = GrayEncodingConfig::new(2); // 2 级 = 二值
+/// 加载 PNG → 全屏扫描定位 finder pattern → 解码 payload
+pub fn test_decode_image(path: &str) -> OptransResult<()> {
+    eprintln!("[test] 解码图片：加载 {}", path);
+    let (pixels, img_w, img_h) = load_png_rgba(path)?;
+    eprintln!("[test] 图片尺寸 {}×{}", img_w, img_h);
 
-    // 1. 创建全屏窗口，获取模块尺寸
-    let mut window = SenderWindow::create(module_pixels)?;
-    let modules_w = window.modules_per_side_w;
-    let modules_h = window.modules_per_side_h;
-
-    // 2. 计算此帧尺寸下能容纳的最大 payload（二值模式）
-    let max_payload = calculate_max_payload_binary(modules_w, modules_h);
-
-    // 3. 用测试消息重复填充到满帧
-    let template = b"HELLO OPTRANS TEST\n";
-    let mut payload = Vec::with_capacity(max_payload);
-    while payload.len() + template.len() <= max_payload {
-        payload.extend_from_slice(template);
-    }
-    // 剩余字节用模板开头填充
-    let remaining = max_payload - payload.len();
-    if remaining > 0 {
-        payload.extend_from_slice(&template[..remaining.min(template.len())]);
+    // 全图扫描定位（返回所有候选，逐个解码）
+    eprintln!("[test] 尝试全屏扫描 locate_frame_all ...");
+    let locations = crate::decoder::locate::locate_frame_all(&pixels, img_w, img_h);
+    if locations.is_empty() {
+        eprintln!("[test] 定位失败！图片中未找到 finder pattern");
+        return Err(OptransError::FrameDecode("定位失败".into()));
     }
 
-    eprintln!(
-        "[test] 发送端：测试帧 payload={}B (模板 \"HELLO OPTRANS TEST\\n\" 重复 {}次), 帧{}w×{}h",
-        payload.len(),
-        payload.len() / template.len(),
-        modules_w, modules_h
-    );
-
-    // 4. 创建 FormatInfo（Meta 帧，seq=0）
-    let info = FormatInfo::new_meta(0, 1, payload.len() as u16);
-
-    // 5. RS 编码
-    let encoder = RsEncoder::new();
-    let encoded_payload = encoder.encode(&payload)?;
-
-    eprintln!(
-        "[test] 发送端：RS 编码完成 (payload {}B → {}B)",
-        payload.len(),
-        encoded_payload.len()
-    );
-
-    // 6. 构建 Frame
-    let frame = Frame {
-        format_info: info,
-        encoded_payload,
-        frame_kind: FrameKind::I,
-    };
-
-    // 7. 渲染
-    let pixels = render_frame_default(&frame, module_pixels, modules_w, modules_h, &gray_config, false, None);
-
-    let img_w = modules_w as usize * module_pixels as usize;
-    let img_h = modules_h as usize * module_pixels as usize;
-    eprintln!(
-        "[test] 发送端：渲染完成 ({}×{} RGBA = {} bytes)",
-        img_w, img_h, pixels.len()
-    );
-
-    window.update_bitmap(&pixels);
-
-    eprintln!(
-        "[test] 发送端：已显示测试帧 — pattern {}×{} ({}px边距), modules={}w×{}h",
-        img_w, img_h,
-        crate::common::constants::FRAME_MARGIN_PX,
-        modules_w, modules_h
-    );
-
-    // 8. 持续显示 3 秒后自动退出（或窗口关闭/Ctrl+C 提前退出）
-    let start_tick = unsafe { crate::win32::ffi::GetTickCount() };
-    loop {
-        if !window.process_messages() {
-            eprintln!("[test] 发送端：窗口已关闭，退出");
-            return Ok(());
-        }
-        let elapsed = unsafe { crate::win32::ffi::GetTickCount() } - start_tick;
-        if elapsed >= 3000 {
-            eprintln!("[test] 发送端：3 秒已到，自动退出");
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// 计算二值模式下帧能容纳的最大 payload 字节数
-fn calculate_max_payload_binary(modules_w: u32, modules_h: u32) -> usize {
-    use crate::common::constants::{RS_DATA_LEN, RS_TOTAL_LEN};
-
-    let total = (modules_w * modules_h) as usize;
-    let finder = 3 * 49;
-    let format = 2 * (modules_w as usize - 14);
-    let available = total - finder - format;
-
-    // 二值：8 模块 = 1 字节（RS 编码后）
-    let max_rs_encoded = available / 8;
-
-    // RS: 4B header + ceil(payload/217) × 255
-    let header = 4;
-    if max_rs_encoded <= header {
-        return 0;
-    }
-    let num_blocks = (max_rs_encoded - header) / RS_TOTAL_LEN;
-    let max_payload = num_blocks * RS_DATA_LEN;
-
-    eprintln!(
-        "[test] 帧容量: {}w×{}h → {} 可用数据模块 → {}B RS编码 → {}B payload ({}个RS块×{})",
-        modules_w, modules_h, available, max_rs_encoded, max_payload, num_blocks, RS_DATA_LEN
-    );
-
-    max_payload
-}
-
-/// 接收测试帧（含诊断日志）
-///
-/// 1. 全屏截取 → locate_frame_with_diag（全屏扫描） → decode_frame
-/// 2. 如果解码成功，打印 payload 文本
-/// 3. 失败时打印亮度诊断，每 10 轮保存全屏 BMP
-/// 4. Ctrl+C 退出
-///
-/// v0.7: 改用全屏扫描定位，不依赖固定角落位置，
-/// 支持 Horizon client 等任意窗口尺寸的远程桌面场景。
-pub fn test_receive() -> OptransResult<()> {
-    eprintln!("[test] 接收端：开始全屏扫描定位...");
-    eprintln!("[test] 接收端：将在首次截屏时保存 capture_debug.bmp 用于诊断");
-
-    let mut scan_count: u64 = 0;
-    let mut debug_saved = false;
-    let mut last_err_time = Instant::now();
-    let mut last_err_count: u64 = 0;
-
-    loop {
-        scan_count += 1;
-
-        // 1. 全屏截取
-        let (pixels, img_w, img_h) = match capture_full_screen() {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("[test] 接收端：截屏失败: {}，重试...", e);
-                std::thread::sleep(Duration::from_millis(200));
-                continue;
+    for loc in &locations {
+        eprintln!(
+            "[test] 候选: tl=({:.0},{:.0}), modules=({}w×{}h), ms={:.2}",
+            loc.tl.center_x, loc.tl.center_y, loc.modules_w, loc.modules_h, loc.tl.module_size
+        );
+        match decode_test_data_direct(&pixels, img_w, img_h, loc) {
+            Ok(data) => {
+                let text = String::from_utf8_lossy(&data);
+                eprintln!("[test] 解码成功！payload = {:?}", text);
+                return Ok(());
             }
-        };
-
-        // 首次截屏打印尺寸并保存全屏 BMP + 全图亮度诊断
-        if !debug_saved {
-            debug_saved = true;
-
-            // 全图采样：每隔 N 像素取一次亮度，统计是否有非白像素
-            let step: usize = 200; // 每 200 像素采样一个
-            let w = img_w as usize;
-            let mut min_lum: u8 = 255;
-            let mut max_lum: u8 = 0;
-            let mut white_count: u64 = 0;
-            let mut black_count: u64 = 0;
-            let mut gray_count: u64 = 0;
-            let mut total_samples: u64 = 0;
-
-            for y in (0..img_h as usize).step_by(step) {
-                for x in (0..w).step_by(step) {
-                    let idx = (y * w + x) * 4;
-                    if idx + 2 >= pixels.len() { continue; }
-                    let r = pixels[idx] as u32;
-                    let g = pixels[idx+1] as u32;
-                    let b = pixels[idx+2] as u32;
-                    let lum = ((r * 299 + g * 587 + b * 114) / 1000) as u8;
-                    min_lum = min_lum.min(lum);
-                    max_lum = max_lum.max(lum);
-                    if lum < 50 { black_count += 1; }
-                    else if lum > 200 { white_count += 1; }
-                    else { gray_count += 1; }
-                    total_samples += 1;
-                }
-            }
-
-            eprintln!(
-                "[test] 接收端：截屏尺寸 {}×{}",
-                img_w, img_h
-            );
-            eprintln!(
-                "[test] 接收端：全图采样({}个), 亮度范围=[{},{}], 黑(<50)={}, 白(>200)={}, 灰={}",
-                total_samples, min_lum, max_lum, black_count, white_count, gray_count
-            );
-            if black_count == 0 && gray_count == 0 {
-                eprintln!("[test] 接收端：⚠ 全图纯白！截屏未捕获到任何窗口内容。");
-                eprintln!("[test] 接收端：⚠ 可能原因: (1) test send 未启动 (2) RDP 会话桌面 DC 不可 BitBlt");
-            } else {
-                eprintln!("[test] 接收端：✓ 全图有非白内容，发送窗口可能已显示在桌面");
-            }
-
-            save_bmp("capture_debug.bmp", &pixels, img_w, img_h);
-            eprintln!(
-                "[test] 接收端：已保存全屏截屏到 capture_debug.bmp ({}×{})",
-                img_w, img_h
-            );
-        }
-
-        // 2. 全屏扫描定位帧
-        match crate::decoder::locate::locate_frame_with_diag(&pixels, img_w, img_h) {
-            Some((loc, diag)) => {
-                eprintln!(
-                    "[test] 接收端：全屏扫描成功！tl=({:.0},{:.0}), tr=({:.0},{:.0}), bl=({:.0},{:.0}), modules=({}w×{}h), ms={:.2} (候选{}, 验证{})",
-                    loc.tl.center_x, loc.tl.center_y,
-                    loc.tr.center_x, loc.tr.center_y,
-                    loc.bl.center_x, loc.bl.center_y,
-                    loc.modules_w, loc.modules_h,
-                    loc.tl.module_size,
-                    diag.candidates_found, diag.candidates_verified
-                );
-
-                match decode_test_data_direct(&pixels, img_w, img_h, &loc) {
-                    Ok(data) => {
-                        let text = String::from_utf8_lossy(&data);
-                        eprintln!("[test] 接收端：解码成功！payload = {:?}", text);
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        let now = Instant::now();
-                        let elapsed = now.duration_since(last_err_time);
-                        if elapsed >= Duration::from_secs(2) {
-                            let total_errs = last_err_count + 1;
-                            eprintln!(
-                                "[test] 接收端：定位成功但解码失败(共{}次): {}，继续扫描...",
-                                total_errs, e
-                            );
-                            last_err_time = now;
-                            last_err_count = 0;
-                        } else {
-                            last_err_count += 1;
-                        }
-                        std::thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
-                }
-            }
-            None => {
-                if scan_count % 10 == 0 {
-                    eprintln!(
-                        "[test] 接收端：未找到帧 (已扫描 {} 次)，全屏扫描未能定位 finder pattern",
-                        scan_count
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
+            Err(_) => continue,
         }
     }
+    eprintln!("[test] 所有候选解码失败 ({} 个候选)", locations.len());
+    Err(OptransError::FrameDecode("所有候选解码失败".into()))
 }
 
 /// 测试模式：直接从数据矩阵提取模块值（跳过格式信息）
@@ -291,10 +109,13 @@ pub fn test_receive() -> OptransResult<()> {
 /// 导致格式信息解码失败。此函数直接按 finder pattern 定位的模块
 /// 网格采样黑白像素，不依赖格式信息。
 ///
-/// v0.8: 改用仿射变换采样（与 extract_data_modules/sample_module 一致），
+/// v0.8: 改用仿射变换采样（与 extract.rs sample_module 一致），
 /// 基于全部 3 个 finder 中心点推算像素坐标，消除行列级联漂移。
 fn decode_test_data_direct(
-    pixels: &[u8], img_w: i32, img_h: i32, loc: &FrameLocation,
+    pixels: &[u8],
+    img_w: i32,
+    img_h: i32,
+    loc: &FrameLocation,
 ) -> Result<Vec<u8>, OptransError> {
     let n_w = loc.modules_w as usize;
     let n_h = loc.modules_h as usize;
@@ -355,7 +176,10 @@ fn decode_test_data_direct(
             if idx + 2 >= pixels.len() {
                 continue;
             }
-            let lum = (pixels[idx] as u32 * 299 + pixels[idx + 1] as u32 * 587 + pixels[idx + 2] as u32 * 114) / 1000;
+            let lum = (pixels[idx] as u32 * 299
+                + pixels[idx + 1] as u32 * 587
+                + pixels[idx + 2] as u32 * 114)
+                / 1000;
             // 与编码器约定一致：black(0) → bit 0, white(255) → bit 1
             let bit: u8 = if lum < 128 { 0 } else { 1 };
             bits.push(bit);
@@ -380,10 +204,14 @@ fn decode_test_data_direct(
     // 必须在读取 total_len 之前应用，因为 total_len 字段也被掩码处理过
     let rs_encoded = crate::common::mask::apply_mask(&bytes);
 
-    let total_len = u32::from_le_bytes([rs_encoded[0], rs_encoded[1], rs_encoded[2], rs_encoded[3]]) as usize;
+    let total_len =
+        u32::from_le_bytes([rs_encoded[0], rs_encoded[1], rs_encoded[2], rs_encoded[3]]) as usize;
 
     if total_len == 0 || total_len > rs_encoded.len() * 2 {
-        return Err(OptransError::FrameDecode(format!("无效的数据长度: {}", total_len)));
+        return Err(OptransError::FrameDecode(format!(
+            "无效的数据长度: {}",
+            total_len
+        )));
     }
 
     let rs_data = &rs_encoded[4..];
@@ -391,99 +219,15 @@ fn decode_test_data_direct(
     let expected_rs_bytes = num_blocks * 255;
 
     if rs_data.len() < expected_rs_bytes {
-        return Err(OptransError::FrameDecode(format!("RS 数据不足: 需要 {}B, 实际 {}B", expected_rs_bytes, rs_data.len())));
+        return Err(OptransError::FrameDecode(format!(
+            "RS 数据不足: 需要 {}B, 实际 {}B",
+            expected_rs_bytes,
+            rs_data.len()
+        )));
     }
 
     use crate::decoder::reed_solomon::rs_decode_data;
     rs_decode_data(&rs_encoded[..4 + expected_rs_bytes.min(rs_encoded.len())])
-}
-
-/// 从 PNG 图片文件解码测试帧（离线调试用）
-///
-/// 加载 PNG → 全屏扫描定位 finder pattern → 解码 payload
-pub fn test_decode_image(path: &str) -> OptransResult<()> {
-    eprintln!("[test] 解码图片：加载 {}", path);
-    let (pixels, img_w, img_h) = load_png_rgba(path)?;
-    eprintln!("[test] 图片尺寸 {}×{}", img_w, img_h);
-
-    // 全图扫描定位（不依赖固定角落位置，支持帧在图片任意位置）
-    eprintln!("[test] 尝试全屏扫描 locate_frame ...");
-    let loc = match crate::decoder::locate::locate_frame(&pixels, img_w, img_h) {
-        Some(loc) => {
-            eprintln!(
-                "[test] 全屏扫描成功！tl=({:.0},{:.0}), tr=({:.0},{:.0}), bl=({:.0},{:.0}), modules=({}w×{}h), module_size={:.2}",
-                loc.tl.center_x, loc.tl.center_y,
-                loc.tr.center_x, loc.tr.center_y,
-                loc.bl.center_x, loc.bl.center_y,
-                loc.modules_w, loc.modules_h,
-                loc.tl.module_size
-            );
-            loc
-        }
-        None => {
-            eprintln!("[test] 定位失败！图片中未找到 finder pattern");
-            return Err(OptransError::FrameDecode("定位失败".into()));
-        }
-    };
-
-    // 解码
-    match decode_test_data_direct(&pixels, img_w, img_h, &loc) {
-        Ok(data) => {
-            let text = String::from_utf8_lossy(&data);
-            eprintln!("[test] 解码成功！payload = {:?}", text);
-            Ok(())
-        }
-        Err(e) => {
-            eprintln!("[test] 解码失败: {}", e);
-            Err(e)
-        }
-    }
-}
-
-/// 保存 RGBA 像素为 BMP 文件
-fn save_bmp(path: &str, rgba: &[u8], w: i32, h: i32) {
-    use std::io::Write;
-    let w_u = w as u32;
-    let h_u = h as u32;
-    // 每行像素字节数（BGR, 4 字节对齐）
-    let row_bytes = (w_u * 3 + 3) & !3;
-    let img_size = row_bytes * h_u;
-    let file_size = 54 + img_size;
-
-    let mut buf = Vec::with_capacity(file_size as usize);
-    // BMP 文件头 (14 bytes)
-    buf.extend_from_slice(b"BM");
-    buf.extend_from_slice(&file_size.to_le_bytes());
-    buf.extend_from_slice(&[0u8; 4]); // reserved
-    buf.extend_from_slice(&54u32.to_le_bytes()); // data offset
-    // DIB 头 (40 bytes)
-    buf.extend_from_slice(&40u32.to_le_bytes()); // header size
-    buf.extend_from_slice(&w_u.to_le_bytes());
-    buf.extend_from_slice(&h_u.to_le_bytes());
-    buf.extend_from_slice(&1u16.to_le_bytes()); // planes
-    buf.extend_from_slice(&24u16.to_le_bytes()); // bpp
-    buf.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
-    buf.extend_from_slice(&img_size.to_le_bytes());
-    buf.extend_from_slice(&[0u8; 16]); // resolution + palette
-
-    // 像素数据 (BMP 是 BGR, 自底向上)
-    for y in (0..h).rev() {
-        let mut row = Vec::with_capacity(row_bytes as usize);
-        for x in 0..w {
-            let idx = ((y * w + x) * 4) as usize;
-            row.push(rgba[idx + 2]); // B
-            row.push(rgba[idx + 1]); // G
-            row.push(rgba[idx]);     // R
-        }
-        while row.len() < row_bytes as usize {
-            row.push(0);
-        }
-        buf.extend_from_slice(&row);
-    }
-
-    if let Ok(mut f) = std::fs::File::create(path) {
-        f.write_all(&buf).ok();
-    }
 }
 
 #[cfg(test)]
@@ -511,7 +255,13 @@ mod tests {
         let modules_w: u32 = 100;
         let modules_h: u32 = 80;
         let frame_pixels = render_frame_default(
-            &frame, module_pixels, modules_w, modules_h, &gray_config, false, None,
+            &frame,
+            module_pixels,
+            modules_w,
+            modules_h,
+            &gray_config,
+            false,
+            None,
         );
         let frame_w = (modules_w * module_pixels) as i32;
         let frame_h = (modules_h * module_pixels) as i32;
@@ -537,19 +287,27 @@ mod tests {
             }
         }
 
-        // 4. 全屏扫描定位
-        let loc = crate::decoder::locate::locate_frame(&screen, screen_w, screen_h)
-            .expect("全屏扫描应能定位帧");
-        eprintln!(
-            "定位成功: tl=({:.0},{:.0}), modules=({}w×{}h), module_size={:.2}",
-            loc.tl.center_x, loc.tl.center_y, loc.modules_w, loc.modules_h, loc.tl.module_size
-        );
-
-        // 5. 解码
-        let data = decode_test_data_direct(&screen, screen_w, screen_h, &loc)
-            .expect("解码应成功");
-        assert_eq!(data, payload);
-        eprintln!("解码成功: payload = {:?}", String::from_utf8_lossy(&data));
+        // 4. 全屏扫描定位（遍历候选逐个解码）
+        let locations = crate::decoder::locate::locate_frame_all(&screen, screen_w, screen_h);
+        assert!(!locations.is_empty(), "全屏扫描应能定位帧");
+        let mut success = false;
+        for loc in &locations {
+            if let Ok(data) = decode_test_data_direct(&screen, screen_w, screen_h, loc) {
+                assert_eq!(data, payload);
+                success = true;
+                eprintln!(
+                    "解码成功: tl=({:.0},{:.0}), modules=({}w×{}h), ms={:.2}, payload={:?}",
+                    loc.tl.center_x,
+                    loc.tl.center_y,
+                    loc.modules_w,
+                    loc.modules_h,
+                    loc.tl.module_size,
+                    String::from_utf8_lossy(&data)
+                );
+                break;
+            }
+        }
+        assert!(success, "所有候选解码失败");
     }
 
     /// 验证正式接收端解码路径（decode_frame）能正确解码合成帧
@@ -580,7 +338,13 @@ mod tests {
         let modules_w: u32 = 200;
         let modules_h: u32 = 150;
         let frame_pixels = render_frame_default(
-            &frame, module_pixels, modules_w, modules_h, &gray_config, false, None,
+            &frame,
+            module_pixels,
+            modules_w,
+            modules_h,
+            &gray_config,
+            false,
+            None,
         );
         let frame_w = (modules_w * module_pixels) as i32;
         let frame_h = (modules_h * module_pixels) as i32;
@@ -602,21 +366,23 @@ mod tests {
             }
         }
 
-        // 4. 全屏扫描定位
-        let loc = crate::decoder::locate::locate_frame(&screen, screen_w, screen_h)
-            .expect("全屏扫描应能定位帧");
-
-        // 5. 使用正式接收端的 decode_frame 解码（覆盖 extract.rs 的采样路径）
-        let decoded = decode_frame(
-            &screen, screen_w, screen_h, &loc, &EncodingMode::Auto,
-        )
-            .expect("decode_frame 应成功");
-
-        assert_eq!(decoded.payload, payload);
-        eprintln!(
-            "decode_frame 解码成功: payload = {:?}",
-            String::from_utf8_lossy(&decoded.payload)
-        );
+        // 4. 全屏扫描定位（遍历候选逐个解码）
+        let locations = crate::decoder::locate::locate_frame_all(&screen, screen_w, screen_h);
+        assert!(!locations.is_empty(), "全屏扫描应能定位帧");
+        let mut success = false;
+        for loc in &locations {
+            if let Ok(decoded) = decode_frame(&screen, screen_w, screen_h, loc, &EncodingMode::Auto)
+            {
+                assert_eq!(decoded.payload, payload);
+                success = true;
+                eprintln!(
+                    "decode_frame 解码成功: payload = {:?}",
+                    String::from_utf8_lossy(&decoded.payload)
+                );
+                break;
+            }
+        }
+        assert!(success, "所有候选 decode_frame 失败");
     }
 
     /// 满帧 payload（无循环填充）+ decode_test_data_direct 往返测试
@@ -649,7 +415,11 @@ mod tests {
             payload.extend_from_slice(&template[..remaining]);
         }
 
-        eprintln!("满帧测试: payload={}B, RSblocks={}", payload.len(), num_blocks);
+        eprintln!(
+            "满帧测试: payload={}B, RSblocks={}",
+            payload.len(),
+            num_blocks
+        );
 
         // 2. RS 编码
         let info = FormatInfo::new_meta(0, 1, payload.len() as u16);
@@ -665,7 +435,13 @@ mod tests {
         let gray_config = GrayEncodingConfig::new(2);
         let module_pixels: u32 = 4;
         let frame_pixels = render_frame_default(
-            &frame, module_pixels, modules_w, modules_h, &gray_config, false, None,
+            &frame,
+            module_pixels,
+            modules_w,
+            modules_h,
+            &gray_config,
+            false,
+            None,
         );
         let frame_w = (modules_w * module_pixels) as i32;
         let frame_h = (modules_h * module_pixels) as i32;
@@ -691,24 +467,245 @@ mod tests {
             }
         }
 
-        // 5. 全屏扫描定位
-        let loc = crate::decoder::locate::locate_frame(&screen, screen_w, screen_h)
-            .expect("满帧测试：全屏扫描应能定位帧");
+        // 5. 全屏扫描定位（遍历候选逐个解码）
+        let locations = crate::decoder::locate::locate_frame_all(&screen, screen_w, screen_h);
+        assert!(!locations.is_empty(), "满帧测试：全屏扫描应能定位帧");
+        let mut success = false;
+        for loc in &locations {
+            eprintln!(
+                "  候选: modules=({}w×{}h), ms={:.2}",
+                loc.modules_w, loc.modules_h, loc.tl.module_size
+            );
+            if let Ok(decoded) = decode_test_data_direct(&screen, screen_w, screen_h, loc) {
+                assert_eq!(decoded, payload, "满帧测试：解码结果应与原始 payload 一致");
+                success = true;
+                eprintln!(
+                    "满帧测试通过: payload={}B 完整往返 (前80字节: {:?})",
+                    payload.len(),
+                    String::from_utf8_lossy(&decoded[..80.min(decoded.len())])
+                );
+                break;
+            }
+        }
+        assert!(success, "满帧测试：所有候选 decode_test_data_direct 失败");
+    }
+
+    /// 诊断测试：单独验证 RS 编码解码往返 + 数据掩码往返
+    #[test]
+    fn test_rs_mask_roundtrip_large_payload() {
+        use crate::decoder::reed_solomon::rs_decode_data;
+        use crate::encoder::reed_solomon::RsEncoder;
+
+        // 构建与真实发送相同大小的 payload (26908 bytes)
+        let block_size = 26900usize;
+        let template = b"HELLO OPTRANS TEST\n";
+        let mut block_data = Vec::with_capacity(block_size);
+        while block_data.len() + template.len() <= block_size {
+            block_data.extend_from_slice(template);
+        }
+        let remaining = block_size - block_data.len();
+        if remaining > 0 {
+            block_data.extend_from_slice(&template[..remaining]);
+        }
+
+        // 构建多块合并 payload
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u16.to_le_bytes()); // count=1
+        payload.extend_from_slice(&0u32.to_le_bytes()); // block_index=0
+        payload.extend_from_slice(&(block_data.len() as u16).to_le_bytes()); // data_len
+        payload.extend_from_slice(&block_data); // data
+        assert_eq!(payload.len(), 26908);
+
+        // 1. RS 编码
+        let encoder = RsEncoder::new();
+        let encoded = encoder.encode(&payload).unwrap();
         eprintln!(
-            "满帧定位: tl=({:.0},{:.0}), modules=({}w×{}h), ms={:.2}",
-            loc.tl.center_x, loc.tl.center_y,
-            loc.modules_w, loc.modules_h, loc.tl.module_size
+            "RS encoded: {} bytes (header=4 + {}*255)",
+            encoded.len(),
+            (encoded.len() - 4) / 255
         );
 
-        // 6. decode_test_data_direct 解码
-        let decoded = decode_test_data_direct(&screen, screen_w, screen_h, &loc)
-            .expect("满帧测试：decode_test_data_direct 应成功");
+        // 2. 应用掩码
+        let masked = crate::common::mask::apply_mask(&encoded);
 
-        assert_eq!(decoded, payload, "满帧测试：解码结果应与原始 payload 一致");
+        // 3. 编码为灰度模块 (binary: 1 bit per module)
+        let gray_config = GrayEncodingConfig::new(2);
+        let (gray_values, _) = crate::encoder::render::encode_gray_n(&masked, &gray_config);
+        eprintln!("Gray values: {} modules", gray_values.len());
+
+        // 4. 解码为字节
+        let encoded_bytes = encoded.len();
+        let mut decoded_bytes = vec![0u8; encoded_bytes];
+        for byte_idx in 0..encoded_bytes {
+            let mut byte_val: u8 = 0;
+            for bit in 0..8 {
+                let bit_pos = byte_idx * 8 + bit;
+                if bit_pos < gray_values.len() {
+                    // gray_values are [0, 255] for binary mode
+                    if gray_values[bit_pos] > 128 {
+                        byte_val |= 1 << bit;
+                    }
+                }
+            }
+            decoded_bytes[byte_idx] = byte_val;
+        }
+
+        // 5. 验证灰色值→字节解码
+        assert_eq!(
+            &decoded_bytes, &masked,
+            "Gray→Byte decoding should roundtrip"
+        );
+
+        // 6. 去掩码
+        let unmasked = crate::common::mask::apply_mask(&decoded_bytes);
+        assert_eq!(
+            &unmasked, &encoded,
+            "Unmask should recover original RS data"
+        );
+
+        // 7. RS 解码
+        let decoded = rs_decode_data(&unmasked).unwrap();
+        assert_eq!(
+            decoded, payload,
+            "Full RS roundtrip should recover original payload"
+        );
+        assert_eq!(
+            &decoded[8..8 + block_data.len()],
+            &block_data,
+            "Decoded block data should match original"
+        );
+
         eprintln!(
-            "满帧测试通过: payload={}B 完整往返 (前80字节: {:?})",
+            "RS+Mask roundtrip test PASSED for {} bytes payload",
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn test_rs_exact_multiple_roundtrip() {
+        // 专门测试 payload 为 RS_DATA_LEN 整数倍的边界情况
+        use crate::common::constants::RS_DATA_LEN;
+        use crate::decoder::reed_solomon::rs_decode_data;
+        use crate::encoder::reed_solomon::RsEncoder;
+
+        // 124 * 217 = 26908
+        let payload = vec![0xABu8; RS_DATA_LEN * 124];
+        assert_eq!(payload.len(), 26908);
+        assert_eq!(payload.len() % RS_DATA_LEN, 0);
+
+        let encoder = RsEncoder::new();
+        let encoded = encoder.encode(&payload).unwrap();
+        eprintln!(
+            "Exact multiple: payload={}, encoded={} (blocks={})",
             payload.len(),
-            String::from_utf8_lossy(&decoded[..80.min(decoded.len())])
+            encoded.len(),
+            (encoded.len() - 4) / 255
         );
+
+        let decoded = rs_decode_data(&encoded).unwrap();
+        assert_eq!(
+            decoded,
+            payload,
+            "Exact multiple RS roundtrip failed: expected {} bytes, got {}",
+            payload.len(),
+            decoded.len()
+        );
+        eprintln!("Exact multiple RS roundtrip PASSED");
+
+        // Also test with mask
+        let masked = crate::common::mask::apply_mask(&encoded);
+        let unmasked = crate::common::mask::apply_mask(&masked);
+        assert_eq!(unmasked, encoded);
+        eprintln!("Mask roundtrip PASSED");
+    }
+
+    /// 完整往返测试：构建 3 数据块帧 → 渲染 → locate → decode_frame → 验证数据
+    ///
+    /// 验证 v0.12 修复：三角搜索 TR/BL 约束收紧后，正确候选排在首位，CRC 通过。
+    #[test]
+    fn test_three_block_full_roundtrip() {
+        use crate::common::types::EncodingMode;
+        use crate::decoder::decode::decode_frame;
+
+        let template = b"HELLO OPTRANS TEST\n";
+        let target_size = 64 * 1024;
+        let mut data = Vec::with_capacity(target_size);
+        while data.len() + template.len() <= target_size {
+            data.extend_from_slice(template);
+        }
+        let remaining = target_size - data.len();
+        if remaining > 0 {
+            data.extend_from_slice(&template[..remaining.min(template.len())]);
+        }
+
+        let module_pixels: u32 = 4;
+        let modules_w: u32 = 640;
+        let modules_h: u32 = 400;
+        let gray_config = GrayEncodingConfig::new(2);
+
+        let total = (modules_w * modules_h) as usize;
+        let finder = 3 * 49;
+        let format = 2 * ((modules_w as usize) - 14);
+        let max_rs_encoded = (total - finder - format) / 8;
+        let num_rs_blocks = (max_rs_encoded - 4) / crate::common::constants::RS_TOTAL_LEN;
+        let max_payload = num_rs_blocks * crate::common::constants::RS_DATA_LEN;
+        let block_size = max_payload.saturating_sub(8);
+
+        let mut blocks: Vec<BlockData> = Vec::new();
+        let mut offset = 0;
+        let mut idx = 0u32;
+        while offset < data.len() {
+            let end = (offset + block_size).min(data.len());
+            blocks.push(BlockData {
+                index: idx,
+                data: data[offset..end].to_vec(),
+            });
+            offset = end;
+            idx += 1;
+        }
+        let total_blocks = blocks.len() as u32;
+
+        let frame_w = (modules_w * module_pixels) as i32;
+        let frame_h = (modules_h * module_pixels) as i32;
+        let encoding_mode = EncodingMode::Binary;
+
+        for block in &blocks {
+            let seq = block.index as u16 + 1;
+            let frame = Frame::new_data_merged(&[block], seq, total_blocks, 0).unwrap();
+            let pixels = render_frame_default(
+                &frame,
+                module_pixels,
+                modules_w,
+                modules_h,
+                &gray_config,
+                false,
+                None,
+            );
+            let locations = crate::decoder::locate::locate_frame_all(&pixels, frame_w, frame_h);
+            assert!(
+                !locations.is_empty(),
+                "block_{}: no candidates",
+                block.index
+            );
+
+            // 正确候选应在首位（v0.12 修复保证）
+            let loc = &locations[0];
+            assert_eq!(loc.modules_w, 640, "block_{}: modules_w", block.index);
+            assert_eq!(loc.modules_h, 400, "block_{}: modules_h", block.index);
+
+            let decoded = decode_frame(&pixels, frame_w, frame_h, loc, &encoding_mode)
+                .expect("decode_frame must succeed");
+            assert_eq!(decoded.frame_sequence, seq);
+            assert!(!decoded.payload.is_empty());
+
+            // 验证多块格式
+            let count = u16::from_le_bytes([decoded.payload[0], decoded.payload[1]]);
+            assert_eq!(count, 1);
+            let dec_idx = u32::from_le_bytes(decoded.payload[2..6].try_into().unwrap());
+            assert_eq!(dec_idx, block.index);
+            let dlen = u16::from_le_bytes([decoded.payload[6], decoded.payload[7]]) as usize;
+            assert_eq!(dlen, block.data.len());
+            assert_eq!(&decoded.payload[8..8 + dlen], block.data.as_slice());
+        }
     }
 }

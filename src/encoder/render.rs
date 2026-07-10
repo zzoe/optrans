@@ -47,7 +47,7 @@ pub fn render_frame(
     let finder = generate_finder_pattern();
 
     // 预计算格式信息区填充比特
-    let format_bits = encode_format_info_bits(&frame.format_info);
+    let format_bits = encode_format_info_bits(&frame.format_info, modules_w);
 
     // 预计算数据矩阵灰度值序列
     let is_p_frame = matches!(frame.frame_kind, crate::common::types::FrameKind::P);
@@ -155,13 +155,22 @@ fn format_module_index(col: usize, row: usize, n_w: usize) -> usize {
     }
 }
 
-/// 将格式信息编码为 bits（长度 = 2 × (n_w - 14)）
-fn encode_format_info_bits(info: &crate::common::types::FormatInfo) -> Vec<u8> {
+/// 将格式信息编码为 bits
+///
+/// v0.13: 动态重复次数。当格式信息区 ≥600 模块时使用 5× 重复（更抗视频压缩噪声），
+/// 否则使用 3× 重复（兼容窄帧）。
+fn encode_format_info_bits(info: &crate::common::types::FormatInfo, n_w: u32) -> Vec<u8> {
     use crate::common::constants::{
         FORMAT_INFO_BYTES,
-        FORMAT_INFO_ENCODED_BYTES,
         FORMAT_INFO_WITH_CRC,
     };
+
+    // 动态计算重复次数：每份拷贝 120 bits (15 bytes × 8)，n 份 = 120*n
+    // 格式信息区 = 2 × (n_w - 14) 模块
+    let format_area_modules = 2 * (n_w as usize - 14);
+    let copy_bits = FORMAT_INFO_WITH_CRC * 8; // 120
+    let max_repetitions = format_area_modules / copy_bits; // 整数除，向下取整
+    let repetitions = max_repetitions.min(5).max(1);
 
     // 1. 打包 97 bits → 13 bytes
     let mut packed = vec![0u8; FORMAT_INFO_BYTES];
@@ -173,14 +182,16 @@ fn encode_format_info_bits(info: &crate::common::types::FormatInfo) -> Vec<u8> {
     with_crc.extend_from_slice(&packed);
     with_crc.extend_from_slice(&crc.to_le_bytes());
 
-    // 3. 三重重复：15 bytes × 3 = 45 bytes = 360 bits
-    let mut encoded = Vec::with_capacity(FORMAT_INFO_ENCODED_BYTES);
-    for _ in 0..3 {
+    // 3. N 重重复：15 bytes × N
+    let total_bytes = FORMAT_INFO_WITH_CRC * repetitions;
+    let total_bits = total_bytes * 8;
+    let mut encoded = Vec::with_capacity(total_bytes);
+    for _ in 0..repetitions {
         encoded.extend_from_slice(&with_crc);
     }
 
-    // 4. 展开为 360 bits（实际可用位数由调用方截断）
-    let mut bits = Vec::with_capacity(360);
+    // 4. 展开为 bits
+    let mut bits = Vec::with_capacity(total_bits);
     for byte in &encoded {
         for bit in 0..8 {
             bits.push((byte >> bit) & 1);

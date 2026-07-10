@@ -26,14 +26,13 @@ fn hex_str(data: &[u8]) -> String {
 fn calculate_frame_capacity(
     module_pixels: u32,
     gray_config: &GrayEncodingConfig,
+    frame_margin: u32,
 ) -> (u32, u32, usize) {
-    use crate::common::constants::FRAME_MARGIN_PX;
-
     let screen_w = unsafe { crate::win32::ffi::GetSystemMetrics(crate::win32::ffi::SM_CXSCREEN) };
     let screen_h = unsafe { crate::win32::ffi::GetSystemMetrics(crate::win32::ffi::SM_CYSCREEN) };
 
-    let modules_w = ((screen_w as u32).saturating_sub(FRAME_MARGIN_PX * 2)) / module_pixels;
-    let modules_h = ((screen_h as u32).saturating_sub(FRAME_MARGIN_PX * 2)) / module_pixels;
+    let modules_w = ((screen_w as u32).saturating_sub(frame_margin * 2)) / module_pixels;
+    let modules_h = ((screen_h as u32).saturating_sub(frame_margin * 2)) / module_pixels;
 
     let (m_w, m_h, payload) = frame_capacity_for_modules(modules_w, modules_h, gray_config);
     (m_w, m_h, payload)
@@ -82,7 +81,6 @@ fn frame_capacity_for_modules(
 /// 执行发送操作的主入口
 pub fn run_send(args: SendArgs) -> OptransResult<()> {
     let module_pixels = args.module_pixels;
-    let rounds = args.rounds;
     let interval_ms = args.interval_ms;
     let gray_levels = args.gray_levels;
     let _enable_diff = args.enable_diff;
@@ -112,6 +110,7 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
     let (modules_w, modules_h, max_payload_per_frame) = calculate_frame_capacity(
         module_pixels,
         &gray_config,
+        args.frame_margin,
     );
 
     if max_payload_per_frame <= 4 {
@@ -142,7 +141,7 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
     let eot_frame = Frame::new_eot(eot_seq)?;
 
     // 4. 创建全屏最大化窗口
-    let mut window = SenderWindow::create_sized(module_pixels, modules_w, modules_h)?;
+    let mut window = SenderWindow::create_sized(module_pixels, modules_w, modules_h, args.frame_margin)?;
 
     eprintln!(
         "[optrans] 帧尺寸: {}w×{}h modules ({}×{}px, max_payload={}B)",
@@ -170,22 +169,19 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
     let can_merge_meta = total_blocks == 1
         && 2 + 4 + 2 + meta_payload_len + 4 + 2 + manifest.blocks[0].data.len() <= max_payload_per_frame;
 
-    // 循环发送
-    for round in 0..rounds {
+    // 单轮发送：不重传，靠单帧高可靠解码（参考二维码识别的容错思路：
+    // 数据块自带 RS 纠错，格式信息解码失败时接收端降级重试平移/变半径）
+    {
         if !window.process_messages() {
             eprintln!("[optrans] 用户中止发送");
             return Ok(());
         }
 
-        eprintln!("[optrans] --- 第 {} 轮 (共 {} 轮) ---", round + 1, rounds);
-
         if can_merge_meta {
             // 小文件：元数据 + 数据合并到一个帧，直接进入数据发送
-            if round == 0 {
-                eprintln!("[optrans] ▶ 小文件模式：元数据+数据合并为单帧，开始发送...");
-            }
+            eprintln!("[optrans] ▶ 小文件模式：元数据+数据合并为单帧，开始发送...");
         } else {
-            // 每轮先发送元数据帧（始终 I 帧、二值渲染）
+            // 先发送元数据帧（始终 I 帧、二值渲染）
             {
                 if !window.process_messages() {
                     eprintln!("[optrans] 用户中止发送");
@@ -197,23 +193,16 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
                 eprintln!("  [META] seq={}", meta_frame.sequence());
                 global_seq += 1;
 
-                // 首轮：元数据帧已显示，3 秒倒计时后自动开始发送数据
-                if round == 0 {
-                    eprintln!("[optrans] □ 确认帧已显示，3 秒后自动开始发送...");
-                    for i in (1..=3).rev() {
-                        eprintln!("[optrans]   {}...", i);
-                        if !window.sleep_with_messages(1000) {
-                            eprintln!("[optrans] 用户中止发送");
-                            return Ok(());
-                        }
-                    }
-                    eprintln!("[optrans] ▶ 开始发送数据帧");
-                } else {
-                    if !window.sleep_with_messages(interval_ms) {
+                // 元数据帧已显示，3 秒倒计时后自动开始发送数据
+                eprintln!("[optrans] □ 确认帧已显示，3 秒后自动开始发送...");
+                for i in (1..=3).rev() {
+                    eprintln!("[optrans]   {}...", i);
+                    if !window.sleep_with_messages(1000) {
                         eprintln!("[optrans] 用户中止发送");
                         return Ok(());
                     }
                 }
+                eprintln!("[optrans] ▶ 开始发送数据帧");
             }
         }
 

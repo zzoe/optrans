@@ -10,7 +10,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::common::constants::{FRAME_MARGIN_PX, RGBA_CHANNELS};
+use crate::common::constants::RGBA_CHANNELS;
 use crate::common::error::{OptransError, OptransResult};
 use crate::win32::ffi;
 use crate::win32::helpers::{check_hwnd, last_error, to_wide};
@@ -31,9 +31,11 @@ pub struct SenderWindow {
     height: i32,
     /// 每模块像素数（用于从 modules 反算帧像素尺寸）
     module_pixels: u32,
-    /// 水平方向模块数（由 (window_w - 2×FRAME_MARGIN_PX) / module_pixels 动态计算）
+    /// 帧边距像素数
+    frame_margin: u32,
+    /// 水平方向模块数
     pub modules_per_side_w: u32,
-    /// 垂直方向模块数（由 (window_h - 2×FRAME_MARGIN_PX) / module_pixels 动态计算）
+    /// 垂直方向模块数
     pub modules_per_side_h: u32,
     /// 位图缓冲区（RGBA，width × height = screen_w × screen_h）
     bitmap_buffer: Vec<u8>,
@@ -139,26 +141,19 @@ unsafe extern "system" fn wnd_proc(
 impl SenderWindow {
     /// 创建无边框真实全屏窗口（screen_w × screen_h）
     ///
-    /// 窗口使用完整屏幕尺寸，编码图案四周留 FRAME_MARGIN_PX 黑边。
-    /// modules_per_side_w = (screen_w - 2×FRAME_MARGIN_PX) / module_pixels
-    /// modules_per_side_h = (screen_h - 2×FRAME_MARGIN_PX) / module_pixels
-    ///
     /// # 参数
-    /// - `module_pixels`: 每模块像素数，用于计算 modules_per_side 和帧图案尺寸
-    pub fn create(module_pixels: u32) -> OptransResult<Self> {
-        // 真实全屏：使用完整屏幕尺寸
+    /// - `module_pixels`: 每模块像素数
+    /// - `frame_margin`: 帧边距像素数
+    pub fn create(module_pixels: u32, frame_margin: u32) -> OptransResult<Self> {
         let screen_w = unsafe { ffi::GetSystemMetrics(ffi::SM_CXSCREEN) };
         let screen_h = unsafe { ffi::GetSystemMetrics(ffi::SM_CYSCREEN) };
-        let modules_w = (screen_w as u32 - FRAME_MARGIN_PX * 2) / module_pixels;
-        let modules_h = (screen_h as u32 - FRAME_MARGIN_PX * 2) / module_pixels;
-        Self::create_sized(module_pixels, modules_w, modules_h)
+        let modules_w = (screen_w as u32 - frame_margin * 2) / module_pixels;
+        let modules_h = (screen_h as u32 - frame_margin * 2) / module_pixels;
+        Self::create_sized(module_pixels, modules_w, modules_h, frame_margin)
     }
 
     /// 创建指定模块尺寸的居中窗口（动态帧尺寸）
-    ///
-    /// 窗口实际像素尺寸 = modules_w × module_pixels × modules_h × module_pixels，
-    /// 在屏幕中居中显示。适用于小文件——根据数据量计算最小帧尺寸，减少闪烁。
-    pub fn create_sized(module_pixels: u32, modules_w: u32, modules_h: u32) -> OptransResult<Self> {
+    pub fn create_sized(module_pixels: u32, modules_w: u32, modules_h: u32, frame_margin: u32) -> OptransResult<Self> {
         // 重置全局标志
         WINDOW_CLOSED.store(false, Ordering::SeqCst);
 
@@ -173,9 +168,9 @@ impl SenderWindow {
         let class_name = to_wide("OptransSenderWindow");
         let window_title = to_wide("optrans - Optical Transfer");
 
-        // 窗口尺寸 = 帧图案尺寸 + 2×FRAME_MARGIN_PX 边距
-        let window_w = (modules_w * module_pixels + FRAME_MARGIN_PX * 2) as i32;
-        let window_h = (modules_h * module_pixels + FRAME_MARGIN_PX * 2) as i32;
+        // 窗口尺寸 = 帧图案尺寸 + 2×frame_margin 边距
+        let window_w = (modules_w * module_pixels + frame_margin * 2) as i32;
+        let window_h = (modules_h * module_pixels + frame_margin * 2) as i32;
 
         // 居中显示
         let screen_w = unsafe { ffi::GetSystemMetrics(ffi::SM_CXSCREEN) };
@@ -255,6 +250,7 @@ impl SenderWindow {
             width: window_w,
             height: window_h,
             module_pixels,
+            frame_margin,
             modules_per_side_w,
             modules_per_side_h,
             bitmap_buffer,
@@ -273,7 +269,7 @@ impl SenderWindow {
         eprintln!(
             "[optrans] 全屏窗口已显示 (0,0) {}×{}，帧图案 {}×{}（{}px边距），modules=({}w×{}h), module_pixels={}",
             window_w, window_h, adjusted_w, adjusted_h,
-            FRAME_MARGIN_PX,
+            frame_margin,
             modules_per_side_w, modules_per_side_h, module_pixels
         );
 
@@ -319,13 +315,13 @@ impl SenderWindow {
 
     /// 更新位图缓冲区并触发重绘
     ///
-    /// 帧像素（adjusted_w × adjusted_h）居中写入 bitmap_buffer（screen_w × screen_h），
-    /// 四周留 FRAME_MARGIN_PX 黑边。`pixels` 是 adjusted_w × adjusted_h 的 RGBA 像素数据。
+    /// 帧像素（adjusted_w × adjusted_h）居中写入 bitmap_buffer，四周留黑边。
+    /// `pixels` 是 adjusted_w × adjusted_h 的 RGBA 像素数据。
     pub fn update_bitmap(&mut self, pixels: &[u8]) {
         let window_w = self.width as usize;
         let frame_w = (self.modules_per_side_w * self.module_pixels) as usize;
         let frame_h = (self.modules_per_side_h * self.module_pixels) as usize;
-        let margin = FRAME_MARGIN_PX as usize;
+        let margin = self.frame_margin as usize;
 
         // 清空整个缓冲区为黑色
         self.bitmap_buffer.fill(0);

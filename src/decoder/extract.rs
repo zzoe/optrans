@@ -19,6 +19,24 @@ pub fn extract_format_modules(
     img_height: i32,
     loc: &FrameLocation,
 ) -> Vec<u8> {
+    extract_format_modules_with_radius(pixels, img_width, img_height, loc, SAMPLE_RADIUS_BINARY)
+}
+
+/// 带自定义采样半径的格式信息提取（用于 CRC 失败时降级重试）
+///
+/// - radius=1（默认 3×3）：常规路径
+/// - radius=0（单点）：定位精准时最稳，避免采到相邻模块
+/// - radius=2（5×5）：抗随机噪声，定位有偏时可能采到邻居
+///
+/// 大文件场景下格式信息 CRC 失败率高，主因是 finder 中心定位的亚像素抖动导致
+/// 仿射变换远端模块采样偏移。降级重试可在不改变定位的前提下提升解码成功率。
+pub fn extract_format_modules_with_radius(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+    radius: i32,
+) -> Vec<u8> {
     let n_w = loc.modules_w as usize;
     let s = 7usize; // finder pattern 尺寸
     let start_col = s;
@@ -26,15 +44,63 @@ pub fn extract_format_modules(
 
     let mut bits = Vec::with_capacity((end_col - start_col) * 2);
 
-    // 格式信息区始终使用二值采样（3×3 均值 + 阈值 128）
     for row in 0..2usize {
         for col in start_col..end_col {
-            let module_val = sample_module_binary(pixels, img_width, img_height, loc, col, row);
+            let (px, py) = module_pixel_center(loc, col, row);
+            let module_val = if radius <= 0 {
+                sample_pixel_point(pixels, img_width, img_height, px, py)
+            } else {
+                sample_pixel_region_mean(pixels, img_width, img_height, px, py, radius)
+            };
             bits.push(module_val);
         }
     }
 
     bits
+}
+
+/// 计算模块中心的像素坐标（基于 TL/TR/BL 三个 finder 的仿射变换）
+#[inline]
+fn module_pixel_center(loc: &FrameLocation, module_col: usize, module_row: usize) -> (f64, f64) {
+    let n_w = loc.modules_w as f64;
+    let n_h = loc.modules_h as f64;
+    let src_tl_x = 3.5;
+    let src_tl_y = 3.5;
+    let src_tr_x = n_w - 3.5;
+    let src_bl_y = n_h - 3.5;
+
+    let src_dx = src_tr_x - src_tl_x;
+    let src_dy = src_bl_y - src_tl_y;
+
+    let dst_dx_x = (loc.tr.center_x - loc.tl.center_x) / src_dx;
+    let dst_dx_y = (loc.tr.center_y - loc.tl.center_y) / src_dx;
+    let dst_dy_x = (loc.bl.center_x - loc.tl.center_x) / src_dy;
+    let dst_dy_y = (loc.bl.center_y - loc.tl.center_y) / src_dy;
+
+    let mx = module_col as f64 + 0.5;
+    let my = module_row as f64 + 0.5;
+    let px = loc.tl.center_x + dst_dx_x * (mx - src_tl_x) + dst_dy_x * (my - src_tl_y);
+    let py = loc.tl.center_y + dst_dx_y * (mx - src_tl_x) + dst_dy_y * (my - src_tl_y);
+    (px, py)
+}
+
+/// 单点采样：直接取模块中心像素亮度，阈值 128（用于降级重试 radius=0）
+fn sample_pixel_point(pixels: &[u8], img_width: i32, img_height: i32, px: f64, py: f64) -> u8 {
+    let w = img_width as usize;
+    let cx = px.round() as i32;
+    let cy = py.round() as i32;
+    if cx < 0 || cx >= img_width || cy < 0 || cy >= img_height {
+        return 0;
+    }
+    let idx = (cy as usize * w + cx as usize) * 4;
+    if idx + 2 >= pixels.len() {
+        return 0;
+    }
+    let r = pixels[idx] as u32;
+    let g = pixels[idx + 1] as u32;
+    let b = pixels[idx + 2] as u32;
+    let lum = ((r * 299 + g * 587 + b * 114) / 1000) as u8;
+    if lum < 128 { 0 } else { 1 }
 }
 
 /// 从数据矩阵提取所有模块的值（二值或灰度取决于 encoding_mode）
@@ -163,45 +229,6 @@ pub fn sample_module(
             sample_module_gray(pixels, img_width, img_height, px, py)
         }
     }
-}
-
-/// 二值采样（3×3 均值 + 阈值 128）
-fn sample_module_binary(
-    pixels: &[u8],
-    img_width: i32,
-    img_height: i32,
-    loc: &FrameLocation,
-    module_col: usize,
-    module_row: usize,
-) -> u8 {
-    let n_w = loc.modules_w as f64;
-    let n_h = loc.modules_h as f64;
-    let src_tl_x = 3.5;
-    let src_tl_y = 3.5;
-    let src_tr_x = n_w - 3.5;
-    let src_bl_y = n_h - 3.5;
-
-    let dst_tl_x = loc.tl.center_x;
-    let dst_tl_y = loc.tl.center_y;
-    let dst_tr_x = loc.tr.center_x;
-    let dst_tr_y = loc.tr.center_y;
-    let dst_bl_x = loc.bl.center_x;
-    let dst_bl_y = loc.bl.center_y;
-
-    let src_dx = src_tr_x - src_tl_x;
-    let src_dy = src_bl_y - src_tl_y;
-
-    let dst_dx_x = (dst_tr_x - dst_tl_x) / src_dx;
-    let dst_dx_y = (dst_tr_y - dst_tl_y) / src_dx;
-    let dst_dy_x = (dst_bl_x - dst_tl_x) / src_dy;
-    let dst_dy_y = (dst_bl_y - dst_tl_y) / src_dy;
-
-    let mx = module_col as f64 + 0.5; // 模块中心
-    let my = module_row as f64 + 0.5; // 模块中心
-    let px = dst_tl_x + dst_dx_x * (mx - src_tl_x) + dst_dy_x * (my - src_tl_y);
-    let py = dst_tl_y + dst_dx_y * (mx - src_tl_x) + dst_dy_y * (my - src_tl_y);
-
-    sample_module_binary_at(pixels, img_width, img_height, px, py)
 }
 
 /// 在像素坐标处执行二值采样（3×3 均值）

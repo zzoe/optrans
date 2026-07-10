@@ -68,7 +68,7 @@ pub fn locate_by_corners(
     module_pixels: u32,
 ) -> Option<FrameLocation> {
     let m = module_pixels as i32;
-    let margin = crate::common::constants::FRAME_MARGIN_PX as i32;
+    let margin = crate::common::constants::FRAME_MARGIN_PX_DEFAULT as i32;
     let search_radius: i32 = 20;
 
     let w = capture_w as usize;
@@ -312,18 +312,19 @@ pub fn locate_frame(pixels: &[u8], width: i32, height: i32) -> Option<FrameLocat
         return None;
     }
 
-    // 第三步：从验证过的候选中找到三个构成等腰直角三角形的 finder pattern
-    let result = find_three_corners(&verified);
+    // 第三步：从验证过的候选中找到所有构成直角三角形的 finder pattern
+    // 返回按像素面积降序排列的候选列表，取第一个（面积最大）
+    let results = find_three_corners(&verified);
 
-    // 最终未能找到 3 个 corner 时，输出诊断
-    if result.is_none() {
+    if results.is_empty() {
+        // 最终未能找到 3 个 corner 时，输出诊断
         diag_ratelimited(&format!(
             "验证通过但未能构成有效三角形(候选{}个, 验证通过{}个)",
             candidate_count, verified_count
         ));
     }
 
-    result
+    results.into_iter().next()
 }
 
 /// Finder Pattern 候选点（水平扫描结果）
@@ -495,6 +496,29 @@ fn verify_finder_vertical(
         return false;
     }
 
+    // v0.15: 检测 finder 下方是否存在大量黑边（FRAME_MARGIN_PX > 0 特征）。
+    // 黑边与 finder 边框合并会截断垂直扫描的 5 段 pattern。
+    // 仅在实际检测到黑边时跳过验证，避免误伤无 margin 场景。
+    let below_check_y = (cy + half_span + 2).min(h as i32 - 2) as usize;
+    if below_check_y < h {
+        let check_idx = below_check_y * w * 4 + (cx as usize).min(w - 1) * 4;
+        if check_idx + 2 < pixels.len() {
+            // 采样下方 2 模块区域是否全黑（margin）
+            let margin_range = (fp.module_size * 2.0) as usize;
+            let mut all_black = true;
+            for dy in 0..margin_range.min(h - below_check_y) {
+                let idx = (below_check_y + dy) * w * 4 + (cx as usize).min(w - 1) * 4;
+                if idx + 2 < pixels.len() && pixel_luminance(pixels, idx) >= 80 {
+                    all_black = false;
+                    break;
+                }
+            }
+            if all_black {
+                return true; // margin detected, skip verification
+            }
+        }
+    }
+
     // 在中心 x 附近 ±1 模块范围内的若干列上尝试垂直扫描
     // finder 中心列全黑，必须扫描偏移约 1 模块的列（col 2 或 col 4）
     let step = (ms / 2).max(1);
@@ -609,41 +633,128 @@ fn merge_nearby_candidates(
     merged
 }
 
-/// 从验证过的 finder pattern 中找到三个构成等腰直角三角形的。
+/// 从验证过的 finder pattern 中找到所有构成等腰直角三角形的组合。
 ///
 /// 使用 O(n³) 组合遍历，对每三个候选点检查几何约束。
-/// 搜集所有有效三角组，选择 frame 面积（modules_w × modules_h）最大的返回。
-/// 密集数据区可能产生假 finder pattern，面积优先可过滤掉假三角组。
-fn find_three_corners(candidates: &[FinderCandidate]) -> Option<FrameLocation> {
+/// 返回所有通过约束的三角组，按像素面积（TL↔TR 距离 × TL↔BL 距离）降序排列。
+///
+/// 为什么返回多个候选：
+/// - 定位阶段无法可靠区分真假帧（噪声可能形成比真帧更大的三角）
+/// - 返回多候选，由解码阶段（CRC + payload 校验）决定哪个是真帧
+/// - QR 码识别思路：不靠单一启发式，靠纠错码验证
+///
+/// 为什么用像素面积排序：
+/// - 真帧全屏铺满时 finder 间距最大，噪声假三角组间距小得多
+/// - 像素面积优先确保真帧排在候选列表前面（CPU 代价最小）
+fn find_three_corners(candidates: &[FinderCandidate]) -> Vec<FrameLocation> {
     let n = candidates.len();
     if n < 3 {
-        return None;
+        return Vec::new();
     }
 
-    // Step 1: 计算平均 module_size，过滤掉偏离均值 >50% 的候选
-    let avg_module_size: f64 = candidates.iter().map(|c| c.module_size).sum::<f64>() / n as f64;
-    let filtered: Vec<&FinderCandidate> = candidates
-        .iter()
-        .filter(|c| {
-            let dev = (c.module_size - avg_module_size).abs() / avg_module_size.max(1.0);
-            dev <= 0.5
-        })
-        .collect();
+    // 按 module_size 聚类，每组独立 O(n³)。
+    // 真帧 finder 的 ms 相近且与噪声候选的 ms 差异大（如 ms≈4 vs ms≈2），
+    // 聚类后真帧所在组 n 很小（~3-20），O(n³) 可忽略。
+    let clusters = cluster_by_module_size(candidates);
 
-    let nf = filtered.len();
-    if nf < 3 {
-        return None;
+    let mut all_results: Vec<(FrameLocation, f64)> = Vec::new();
+
+    for cluster in &clusters {
+        if cluster.len() < 3 {
+            continue;
+        }
+        search_triangles(cluster, &mut all_results);
     }
 
-    // Step 2: O(n³) 遍历所有三元组，收集所有有效结果
-    let mut best: Option<(FrameLocation, u64)> = None;
+    // 跨组诊断（限频）
+    if !all_results.is_empty() {
+        let frame_like_count = all_results.iter()
+            .filter(|(loc, _)| {
+                // v0.15: 放宽帧型范围，覆盖 FRAME_MARGIN_PX=120 的 580×340 及原始 640×400
+                loc.modules_w >= 550 && loc.modules_w <= 710
+                    && loc.modules_h >= 300 && loc.modules_h <= 460
+            })
+            .count();
+        let best = all_results.iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        if let Some((_, best_area)) = best {
+            diag_ratelimited(&format!(
+                "find_3c: {}群×{}候选, 三角组{}个, 640×400型{}个(best area={:.0})",
+                clusters.len(), n, all_results.len(), frame_like_count, best_area
+            ));
+        }
+    }
 
-    for i in 0..nf {
-        let a = filtered[i];
-        for j in (i + 1)..nf {
-            let b = filtered[j];
-            for k in (j + 1)..nf {
-                let c = filtered[k];
+    // 排序：帧型候选始终排在前面（同类内按像素面积降序），
+    // 确保真帧优先被 decode 尝试，不被面积更大的假帧抢位。
+    // 剩下的按像素面积降序。
+    all_results.sort_by(|a, b| {
+        // v0.15: 放宽帧型范围，覆盖 FRAME_MARGIN_PX=120 的 580×340
+        let a_is_frame = a.0.modules_w >= 550 && a.0.modules_w <= 710
+            && a.0.modules_h >= 300 && a.0.modules_h <= 460;
+        let b_is_frame = b.0.modules_w >= 550 && b.0.modules_w <= 710
+            && b.0.modules_h >= 300 && b.0.modules_h <= 460;
+        match (a_is_frame, b_is_frame) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    });
+    const MAX_CANDIDATES: usize = 50;
+    all_results.truncate(MAX_CANDIDATES);
+    all_results.into_iter().map(|(loc, _)| loc).collect()
+}
+
+/// 按 module_size 聚类：排序后，相邻候选的 ms 差距 ≤0.5 归为同组
+fn cluster_by_module_size(candidates: &[FinderCandidate]) -> Vec<Vec<&FinderCandidate>> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&FinderCandidate> = candidates.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.module_size
+            .partial_cmp(&b.module_size)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut clusters: Vec<Vec<&FinderCandidate>> = Vec::new();
+    let mut current: Vec<&FinderCandidate> = vec![sorted[0]];
+    let mut group_start_ms = sorted[0].module_size;
+
+    for &cand in &sorted[1..] {
+        if (cand.module_size - group_start_ms).abs() <= 0.5 {
+            current.push(cand);
+        } else {
+            clusters.push(current);
+            current = vec![cand];
+            group_start_ms = cand.module_size;
+        }
+    }
+    clusters.push(current);
+    clusters
+}
+
+/// 对单个候选组做 O(n³) 三角搜索，结果追加到 results。
+/// v0.17: 每簇结果上限 200，防止大簇 O(n³) 膨胀（479→109M 次迭代 >400ms）。
+/// 真帧三角在迭代早期出现，提前截断不影响定位精度。
+fn search_triangles(
+    candidates: &[&FinderCandidate],
+    results: &mut Vec<(FrameLocation, f64)>,
+) {
+    let n = candidates.len();
+    if n < 3 {
+        return;
+    }
+
+    const MAX_PER_CLUSTER: usize = 200;
+    let start_count = results.len();
+
+    for i in 0..n {
+        let a = candidates[i];
+        for j in (i + 1)..n {
+            let b = candidates[j];
+            for k in (j + 1)..n {
+                let c = candidates[k];
 
                 // 按 y 排序，top2 → TL/TR，bottom1 → BL
                 let mut trio = [a, b, c];
@@ -663,11 +774,15 @@ fn find_three_corners(candidates: &[FinderCandidate]) -> Option<FrameLocation> {
 
                 // --- 约束 (a): TL 与 TR 水平对齐 ---
                 let dx = tr_cand.center_x - tl_cand.center_x;
-                let dy = (tr_cand.center_y - tl_cand.center_y).abs();
                 if dx < 1.0 {
                     continue;
                 }
-                if dy > 0.25 * dx {
+                // v0.12: TR 必须与 TL 在同一水平线（同行），容差 5 模块。
+                // 原约束 dy > 0.25*dx 过于宽松（对于 2500px 帧允许 625px 的 y 偏移），
+                // 导致帧中部假 finder 被误选为 TR，产生错误仿射变换。
+                let dy = (tr_cand.center_y - tl_cand.center_y).abs();
+                let avg_m_a = (tl_cand.module_size + tr_cand.module_size + bl_cand.module_size) / 3.0;
+                if dy > avg_m_a * 5.0 {
                     continue;
                 }
 
@@ -676,8 +791,14 @@ fn find_three_corners(candidates: &[FinderCandidate]) -> Option<FrameLocation> {
                 if dy_bl < 50.0 {
                     continue;
                 }
+                // v0.12: BL 必须与 TL 水平对齐（同列），容差 10 模块。
+                // 原约束 |dx_bl| < dx * 0.5 过于宽松（对于 2500px 帧允许 1250px 偏移），
+                // 导致数据区中部的假 finder 被误选为 BL，产生错误仿射变换，CRC 全部失败。
+                // 修复为基于模块尺寸的绝对约束：finder pattern 本身宽 7 模块，
+                // 10 模块容差足够覆盖定位抖动，又远小于帧宽/高。
                 let dx_bl = bl_cand.center_x - tl_cand.center_x;
-                if dx_bl.abs() > dx * 0.5 {
+                let avg_m_b = (tl_cand.module_size + tr_cand.module_size + bl_cand.module_size) / 3.0;
+                if dx_bl.abs() > avg_m_b * 10.0 {
                     continue;
                 }
 
@@ -725,46 +846,42 @@ fn find_three_corners(candidates: &[FinderCandidate]) -> Option<FrameLocation> {
                 let modules_per_side = modules_w.max(modules_h);
 
                 // --- 通过所有约束，记录此三角组 ---
-                let area = (modules_w as u64) * (modules_h as u64);
-                let is_better = match &best {
-                    None => true,
-                    Some((_, best_area)) => area > *best_area,
+                let pixel_area = d_top * d_left;
+
+                let tl_fp = FinderPattern {
+                    center_x: tl_cand.center_x,
+                    center_y: tl_cand.center_y,
+                    module_size: tl_cand.module_size,
+                };
+                let tr_fp = FinderPattern {
+                    center_x: tr_cand.center_x,
+                    center_y: tr_cand.center_y,
+                    module_size: tr_cand.module_size,
+                };
+                let bl_fp = FinderPattern {
+                    center_x: bl_cand.center_x,
+                    center_y: bl_cand.center_y,
+                    module_size: bl_cand.module_size,
                 };
 
-                if is_better {
-                    let tl_fp = FinderPattern {
-                        center_x: tl_cand.center_x,
-                        center_y: tl_cand.center_y,
-                        module_size: tl_cand.module_size,
-                    };
-                    let tr_fp = FinderPattern {
-                        center_x: tr_cand.center_x,
-                        center_y: tr_cand.center_y,
-                        module_size: tr_cand.module_size,
-                    };
-                    let bl_fp = FinderPattern {
-                        center_x: bl_cand.center_x,
-                        center_y: bl_cand.center_y,
-                        module_size: bl_cand.module_size,
-                    };
-
-                    best = Some((
-                        FrameLocation {
-                            tl: tl_fp,
-                            tr: tr_fp,
-                            bl: bl_fp,
-                            modules_per_side,
-                            modules_w,
-                            modules_h,
-                        },
-                        area,
-                    ));
+                results.push((
+                    FrameLocation {
+                        tl: tl_fp,
+                        tr: tr_fp,
+                        bl: bl_fp,
+                        modules_per_side,
+                        modules_w,
+                        modules_h,
+                    },
+                    pixel_area,
+                ));
+                // v0.17: 早停防止大簇 O(n³) 膨胀
+                if results.len() - start_count >= MAX_PER_CLUSTER {
+                    return;
                 }
             }
         }
     }
-
-    best.map(|(loc, _area)| loc)
 }
 
 /// 在像素缓冲区中定位帧，同时返回诊断统计
@@ -800,9 +917,9 @@ pub fn locate_frame_with_diag(
         return None;
     }
 
-    let result = find_three_corners(&verified);
+    let results = find_three_corners(&verified);
 
-    result.map(|loc| {
+    results.into_iter().next().map(|loc| {
         (
             loc,
             LocateDiagnostics {
@@ -811,4 +928,92 @@ pub fn locate_frame_with_diag(
             },
         )
     })
+}
+
+/// 在像素缓冲区中定位帧，返回所有候选（含诊断统计）。
+///
+/// 返回所有通过几何约束的三角组，按像素面积降序排列。
+/// 调用方应遍历候选逐个解码，由 CRC/payload 校验决定哪个是真帧。
+pub fn locate_frame_all_with_diag(
+    pixels: &[u8],
+    width: i32,
+    height: i32,
+) -> Vec<(FrameLocation, LocateDiagnostics)> {
+    if width < 50 || height < 50 {
+        return Vec::new();
+    }
+
+    let w = width as usize;
+    let h = height as usize;
+
+    let candidates = find_finder_candidates(pixels, w, h);
+    let candidate_count = candidates.len();
+
+    if candidates.len() < 3 {
+        return Vec::new();
+    }
+
+    let verified: Vec<FinderCandidate> = candidates
+        .into_iter()
+        .filter(|fp| verify_finder_vertical(pixels, w, h, fp))
+        .collect();
+    let verified_count = verified.len();
+
+    if verified.len() < 3 {
+        return Vec::new();
+    }
+
+    // 诊断：module_size 分布（限频输出，确认真帧 finder 是否被检测到）
+    diag_ratelimited(&{
+        let mut buckets = [0usize; 9]; // [0,1), [1,2), ..., [8,9), [9+)
+        for v in &verified {
+            let idx = (v.module_size as usize).min(8);
+            buckets[idx] += 1;
+        }
+        format!(
+            "finder ms分布: [0-1):{} [1-2):{} [2-3):{} [3-4):{} [4-5):{} [5-6):{} [6-7):{} [7-8):{} [8+):{}",
+            buckets[0], buckets[1], buckets[2], buckets[3],
+            buckets[4], buckets[5], buckets[6], buckets[7], buckets[8],
+        )
+    });
+
+    let diag = LocateDiagnostics {
+        candidates_found: candidate_count,
+        candidates_verified: verified_count,
+    };
+
+    find_three_corners(&verified)
+        .into_iter()
+        .map(|loc| (loc, diag.clone()))
+        .collect()
+}
+
+/// 在像素缓冲区中定位帧，返回所有候选。
+pub fn locate_frame_all(
+    pixels: &[u8],
+    width: i32,
+    height: i32,
+) -> Vec<FrameLocation> {
+    if width < 50 || height < 50 {
+        return Vec::new();
+    }
+
+    let w = width as usize;
+    let h = height as usize;
+
+    let candidates = find_finder_candidates(pixels, w, h);
+    if candidates.len() < 3 {
+        return Vec::new();
+    }
+
+    let verified: Vec<FinderCandidate> = candidates
+        .into_iter()
+        .filter(|fp| verify_finder_vertical(pixels, w, h, fp))
+        .collect();
+
+    if verified.len() < 3 {
+        return Vec::new();
+    }
+
+    find_three_corners(&verified)
 }

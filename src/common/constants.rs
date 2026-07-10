@@ -37,10 +37,10 @@ pub const RS_PARITY_LEN: usize = 38;
 pub const RS_TOTAL_LEN: usize = 255;
 
 /// 默认帧间隔（毫秒）
-pub const FRAME_INTERVAL_MS: u64 = 150;
+pub const FRAME_INTERVAL_MS: u64 = 300;
 
 /// 默认发送轮数
-pub const DEFAULT_ROUNDS: u32 = 3;
+pub const DEFAULT_ROUNDS: u32 = 1;
 
 /// EOT 帧重复次数
 pub const EOT_REPEAT: u32 = 3;
@@ -94,9 +94,10 @@ pub const CAPTURE_X_DEFAULT: i32 = 0;
 pub const CAPTURE_Y_DEFAULT: i32 = 0;
 
 /// 发送端编码图案四周的空白边距（像素）。
-/// 设为 0：finder pattern 自身的 7×7 黑色边框已提供视觉分隔，
-/// 额外黑边会让接收端扫描时第一段 B 与 finder 边框合并，破坏 1:1:3:1:1 比例。
-pub const FRAME_MARGIN_PX: u32 = 0;
+///
+/// 默认 20px：提供少量边缘分离，避免 finder 紧贴屏幕边缘时因亚像素
+/// 抖动导致的边界效应。远程桌面场景（Horizon/Citrix）需通过 --frame-margin 增大。
+pub const FRAME_MARGIN_PX_DEFAULT: u32 = 20;
 
 // ─── v0.2 新增：灰度值表 ───
 
@@ -176,7 +177,8 @@ pub const SAMPLE_RADIUS_BINARY: i32 = 1;
 pub const SAMPLE_RADIUS_GRAY: i32 = 2;
 
 /// 默认灰度级数
-pub const GRAY_LEVELS_DEFAULT: u32 = 5;
+/// 改为 2（二值），参考二维码识别的抗噪能力：黑白对比强，对远程桌面视频压缩更鲁棒
+pub const GRAY_LEVELS_DEFAULT: u32 = 2;
 
 /// 有效的灰度级数列表
 pub const VALID_GRAY_LEVELS: [u32; 5] = [2, 4, 5, 8, 16];

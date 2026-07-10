@@ -22,8 +22,8 @@ fn main() -> OptransResult<()> {
         Command::Send {
             path,
             module_pixels,
-            rounds,
             interval_ms,
+            frame_margin,
             gray_levels,
             no_diff,
             no_heartbeat,
@@ -33,8 +33,8 @@ fn main() -> OptransResult<()> {
             let args = SendArgs::from_cli(
                 path,
                 module_pixels,
-                rounds,
                 interval_ms,
+                frame_margin,
                 gray_levels,
                 no_diff,
                 no_heartbeat,
@@ -43,8 +43,8 @@ fn main() -> OptransResult<()> {
             eprintln!("[optrans] 发送模式");
             eprintln!("[optrans]   文件: {:?}", args.path);
             eprintln!("[optrans]   模块像素: {}", args.module_pixels);
-            eprintln!("[optrans]   轮数: {}", args.rounds);
             eprintln!("[optrans]   帧间隔: {}ms", args.interval_ms);
+            eprintln!("[optrans]   帧边距: {}px", args.frame_margin);
             eprintln!("[optrans]   灰度级数: {}", args.gray_levels);
             eprintln!("[optrans]   差分编码: {}", if args.enable_diff { "启用" } else { "禁用" });
             eprintln!("[optrans]   心跳: {}", if args.enable_heartbeat { "启用" } else { "禁用" });
@@ -55,23 +55,56 @@ fn main() -> OptransResult<()> {
             output,
             module_pixels,
             encoding_mode,
+            debug,
         } => {
             validate_module_pixels(module_pixels)?;
-            let args = ReceiveArgs::from_cli(output, module_pixels, &encoding_mode);
+            let args = ReceiveArgs::from_cli(output, module_pixels, &encoding_mode, debug);
             eprintln!("[optrans] 接收模式");
-            eprintln!("[optrans]   输出: {:?}", args.output);
+            match &args.output {
+                Some(p) => eprintln!("[optrans]   输出: {:?}", p),
+                None => eprintln!("[optrans]   输出: <从发送端元数据解析>"),
+            }
             eprintln!("[optrans]   模块像素: {}", args.module_pixels);
             eprintln!("[optrans]   编码模式: {:?}", args.encoding_mode);
+            if args.debug {
+                eprintln!("[optrans]   调试: 已启用（失败截图保存到 optrans_debug/）");
+            }
             optrans::receiver::mod_impl::run_receive(args)
         }
         Command::Test { mode } => match mode {
-            TestMode::Send => {
-                eprintln!("[optrans] test send — 发送硬编码测试帧");
-                optrans::test_mode::test_send()
+            TestMode::Send {
+                module_pixels,
+                interval_ms,
+                frame_margin,
+                gray_levels,
+                no_diff,
+                no_heartbeat,
+                i_frame_interval,
+            } => {
+                validate_module_pixels(module_pixels)?;
+                let args = SendArgs::from_cli(
+                    std::path::PathBuf::new(),
+                    module_pixels,
+                    interval_ms,
+                    frame_margin,
+                    gray_levels,
+                    no_diff,
+                    no_heartbeat,
+                    i_frame_interval,
+                );
+                eprintln!("[optrans] test send — 发送固定测试内容（复用 send 完整流程）");
+                optrans::test_mode::test_send(args)
             }
-            TestMode::Receive => {
-                eprintln!("[optrans] test receive — 接收并解码测试帧");
-                optrans::test_mode::test_receive()
+            TestMode::Receive {
+                output,
+                module_pixels,
+                encoding_mode,
+                debug,
+            } => {
+                validate_module_pixels(module_pixels)?;
+                let args = ReceiveArgs::from_cli(output, module_pixels, &encoding_mode, debug);
+                eprintln!("[optrans] test receive — 接收测试帧（复用 receive 完整流程）");
+                optrans::test_mode::test_receive(args)
             }
             TestMode::DecodeImage { path } => {
                 eprintln!("[optrans] test decode-image — 从图片解码测试帧");

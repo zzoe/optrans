@@ -5,17 +5,23 @@
 //! 2. 提取数据载荷并 RS 解码
 //! v0.2 新增：frame_kind / encoding_mode 解析、P 帧 payload 解析、自动检测。
 
-use crate::common::constants::FORMAT_INFO_ENCODED_BITS;
 use crate::common::crc::crc16_xmodem;
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::{
-    DecodedFrame, DiffEntry, EncodingMode, FormatInfo, FrameKind, FrameLocation, FrameType,
-    GrayEncodingConfig, MetaPayload,
+    DecodedFrame, DiffEntry, EncodingMode, FinderPattern, FormatInfo, FrameKind, FrameLocation,
+    FrameType, GrayEncodingConfig, MetaPayload,
 };
 use crate::decoder::extract;
 use crate::decoder::reed_solomon::rs_decode_data;
 
 /// 从截屏中解码格式信息
+///
+/// 主路径用 3×3 采样（radius=1）。CRC 失败时降级重试：
+/// 1. 整体平移 ±1 像素（8 种组合）——纠正 finder 中心亚像素抖动导致的整体偏移
+/// 2. 单点采样（radius=0）——定位精准时最稳，避开相邻模块
+/// 3. 5×5 采样（radius=2）——抗随机噪声
+///
+/// v0.13: 动态 N 路多数投票（3× 或 5× 重复），抵抗远程桌面视频压缩噪声。
 pub fn decode_format_info(
     pixels: &[u8],
     img_width: i32,
@@ -24,26 +30,108 @@ pub fn decode_format_info(
 ) -> OptransResult<FormatInfo> {
     let raw_bits = extract::extract_format_modules(pixels, img_width, img_height, loc);
 
-    if raw_bits.len() < FORMAT_INFO_ENCODED_BITS {
+    // v0.13: 根据帧宽动态计算重复次数
+    let (repetitions, min_bits) = format_info_params(loc.modules_w);
+
+    // 比特不足（定位到极小假帧）：微调无意义，直接返回
+    if raw_bits.len() < min_bits {
         return Err(OptransError::InvalidFormatInfo(format!(
             "格式信息比特不足: 需要 {} bits，实际 {} bits",
-            FORMAT_INFO_ENCODED_BITS,
+            min_bits,
             raw_bits.len()
         )));
     }
 
-    let encoded_bits = &raw_bits[..FORMAT_INFO_ENCODED_BITS];
+    // 假帧快速拒绝
+    if raw_bits.iter().all(|&b| b == 1) || raw_bits.iter().all(|&b| b == 0) {
+        return Err(OptransError::InvalidFormatInfo(
+            "假帧: 格式信息区全白/全黑，定位到空白区域".to_string(),
+        ));
+    }
+
+    // 原始尝试
+    match vote_and_check(&raw_bits, repetitions) {
+        Ok(info) => return Ok(info),
+        Err(first_err) => {
+            let is_fake = matches!(&first_err, OptransError::InvalidFormatInfo(m) if m.starts_with("假帧"));
+            if is_fake {
+                return Err(first_err);
+            }
+            // CRC 失败：降级重试
+            for dx in [-1i32, 0, 1] {
+                for dy in [-1i32, 0, 1] {
+                    if dx == 0 && dy == 0 { continue; }
+                    let adj = shift_loc(loc, dx as f64, dy as f64);
+                    let raw2 = extract::extract_format_modules(pixels, img_width, img_height, &adj);
+                    if raw2.len() >= min_bits {
+                        if let Ok(info) = vote_and_check(&raw2, repetitions) {
+                            return Ok(info);
+                        }
+                        // v0.13: 平移后帧宽不变，但为防御性也尝试不同重复次数
+                        let r2 = format_info_params(adj.modules_w).0;
+                        if r2 != repetitions && raw2.len() >= format_info_params(adj.modules_w).1 {
+                            if let Ok(info) = vote_and_check(&raw2, r2) {
+                                return Ok(info);
+                            }
+                        }
+                    }
+                }
+            }
+            // 2. 不同采样半径
+            for radius in [0i32, 2] {
+                let raw2 = extract::extract_format_modules_with_radius(
+                    pixels, img_width, img_height, loc, radius,
+                );
+                if raw2.len() >= min_bits {
+                    if let Ok(info) = vote_and_check(&raw2, repetitions) {
+                        return Ok(info);
+                    }
+                }
+            }
+            return Err(first_err);
+        }
+    }
+}
+
+/// v0.13: 根据帧模块宽度计算格式信息重复次数和所需最小比特数
+fn format_info_params(modules_w: u32) -> (usize, usize) {
+    let format_area = 2 * (modules_w as usize - 14);
+    let copy_bits = 15 * 8; // 120 bits per copy
+    let max_reps = (format_area / copy_bits).max(1);
+    let reps = max_reps.min(5);
+    (reps, reps * copy_bits)
+}
+
+/// N 路多数投票 + CRC 校验 + 解包 (v0.13: 支持 3×/5× 重复)
+fn vote_and_check(raw_bits: &[u8], repetitions: usize) -> OptransResult<FormatInfo> {
+    let copy_bits = 15 * 8; // 120 bits per copy
+    let min_required = copy_bits * repetitions;
+
+    if raw_bits.len() < min_required {
+        return Err(OptransError::InvalidFormatInfo(format!(
+            "格式信息比特不足: 需要 {} bits，实际 {} bits",
+            min_required, raw_bits.len()
+        )));
+    }
+
+    let encoded_bits = &raw_bits[..min_required];
 
     let mut decoded_15bytes = vec![0u8; 15];
     for byte_idx in 0..15 {
         let mut byte_val: u8 = 0;
         for bit in 0..8 {
             let bit_pos = byte_idx * 8 + bit;
-            let v0 = encoded_bits[bit_pos] as u32;
-            let v1 = encoded_bits[bit_pos + 120] as u32;
-            let v2 = encoded_bits[bit_pos + 240] as u32;
-            let majority = if v0 + v1 + v2 >= 2 { 1 } else { 0 };
-            byte_val |= majority << bit;
+            let mut sum: u32 = 0;
+            for rep in 0..repetitions {
+                let idx = bit_pos + rep * copy_bits;
+                if idx < encoded_bits.len() {
+                    sum += encoded_bits[idx] as u32;
+                }
+            }
+            // 多数投票：超过半数则为 1
+            if sum * 2 > repetitions as u32 {
+                byte_val |= 1 << bit;
+            }
         }
         decoded_15bytes[byte_idx] = byte_val;
     }
@@ -57,6 +145,12 @@ pub fn decode_format_info(
 
     let crc_computed = crc16_xmodem(data_part);
     if crc_computed != crc_received {
+        if crc_received == 0x0000 || crc_received == 0xFFFF {
+            return Err(OptransError::InvalidFormatInfo(format!(
+                "假帧: CRC 全0/全1 (收到 0x{:04X})，定位到空白区域",
+                crc_received
+            )));
+        }
         return Err(OptransError::InvalidFormatInfo(format!(
             "CRC 校验失败: 计算 0x{:04X}, 收到 0x{:04X}",
             crc_computed, crc_received
@@ -64,6 +158,30 @@ pub fn decode_format_info(
     }
 
     unpack_format_info(data_part)
+}
+
+/// 生成整体平移后的 FrameLocation（不依赖 Clone，逐字段构造）
+fn shift_loc(loc: &FrameLocation, dx: f64, dy: f64) -> FrameLocation {
+    FrameLocation {
+        tl: FinderPattern {
+            center_x: loc.tl.center_x + dx,
+            center_y: loc.tl.center_y + dy,
+            module_size: loc.tl.module_size,
+        },
+        tr: FinderPattern {
+            center_x: loc.tr.center_x + dx,
+            center_y: loc.tr.center_y + dy,
+            module_size: loc.tr.module_size,
+        },
+        bl: FinderPattern {
+            center_x: loc.bl.center_x + dx,
+            center_y: loc.bl.center_y + dy,
+            module_size: loc.bl.module_size,
+        },
+        modules_per_side: loc.modules_per_side,
+        modules_w: loc.modules_w,
+        modules_h: loc.modules_h,
+    }
 }
 
 /// 从格式信息中检测编码模式
