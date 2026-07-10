@@ -421,6 +421,8 @@ impl SenderWindow {
     }
 
     /// 休眠指定毫秒数同时处理消息
+    ///
+    /// 返回 `true` 如果应该继续运行，`false` 如果收到了退出消息。
     pub fn sleep_with_messages(&self, ms: u64) -> bool {
         let start = unsafe { ffi::GetTickCount() };
         loop {

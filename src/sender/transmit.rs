@@ -2,8 +2,10 @@
 //!
 //! 发送主控逻辑：读取文件 → 块合并 → 帧构建 → 灰度渲染 → 循环显示 → EOT。
 //! v0.9: 多块合并发送，每帧填满 payload 容量。
+//! v0.19.2: 帧间隔从 render 起始计时，消除 render 耗时导致的漂移。
 
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::cli::SendArgs;
 use crate::common::constants::EOT_REPEAT;
@@ -211,6 +213,8 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
         let mut frame_idx: usize = 0;
 
         while block_iter.peek().is_some() || (can_merge_meta && frame_idx == 0) {
+            let frame_start = Instant::now();
+
             if !window.process_messages() {
                 eprintln!("[optrans] 用户中止发送");
                 return Ok(());
@@ -272,9 +276,16 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
             frame_idx += 1;
             global_seq += 1;
 
-            if !window.sleep_with_messages(interval_ms) {
-                eprintln!("[optrans] 用户中止发送");
-                return Ok(());
+            // v0.19.2: 从帧起始计时，确保严格的帧间隔
+            // render耗时浮动 (5~100ms) 不再累积漂移
+            let elapsed = frame_start.elapsed();
+            let interval = Duration::from_millis(interval_ms);
+            if elapsed < interval {
+                let remaining = (interval - elapsed).as_millis() as u64;
+                if !window.sleep_with_messages(remaining) {
+                    eprintln!("[optrans] 用户中止发送");
+                    return Ok(());
+                }
             }
         }
     }
