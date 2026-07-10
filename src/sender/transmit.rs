@@ -2,10 +2,8 @@
 //!
 //! 发送主控逻辑：读取文件 → 块合并 → 帧构建 → 灰度渲染 → 循环显示 → EOT。
 //! v0.9: 多块合并发送，每帧填满 payload 容量。
-//! v0.19.2: 帧间隔从 render 起始计时，消除 render 耗时导致的漂移。
 
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use crate::cli::SendArgs;
 use crate::common::constants::EOT_REPEAT;
@@ -209,30 +207,29 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
         }
 
         // 合并块发送：将多个块打包到一帧，直到 payload 接近容量上限
+        // v0.19.3: 预渲染所有帧，display loop 只做 instant blit + sleep
         let mut block_iter = manifest.blocks.iter().peekable();
         let mut frame_idx: usize = 0;
+        let mut pre_rendered: Vec<Vec<u8>> = Vec::new();
 
+        // ── 阶段 1: 收集所有帧 + 预渲染 ──
         while block_iter.peek().is_some() || (can_merge_meta && frame_idx == 0) {
-            let frame_start = Instant::now();
-
             if !window.process_messages() {
                 eprintln!("[optrans] 用户中止发送");
                 return Ok(());
             }
 
-            // 收集本帧的块，直到 payload 填满或块用完
             let mut merged_blocks: Vec<&BlockData> = Vec::new();
-            let mut accumulated = 2usize; // count prefix: 2B
+            let mut accumulated = 2usize;
 
-            // 合并模式：第一个"块"是元数据
             if can_merge_meta && frame_idx == 0 {
-                accumulated += 4 + 2 + meta_payload_len; // index(4) + len(2) + meta_data
+                accumulated += 4 + 2 + meta_payload_len;
             }
 
             while let Some(block) = block_iter.peek() {
-                let entry_size = 4 + 2 + block.data.len(); // index(4) + len(2) + data
+                let entry_size = 4 + 2 + block.data.len();
                 if accumulated + entry_size > max_payload_per_frame {
-                    break; // 当前帧已满
+                    break;
                 }
                 accumulated += entry_size;
                 merged_blocks.push(block);
@@ -243,9 +240,7 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
                 break;
             }
 
-            // 构建帧
             let frame = if can_merge_meta && frame_idx == 0 {
-                // 元数据+数据合并帧：用特殊 block_index 标识元数据块
                 Frame::new_merged_with_meta(global_seq, total_blocks, encoding_mode_bit,
                     &meta_payload, &merged_blocks)?
             } else {
@@ -254,38 +249,39 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
                 )?
             };
 
-            // 渲染帧
             let pixels = render_frame_default(
                 &frame, module_pixels, modules_w, modules_h,
                 &gray_config, enable_heartbeat, None,
             );
 
-            window.update_bitmap(&pixels);
-
             let count = merged_blocks.len();
             let first_idx = merged_blocks[0].index;
             let last_idx = merged_blocks[count - 1].index;
             eprintln!(
-                "  [{}/{}] seq={} blocks={}-{} payload={}B ({:.0}%)",
+                "  [预渲染 {}/{}] seq={} blocks={}-{} payload={}B ({:.0}%)",
                 frame_idx + 1, total_blocks as usize,
                 global_seq, first_idx, last_idx,
                 accumulated,
                 accumulated as f64 / max_payload_per_frame as f64 * 100.0
             );
 
+            pre_rendered.push(pixels);
             frame_idx += 1;
             global_seq += 1;
+        }
 
-            // v0.19.2: 从帧起始计时，确保严格的帧间隔
-            // render耗时浮动 (5~100ms) 不再累积漂移
-            let elapsed = frame_start.elapsed();
-            let interval = Duration::from_millis(interval_ms);
-            if elapsed < interval {
-                let remaining = (interval - elapsed).as_millis() as u64;
-                if !window.sleep_with_messages(remaining) {
-                    eprintln!("[optrans] 用户中止发送");
-                    return Ok(());
-                }
+        eprintln!("[optrans] ▶ 已预渲染 {} 帧，开始展示（{}ms/帧）", pre_rendered.len(), interval_ms);
+
+        // ── 阶段 2: 严格串行展示，每帧精确 interval_ms ──
+        for (_i, pixels) in pre_rendered.iter().enumerate() {
+            if !window.process_messages() {
+                eprintln!("[optrans] 用户中止发送");
+                return Ok(());
+            }
+            window.update_bitmap(pixels);
+            if !window.sleep_with_messages(interval_ms) {
+                eprintln!("[optrans] 用户中止发送");
+                return Ok(());
             }
         }
     }
