@@ -2,8 +2,11 @@
 //!
 //! 发送主控逻辑：读取文件 → 块合并 → 帧构建 → 灰度渲染 → 循环显示 → EOT。
 //! v0.9: 多块合并发送，每帧填满 payload 容量。
+//! v0.19.3: render 线程异步预渲染，display loop 严格串行计时。
 
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
 
 use crate::cli::SendArgs;
 use crate::common::constants::EOT_REPEAT;
@@ -206,19 +209,12 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
             }
         }
 
-        // 合并块发送：将多个块打包到一帧，直到 payload 接近容量上限
-        // v0.19.3: 预渲染所有帧，display loop 只做 instant blit + sleep
+        // ── 阶段 1: 收集所有数据帧 (Frame 构建，不渲染) ──
         let mut block_iter = manifest.blocks.iter().peekable();
         let mut frame_idx: usize = 0;
-        let mut pre_rendered: Vec<Vec<u8>> = Vec::new();
+        let mut data_frames: Vec<Frame> = Vec::new();
 
-        // ── 阶段 1: 收集所有帧 + 预渲染 ──
         while block_iter.peek().is_some() || (can_merge_meta && frame_idx == 0) {
-            if !window.process_messages() {
-                eprintln!("[optrans] 用户中止发送");
-                return Ok(());
-            }
-
             let mut merged_blocks: Vec<&BlockData> = Vec::new();
             let mut accumulated = 2usize;
 
@@ -249,36 +245,38 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
                 )?
             };
 
-            let pixels = render_frame_default(
-                &frame, module_pixels, modules_w, modules_h,
-                &gray_config, enable_heartbeat, None,
-            );
-
-            let count = merged_blocks.len();
-            let first_idx = merged_blocks[0].index;
-            let last_idx = merged_blocks[count - 1].index;
-            eprintln!(
-                "  [预渲染 {}/{}] seq={} blocks={}-{} payload={}B ({:.0}%)",
-                frame_idx + 1, total_blocks as usize,
-                global_seq, first_idx, last_idx,
-                accumulated,
-                accumulated as f64 / max_payload_per_frame as f64 * 100.0
-            );
-
-            pre_rendered.push(pixels);
+            data_frames.push(frame);
             frame_idx += 1;
             global_seq += 1;
         }
 
-        eprintln!("[optrans] ▶ 已预渲染 {} 帧，开始展示（{}ms/帧）", pre_rendered.len(), interval_ms);
+        let total_frames = data_frames.len();
+        eprintln!("[optrans] ▶ 已构建 {} 帧，启动渲染线程...", total_frames);
 
-        // ── 阶段 2: 严格串行展示，每帧精确 interval_ms ──
-        for (_i, pixels) in pre_rendered.iter().enumerate() {
+        // ── 阶段 2: 渲染线程 (异步) + display loop (严格串行) ──
+        let (render_tx, render_rx) = mpsc::channel::<Vec<u8>>();
+
+        let render_gray = gray_config.clone();
+        thread::spawn(move || {
+            for frame in &data_frames {
+                let pixels = render_frame_default(
+                    frame, module_pixels, modules_w, modules_h,
+                    &render_gray, enable_heartbeat, None,
+                );
+                if render_tx.send(pixels).is_err() {
+                    break; // display loop 退出
+                }
+            }
+            // render_tx dropped → display loop 的 rx.recv() 返回 Err
+        });
+
+        // display loop: 严格串行，每帧 interval_ms
+        for pixels in render_rx {
             if !window.process_messages() {
                 eprintln!("[optrans] 用户中止发送");
                 return Ok(());
             }
-            window.update_bitmap(pixels);
+            window.update_bitmap(&pixels);
             if !window.sleep_with_messages(interval_ms) {
                 eprintln!("[optrans] 用户中止发送");
                 return Ok(());
