@@ -15,6 +15,9 @@ use crate::encoder::frame::Frame;
 use crate::encoder::render::render_frame_default;
 use crate::sender::window::SenderWindow;
 
+/// 首帧 / 末帧驻留时间（ms）
+const BOUNDARY_DWELL_MS: u64 = 500;
+
 /// 将字节数组格式化为十六进制字符串
 fn hex_str(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
@@ -193,14 +196,11 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
                 eprintln!("  [META] seq={}", meta_frame.sequence());
                 global_seq += 1;
 
-                // 元数据帧已显示，3 秒倒计时后自动开始发送数据
-                eprintln!("[optrans] □ 确认帧已显示，3 秒后自动开始发送...");
-                for i in (1..=3).rev() {
-                    eprintln!("[optrans]   {}...", i);
-                    if !window.sleep_with_messages(1000) {
-                        eprintln!("[optrans] 用户中止发送");
-                        return Ok(());
-                    }
+                // 元数据帧已显示，短暂驻留后开始发送数据
+                eprintln!("[optrans] □ 确认帧已显示，{}ms 后开始发送...", BOUNDARY_DWELL_MS);
+                if !window.sleep_with_messages(BOUNDARY_DWELL_MS) {
+                    eprintln!("[optrans] 用户中止发送");
+                    return Ok(());
                 }
                 eprintln!("[optrans] ▶ 开始发送数据帧");
             }
@@ -302,14 +302,14 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
         }
     }
 
-    // 7. EOT 帧驻留 3 秒，确保接收端有充足时间检测
-    eprintln!("[optrans] EOT 帧驻留 3 秒，等待接收端确认...");
+    // 7. EOT 帧驻留 500ms，确保接收端有充足时间检测
+    eprintln!("[optrans] EOT 帧驻留 {}ms，等待接收端确认...", BOUNDARY_DWELL_MS);
     let dwell_start = unsafe { crate::win32::ffi::GetTickCount() };
     loop {
         if !window.process_messages() {
             break;
         }
-        if (unsafe { crate::win32::ffi::GetTickCount() } - dwell_start) >= 3000 {
+        if (unsafe { crate::win32::ffi::GetTickCount() } - dwell_start) >= BOUNDARY_DWELL_MS as u32 {
             break;
         }
         unsafe { crate::win32::ffi::Sleep(50) };
