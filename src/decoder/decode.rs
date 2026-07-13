@@ -28,7 +28,7 @@ pub fn decode_format_info(
     img_height: i32,
     loc: &FrameLocation,
 ) -> OptransResult<FormatInfo> {
-    let raw_bits = extract::extract_format_modules(pixels, img_width, img_height, loc);
+    let raw_bits = extract::extract_format_modules_with_radius(pixels, img_width, img_height, loc, 0);
 
     // v0.13: 根据帧宽动态计算重复次数
     let (repetitions, min_bits) = format_info_params(loc.modules_w);
@@ -62,7 +62,7 @@ pub fn decode_format_info(
                 for dy in [-1i32, 0, 1] {
                     if dx == 0 && dy == 0 { continue; }
                     let adj = shift_loc(loc, dx as f64, dy as f64);
-                    let raw2 = extract::extract_format_modules(pixels, img_width, img_height, &adj);
+                    let raw2 = extract::extract_format_modules_with_radius(pixels, img_width, img_height, &adj, 0);
                     if raw2.len() >= min_bits {
                         if let Ok(info) = vote_and_check(&raw2, repetitions) {
                             return Ok(info);
@@ -76,8 +76,8 @@ pub fn decode_format_info(
                     }
                 }
             }
-            // 2. 不同采样半径
-            for radius in [0i32, 2] {
+            // 2. 不同采样半径（先试 3×3 默认）
+            for radius in [1i32, 2] {
                 let raw2 = extract::extract_format_modules_with_radius(
                     pixels, img_width, img_height, loc, radius,
                 );

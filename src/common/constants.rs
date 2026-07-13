@@ -79,8 +79,8 @@ pub const HEARTBEAT_BASE_GRAY: u8 = 128;
 /// 二值模式采样半径（3×3，radius=1）
 pub const SAMPLE_RADIUS_BINARY: i32 = 1;
 
-/// 默认 16 级灰度（4 bit/模块，最高密度）；2/4/8 也全部稳定可用
-pub const GRAY_LEVELS_DEFAULT: u32 = 16;
+/// 默认灰度级数（4 = 推荐；16 = 最高密度但需理想传输环境）
+pub const GRAY_LEVELS_DEFAULT: u32 = 4;
 
 /// 有效的灰度级数（2 的幂，bit 直映射）
 pub const VALID_GRAY_LEVELS: [u32; 4] = [2, 4, 8, 16];
