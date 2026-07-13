@@ -10,5 +10,4 @@ pub mod decoder;
 pub mod encoder;
 pub mod receiver;
 pub mod sender;
-pub mod test_mode;
 pub mod win32;

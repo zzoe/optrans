@@ -48,7 +48,7 @@ impl RsDecoder {
         let block_data = &encoded[4..];
         let num_blocks = block_data.len() / RS_TOTAL_LEN;
 
-        if block_data.len() % RS_TOTAL_LEN != 0 {
+        if !block_data.len().is_multiple_of(RS_TOTAL_LEN) {
             return Err(OptransError::RsDecode(format!(
                 "编码数据大小不正确: {} bytes（应为 RS 块的整数倍）",
                 block_data.len()
@@ -60,7 +60,7 @@ impl RsDecoder {
         }
 
         // 计算需要的数据块数
-        let expected_blocks = (total_len + RS_DATA_LEN - 1) / RS_DATA_LEN;
+        let expected_blocks = total_len.div_ceil(RS_DATA_LEN);
         if num_blocks != expected_blocks {
             return Err(OptransError::RsDecode(format!(
                 "RS 块数不匹配: 期望 {} 块，实际 {} 块",

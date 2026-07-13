@@ -287,7 +287,7 @@ pub fn encode_gray_n(data: &[u8], gray_config: &GrayEncodingConfig) -> (Vec<u8>,
 fn encode_gray_direct(data: &[u8], bits_per_module: u32, gray_table: &[u8]) -> (Vec<u8>, usize) {
     let original_len = data.len();
     let total_bits = (original_len * 8) as u64;
-    let num_modules = ((total_bits + bits_per_module as u64 - 1) / bits_per_module as u64) as usize;
+    let num_modules = total_bits.div_ceil(bits_per_module as u64) as usize;
     let mask = (1u32 << bits_per_module) - 1;
 
     let mut gray_values = Vec::with_capacity(num_modules);

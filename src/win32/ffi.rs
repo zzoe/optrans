@@ -106,31 +106,20 @@ pub const SM_CYSCREEN: i32 = 1;
 // 位图相关
 pub const BI_RGB: DWORD = 0;
 pub const DIB_RGB_COLORS: UINT = 0;
-pub const SRCCOPY: DWORD = 0x00CC0020;
 
 // 窗口类样式
 pub const CS_HREDRAW: UINT = 0x0002;
 pub const CS_VREDRAW: UINT = 0x0001;
 pub const CS_OWNDC: UINT = 0x0020;
 
-// 图片加载标志
-pub const IMAGE_BITMAP: UINT = 0;
-pub const LR_LOADFROMFILE: UINT = 0x0010;
-
-// 窗口字段偏移
-pub const GWL_STYLE: i32 = -16;
-pub const GWL_EXSTYLE: i32 = -20;
-
-// 显示器相关
-pub const MONITOR_DEFAULTTOPRIMARY: DWORD = 1;
-
 // PeekMessage 标志
 pub const PM_REMOVE: UINT = 0x0001;
-pub const PM_NOREMOVE: UINT = 0x0000;
 
-// 色彩格式
-pub const BLACKNESS: DWORD = 0x00000042;
-pub const WHITENESS: DWORD = 0x00FF0062;
+// MsgWaitForMultipleObjects 返回值
+pub const WAIT_OBJECT_0: DWORD = 0;
+
+// MsgWaitForMultipleObjects 唤醒掩码：任意消息类型
+pub const QS_ALLINPUT: UINT = 0x04FF;
 
 // ============================================================================
 // 结构体
@@ -157,25 +146,6 @@ pub struct RECT {
     pub top: LONG,
     pub right: LONG,
     pub bottom: LONG,
-}
-
-impl RECT {
-    pub fn new(left: LONG, top: LONG, right: LONG, bottom: LONG) -> Self {
-        RECT {
-            left,
-            top,
-            right,
-            bottom,
-        }
-    }
-
-    pub fn width(&self) -> LONG {
-        self.right - self.left
-    }
-
-    pub fn height(&self) -> LONG {
-        self.bottom - self.top
-    }
 }
 
 #[repr(C)]
@@ -284,26 +254,6 @@ pub struct RGBQUAD {
 pub struct BITMAPINFO {
     pub bmiHeader: BITMAPINFOHEADER,
     pub bmiColors: [RGBQUAD; 1],
-}
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct MONITORINFO {
-    pub cbSize: DWORD,
-    pub rcMonitor: RECT,
-    pub rcWork: RECT,
-    pub dwFlags: DWORD,
-}
-
-impl Default for MONITORINFO {
-    fn default() -> Self {
-        MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as DWORD,
-            rcMonitor: RECT::new(0, 0, 0, 0),
-            rcWork: RECT::new(0, 0, 0, 0),
-            dwFlags: 0,
-        }
-    }
 }
 
 #[repr(C)]
@@ -452,25 +402,6 @@ unsafe extern "system" {
     /// 设置窗口长属性
     pub fn SetWindowLongPtrW(hWnd: HWND, nIndex: i32, dwNewLong: isize) -> isize;
 
-    /// 获取显示器信息
-    pub fn GetMonitorInfoW(
-        hMonitor: isize,
-        lpmi: *mut MONITORINFO,
-    ) -> BOOL;
-
-    /// 从窗口获取显示器句柄
-    pub fn MonitorFromWindow(hWnd: HWND, dwFlags: DWORD) -> isize;
-
-    /// 加载图片
-    pub fn LoadImageW(
-        hInst: HINSTANCE,
-        name: *const u16,
-        typ: UINT,
-        cx: i32,
-        cy: i32,
-        fuLoad: UINT,
-    ) -> isize;
-
     /// 使窗口客户区矩形无效，触发 WM_PAINT
     pub fn InvalidateRect(hWnd: HWND, lpRect: *const RECT, bErase: BOOL) -> BOOL;
 
@@ -482,6 +413,19 @@ unsafe extern "system" {
 
     /// 设置进程为 DPI 感知（Vista+，Win7 兼容）
     pub fn SetProcessDPIAware() -> BOOL;
+
+    /// 等待消息到达或超时——线程真正休眠，零 CPU 空转
+    ///
+    /// 替代 Sleep 轮询：当没有消息时，线程挂起直到超时或消息进入队列。
+    /// 用于帧间隔等待，比 Sleep(10) 循环精确得多且不浪费 CPU。
+    /// 返回 WAIT_OBJECT_0 表示有消息待处理，WAIT_TIMEOUT 表示超时。
+    pub fn MsgWaitForMultipleObjects(
+        nCount: DWORD,
+        pHandles: *const c_void,
+        fWaitAll: BOOL,
+        dwMilliseconds: DWORD,
+        dwWakeMask: DWORD,
+    ) -> DWORD;
 }
 
 // ============================================================================
@@ -490,12 +434,6 @@ unsafe extern "system" {
 
 #[link(name = "gdi32")]
 unsafe extern "system" {
-    /// 创建实心画刷
-    pub fn CreateSolidBrush(color: COLORREF) -> HBRUSH;
-
-    /// 填充矩形
-    pub fn FillRect(hDC: HDC, lprc: *const RECT, hbr: HBRUSH) -> i32;
-
     /// 删除 GDI 对象
     pub fn DeleteObject(ho: HGDIOBJ) -> BOOL;
 
@@ -551,26 +489,12 @@ unsafe extern "system" {
         fuColorUse: UINT,
     ) -> i32;
 
-    /// 创建 DIB 选区
-    pub fn CreateDIBSection(
-        hdc: HDC,
-        lpbmih: *const BITMAPINFO,
-        usage: UINT,
-        ppvBits: *mut *mut c_void,
-        hSection: isize,
-        offset: DWORD,
-    ) -> HBITMAP;
-
-    /// 创建设备上下文 DC
+    /// 刷新 GDI 命令缓冲区
     ///
-    /// `CreateDCW("DISPLAY", null, null, null)` 获取整个显示设备的 DC，
-    /// 区别于 `GetDC(NULL)` 返回的桌面窗口 DC（RDP 下可能为虚拟化 DC）。
-    pub fn CreateDCW(
-        lpszDriver: *const u16,
-        lpszDevice: *const u16,
-        lpszOutput: *const u16,
-        lpInitData: *const c_void,
-    ) -> HDC;
+    /// 强制 GDI 立即执行所有排队的绘制命令。在远程桌面（BlastCodec/H.264/RDP）
+    /// 环境下，调用此函数相当于告知编码器"当前帧绘制完毕，请立即编码发送"，
+    /// 防止编码器将连续多帧合并为一次更新导致接收端丢帧。
+    pub fn GdiFlush() -> BOOL;
 }
 
 // ============================================================================

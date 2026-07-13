@@ -37,28 +37,10 @@ pub const RS_PARITY_LEN: usize = 38;
 pub const RS_TOTAL_LEN: usize = 255;
 
 /// 默认帧间隔（毫秒）
-pub const FRAME_INTERVAL_MS: u64 = 300;
-
-/// 默认发送轮数
-pub const DEFAULT_ROUNDS: u32 = 1;
-
-/// EOT 帧重复次数
-pub const EOT_REPEAT: u32 = 3;
-
-/// 接收端超时（秒）
-pub const RECEIVE_TIMEOUT_SECS: u64 = 60;
-
-/// Finder Pattern 尺寸（模块）
-pub const FINDER_SIZE: u32 = 7;
-
-/// 格式信息区行数
-pub const FORMAT_ROWS: u32 = 2;
+pub const FRAME_INTERVAL_MS: u64 = 100;
 
 /// 最大文件名长度（UTF-8 字节）
 pub const MAX_FILE_NAME_LEN: usize = 255;
-
-/// 格式信息原始字段位数
-pub const FORMAT_INFO_BITS: usize = 97;
 
 /// 格式信息打包字节数（97 bits → 13 bytes，最后一个字节高7位为0）
 pub const FORMAT_INFO_BYTES: usize = 13;
@@ -66,32 +48,11 @@ pub const FORMAT_INFO_BYTES: usize = 13;
 /// CRC-16 追加后的字节数
 pub const FORMAT_INFO_WITH_CRC: usize = 15;
 
-/// 三重重复后的字节数
-pub const FORMAT_INFO_ENCODED_BYTES: usize = 45;
-
-/// 三重重复后的位数
-pub const FORMAT_INFO_ENCODED_BITS: usize = 360;
-
-/// 格式信息区可用位数（2 行 × (N-14) 模块，N=200 时为 372）
-pub const FORMAT_INFO_AREA_BITS: usize = 372;
-
 /// RGBA 像素通道数
 pub const RGBA_CHANNELS: usize = 4;
 
-/// CRC-16/XMODEM 多项式
-pub const CRC16_POLY: u16 = 0x1021;
-
-/// CRC-16 初始值
-pub const CRC16_INIT: u16 = 0x0000;
-
 /// BitBlt 光栅操作码：SRCCOPY（直接拷贝）
 pub const SRCCOPY: u32 = 0x00CC0020;
-
-/// 截屏默认起始 X 坐标
-pub const CAPTURE_X_DEFAULT: i32 = 0;
-
-/// 截屏默认起始 Y 坐标
-pub const CAPTURE_Y_DEFAULT: i32 = 0;
 
 /// 发送端编码图案四周的空白边距（像素）。
 ///
@@ -99,67 +60,12 @@ pub const CAPTURE_Y_DEFAULT: i32 = 0;
 /// 抖动导致的边界效应。远程桌面场景（Horizon/Citrix）需通过 --frame-margin 增大。
 pub const FRAME_MARGIN_PX_DEFAULT: u32 = 20;
 
-// ─── v0.2 新增：灰度值表 ───
-
-/// 2 级灰度值表（同 v0.1 二值）
-pub const GRAY_2_VALUES: [u8; 2] = [0, 255];
-
-/// 2 级解码阈值
-pub const GRAY_2_THRESHOLDS: [u8; 1] = [128];
-
-/// 4 级灰度值表
-pub const GRAY_4_VALUES: [u8; 4] = [0, 85, 170, 255];
-
-/// 4 级解码阈值
-pub const GRAY_4_THRESHOLDS: [u8; 3] = [42, 127, 212];
-
-/// 5 级灰度值表
-pub const GRAY_5_VALUES: [u8; 5] = [0, 64, 128, 192, 255];
-
-/// 5 级解码阈值（相邻灰度值的中点）
-pub const GRAY_5_THRESHOLDS: [u8; 4] = [32, 96, 160, 224];
-
-/// 8 级灰度值表
-pub const GRAY_8_VALUES: [u8; 8] = [0, 36, 73, 109, 146, 182, 219, 255];
-
-/// 8 级解码阈值
-pub const GRAY_8_THRESHOLDS: [u8; 7] = [18, 54, 91, 127, 164, 200, 237];
-
-/// 16 级灰度值表
-pub const GRAY_16_VALUES: [u8; 16] = [
-    0, 17, 34, 51, 68, 85, 102, 119, 136, 153, 170, 187, 204, 221, 238, 255,
-];
-
-/// 16 级解码阈值
-pub const GRAY_16_THRESHOLDS: [u8; 15] = [
-    8, 25, 42, 59, 76, 93, 110, 128, 144, 161, 178, 195, 212, 229, 246,
-];
-
-// ─── v0.2 新增：5 进制编码参数 ───
-
-/// 5 进制编码组大小（源字节数）
-pub const BASE5_CHUNK_SRC: usize = 2;
-
-/// 5 进制编码组大小（模块数）
-pub const BASE5_CHUNK_MOD: usize = 7;
-
-/// 5⁷ = 78,125
-pub const BASE5_MAX_VALUE: u32 = 78125;
-
 // ─── v0.2 新增：差分编码参数 ───
 
 /// 默认 I 帧间隔（连续 P 帧数达到此值后强制 I 帧）
 pub const I_FRAME_INTERVAL_DEFAULT: u32 = 10;
 
-/// P 帧退化为 I 帧的 diff 比例阈值
-pub const P_FRAME_DIFF_RATIO_THRESHOLD: f64 = 0.80;
-
 // ─── v0.2 新增：心跳参数 ───
-
-/// 心跳像素位置（从右下角算起的模块坐标偏移）
-pub const HEARTBEAT_MODULE_OFFSET: u32 = 3;
-
-/// 心跳像素块尺寸（像素）
 pub const HEARTBEAT_PIXEL_SIZE: u32 = 2;
 
 /// 心跳变化幅度
@@ -176,16 +82,8 @@ pub const SAMPLE_RADIUS_BINARY: i32 = 1;
 /// 灰度模式采样半径（5×5，radius=2）
 pub const SAMPLE_RADIUS_GRAY: i32 = 2;
 
-/// 默认灰度级数
-/// 改为 2（二值），参考二维码识别的抗噪能力：黑白对比强，对远程桌面视频压缩更鲁棒
+/// 默认灰度级数（2 = 二值，最稳定；4+ = 灰度，待调通）
 pub const GRAY_LEVELS_DEFAULT: u32 = 2;
 
 /// 有效的灰度级数列表
 pub const VALID_GRAY_LEVELS: [u32; 5] = [2, 4, 5, 8, 16];
-
-// ─── v0.2 新增：P 帧背景色 ───
-
-/// P 帧背景色（中灰，RGB 各通道）
-pub const P_FRAME_BG_R: u8 = 128;
-pub const P_FRAME_BG_G: u8 = 128;
-pub const P_FRAME_BG_B: u8 = 128;

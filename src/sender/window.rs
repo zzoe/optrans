@@ -15,6 +15,8 @@ use crate::common::error::{OptransError, OptransResult};
 use crate::win32::ffi;
 use crate::win32::helpers::{check_hwnd, last_error, to_wide};
 
+use log::info;
+
 /// 窗口额外内存中存储用户数据的偏移（64 位指针 = 8 字节）
 const USERDATA_OFFSET: i32 = 0;
 
@@ -228,7 +230,7 @@ impl SenderWindow {
                 window_w,
                 window_h,
                 ffi::NULL as ffi::HWND,
-                ffi::NULL as isize,
+                ffi::NULL,
                 hinstance,
                 ptr::null(),
             )
@@ -266,8 +268,8 @@ impl SenderWindow {
         unsafe { ffi::ShowCursor(ffi::FALSE) };
 
         // 通知用户窗口位置和帧尺寸
-        eprintln!(
-            "[optrans] 全屏窗口已显示 (0,0) {}×{}，帧图案 {}×{}（{}px边距），modules=({}w×{}h), module_pixels={}",
+        info!(
+            "全屏窗口已显示 (0,0) {}×{}，帧图案 {}×{}（{}px边距），modules=({}w×{}h), module_pixels={}",
             window_w, window_h, adjusted_w, adjusted_h,
             frame_margin,
             modules_per_side_w, modules_per_side_h, module_pixels
@@ -334,7 +336,7 @@ impl SenderWindow {
         let dst_stride = window_w * RGBA_CHANNELS;
         let dst_base = margin * dst_stride + margin * RGBA_CHANNELS; // 偏移 (margin, margin)
 
-        let rows = (copy_len + src_stride - 1) / src_stride;
+        let rows = copy_len.div_ceil(src_stride);
         for row in 0..rows {
             let row_start = row * src_stride;
             let row_end = (row_start + src_stride).min(copy_len);
@@ -375,21 +377,20 @@ impl SenderWindow {
         }
     }
 
-    /// 隐藏窗口
-    #[allow(dead_code)]
-    pub fn hide(&mut self) {
-        unsafe {
-            ffi::ShowWindow(self.hwnd, ffi::SW_HIDE);
-        }
-    }
-
     /// 使窗口客户区无效，触发重绘
+    ///
+    /// v0.19.4: `GdiFlush()` 强制 GDI 清空命令缓冲区。在远程桌面（BlastCodec）
+    /// 环境下，这相当于告知编码器"当前帧绘制完毕"，防止编码器将连续多帧
+    /// 合并导致接收端冻屏后突刷多帧。
     fn invalidate(&self) {
         unsafe {
             // 标记整个客户区为"脏"，以便 UpdateWindow 真正发送 WM_PAINT
             ffi::InvalidateRect(self.hwnd, ptr::null(), 1);
             // 立即发送 WM_PAINT（跳过消息队列）
             ffi::UpdateWindow(self.hwnd);
+            // 强制 GDI 立即执行所有排队的绘制命令
+            // 远程桌面下相当于帧边界信号，防止 BlastCodec 合并连续多帧
+            ffi::GdiFlush();
         }
     }
 
@@ -422,10 +423,16 @@ impl SenderWindow {
 
     /// 休眠指定毫秒数同时处理消息
     ///
+    /// v0.19.4: 用 `MsgWaitForMultipleObjects` 替代 `Sleep(10)` 轮询。
+    /// 线程在无消息时真正挂起直到超时到期，而非每 10ms 空转唤醒。
+    /// - 零 CPU 占用（对比之前每帧 ~15 次 `Sleep` 唤醒 + `PeekMessage`）
+    /// - 精确超时（对比 `Sleep(10)` 在默认 15.6ms 定时器分辨率下的显著超调）
+    ///
     /// 返回 `true` 如果应该继续运行，`false` 如果收到了退出消息。
     pub fn sleep_with_messages(&self, ms: u64) -> bool {
         let start = unsafe { ffi::GetTickCount() };
         loop {
+            // 先处理已有消息
             if !self.process_messages() {
                 return false;
             }
@@ -433,16 +440,27 @@ impl SenderWindow {
             if elapsed >= ms as u32 {
                 break;
             }
-            // 短暂休眠以避免 CPU 空转
-            unsafe { ffi::Sleep(10) };
+            let remaining = (ms as u32).saturating_sub(elapsed);
+            if remaining == 0 {
+                break;
+            }
+            // 阻塞等待：消息到达或超时，线程挂起零 CPU
+            let ret = unsafe {
+                ffi::MsgWaitForMultipleObjects(
+                    0,
+                    std::ptr::null(),
+                    0,
+                    remaining,
+                    ffi::QS_ALLINPUT,
+                )
+            };
+            // WAIT_OBJECT_0 → 消息到达，继续循环处理
+            // WAIT_TIMEOUT → 超时，退出
+            if ret != ffi::WAIT_OBJECT_0 {
+                break;
+            }
         }
         true
-    }
-
-    /// 获取窗口句柄
-    #[allow(dead_code)]
-    pub fn hwnd(&self) -> ffi::HWND {
-        self.hwnd
     }
 }
 

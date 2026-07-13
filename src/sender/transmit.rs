@@ -9,21 +9,23 @@ use std::sync::mpsc;
 use std::thread;
 
 use crate::cli::SendArgs;
-use crate::common::constants::EOT_REPEAT;
 use crate::common::error::{OptransError, OptransResult};
-use crate::common::types::{
-    BlockData, GrayEncodingConfig,
-};
+use crate::common::types::{BlockData, GrayEncodingConfig};
 use crate::encoder::frame::Frame;
 use crate::encoder::render::render_frame_default;
 use crate::sender::window::SenderWindow;
 
+use log::{debug, info, warn};
+
 /// 首帧 / 末帧驻留时间（ms）
-const BOUNDARY_DWELL_MS: u64 = 500;
+const BOUNDARY_DWELL_MS: u64 = 100;
 
 /// 将字节数组格式化为十六进制字符串
 fn hex_str(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join("")
+    data.iter()
+        .map(|b| format!("{:02x}", b))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// 根据屏幕尺寸和编码参数，计算每帧能容纳的最大载荷字节数
@@ -67,7 +69,10 @@ fn frame_capacity_for_modules(
     let max_rs_encoded: usize = match gray_levels {
         2 => available / 8,
         4 => available / 4,
-        5 => { let v = (available * 2) / 7; v.saturating_sub(1) }
+        5 => {
+            let v = (available * 2) / 7;
+            v.saturating_sub(1)
+        }
         8 => (available * 3) / 8,
         16 => available / 2,
         _ => available / 8,
@@ -96,8 +101,8 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
     // 验证灰度级数
     let valid_levels = crate::common::constants::VALID_GRAY_LEVELS;
     if !valid_levels.contains(&gray_levels) {
-        eprintln!(
-            "[optrans] 警告: 灰度级数 {} 不在推荐范围 {:?}，继续使用",
+        warn!(
+            "警告: 灰度级数 {} 不在推荐范围 {:?}，继续使用",
             gray_levels, valid_levels
         );
     }
@@ -107,21 +112,18 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
     // encoding_mode_bit: 2级灰度=二值模式=bit0, 其他=灰度模式=bit1
     let encoding_mode_bit: u8 = if gray_levels == 2 { 0 } else { 1 };
 
-    eprintln!(
-        "[optrans] 灰度配置: {} 级, 编码模式位={}",
+    debug!(
+        "灰度配置: {} 级, 编码模式位={}",
         gray_levels, encoding_mode_bit
     );
 
     // 1. 根据屏幕尺寸计算每帧最大容量
-    let (modules_w, modules_h, max_payload_per_frame) = calculate_frame_capacity(
-        module_pixels,
-        &gray_config,
-        args.frame_margin,
-    );
+    let (modules_w, modules_h, max_payload_per_frame) =
+        calculate_frame_capacity(module_pixels, &gray_config, args.frame_margin);
 
     if max_payload_per_frame <= 4 {
         return Err(OptransError::InvalidArgument(
-            "屏幕尺寸不足以容纳任何数据帧，请增大窗口或减小 module_pixels".to_string()
+            "屏幕尺寸不足以容纳任何数据帧，请增大窗口或减小 module_pixels".to_string(),
         ));
     }
 
@@ -130,13 +132,17 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
     let block_size = max_payload_per_frame.saturating_sub(8);
 
     // 2. 读取文件并分块
-    let manifest = crate::sender::chunker::read_file_with_block_size(&Path::new(&args.path), block_size)?;
+    let manifest =
+        crate::sender::chunker::read_file_with_block_size(Path::new(&args.path), block_size)?;
 
-    eprintln!(
-        "[optrans] 文件: {} ({} bytes, {} 块, 每块≤{}B)",
-        manifest.file_name, manifest.file_size, manifest.blocks.len(), block_size
+    info!(
+        "文件: {} ({} bytes, {} 块, 每块≤{}B)",
+        manifest.file_name,
+        manifest.file_size,
+        manifest.blocks.len(),
+        block_size
     );
-    eprintln!("[optrans] SHA-256: {}", hex_str(&manifest.sha256));
+    info!("SHA-256: {}", hex_str(&manifest.sha256));
 
     let total_blocks = manifest.blocks.len() as u32;
 
@@ -147,22 +153,25 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
     let eot_frame = Frame::new_eot(eot_seq)?;
 
     // 4. 创建全屏最大化窗口
-    let mut window = SenderWindow::create_sized(module_pixels, modules_w, modules_h, args.frame_margin)?;
+    let mut window =
+        SenderWindow::create_sized(module_pixels, modules_w, modules_h, args.frame_margin)?;
 
-    eprintln!(
-        "[optrans] 帧尺寸: {}w×{}h modules ({}×{}px, max_payload={}B)",
-        modules_w, modules_h,
-        modules_w * module_pixels, modules_h * module_pixels,
+    info!(
+        "帧尺寸: {}w×{}h modules ({}×{}px, max_payload={}B)",
+        modules_w,
+        modules_h,
+        modules_w * module_pixels,
+        modules_h * module_pixels,
         max_payload_per_frame
     );
-    eprintln!("[optrans] 开始发送...");
+    info!("开始发送...");
 
     let mut global_seq: u16 = 0;
 
     // 元数据 payload 大小
     let meta_payload = {
         let mut p = Vec::new();
-        p.push(manifest.file_name.as_bytes().len() as u8);
+        p.push(manifest.file_name.len() as u8);
         p.extend_from_slice(manifest.file_name.as_bytes());
         p.extend_from_slice(&manifest.file_size.to_le_bytes());
         p.extend_from_slice(&manifest.sha256);
@@ -173,39 +182,51 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
 
     // 检查是否可以将元数据合并到第一个数据帧（小文件优化）
     let can_merge_meta = total_blocks == 1
-        && 2 + 4 + 2 + meta_payload_len + 4 + 2 + manifest.blocks[0].data.len() <= max_payload_per_frame;
+        && 2 + 4 + 2 + meta_payload_len + 4 + 2 + manifest.blocks[0].data.len()
+            <= max_payload_per_frame;
 
     // 单轮发送：不重传，靠单帧高可靠解码（参考二维码识别的容错思路：
     // 数据块自带 RS 纠错，格式信息解码失败时接收端降级重试平移/变半径）
     {
         if !window.process_messages() {
-            eprintln!("[optrans] 用户中止发送");
+            info!("用户中止发送");
             return Ok(());
         }
 
         if can_merge_meta {
             // 小文件：元数据 + 数据合并到一个帧，直接进入数据发送
-            eprintln!("[optrans] ▶ 小文件模式：元数据+数据合并为单帧，开始发送...");
+            info!("▶ 小文件模式：元数据+数据合并为单帧，开始发送...");
         } else {
             // 先发送元数据帧（始终 I 帧、二值渲染）
             {
                 if !window.process_messages() {
-                    eprintln!("[optrans] 用户中止发送");
+                    info!("用户中止发送");
                     return Ok(());
                 }
                 let meta_gray_config = GrayEncodingConfig::new(2); // 元数据帧始终二值
-                let pixels = render_frame_default(&meta_frame, module_pixels, modules_w, modules_h, &meta_gray_config, false, None);
+                let pixels = render_frame_default(
+                    &meta_frame,
+                    module_pixels,
+                    modules_w,
+                    modules_h,
+                    &meta_gray_config,
+                    false,
+                    None,
+                );
                 window.update_bitmap(&pixels);
-                eprintln!("  [META] seq={}", meta_frame.sequence());
+                debug!("  [META] seq={}", meta_frame.sequence());
                 global_seq += 1;
 
                 // 元数据帧已显示，短暂驻留后开始发送数据
-                eprintln!("[optrans] □ 确认帧已显示，{}ms 后开始发送...", BOUNDARY_DWELL_MS);
+                info!(
+                    "□ 确认帧已显示，{}ms 后开始发送...",
+                    BOUNDARY_DWELL_MS
+                );
                 if !window.sleep_with_messages(BOUNDARY_DWELL_MS) {
-                    eprintln!("[optrans] 用户中止发送");
+                    info!("用户中止发送");
                     return Ok(());
                 }
-                eprintln!("[optrans] ▶ 开始发送数据帧");
+                info!("▶ 开始发送数据帧");
             }
         }
 
@@ -237,12 +258,15 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
             }
 
             let frame = if can_merge_meta && frame_idx == 0 {
-                Frame::new_merged_with_meta(global_seq, total_blocks, encoding_mode_bit,
-                    &meta_payload, &merged_blocks)?
-            } else {
-                Frame::new_data_merged(
-                    &merged_blocks, global_seq, total_blocks, encoding_mode_bit,
+                Frame::new_merged_with_meta(
+                    global_seq,
+                    total_blocks,
+                    encoding_mode_bit,
+                    &meta_payload,
+                    &merged_blocks,
                 )?
+            } else {
+                Frame::new_data_merged(&merged_blocks, global_seq, total_blocks, encoding_mode_bit)?
             };
 
             data_frames.push(frame);
@@ -251,7 +275,11 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
         }
 
         let total_frames = data_frames.len();
-        eprintln!("[optrans] ▶ 已构建 {} 帧，启动渲染线程...", total_frames);
+        info!("▶ 已构建 {} 帧，启动渲染线程...", total_frames);
+
+        // v0.19.4: 提前释放 manifest（含原始文件数据拷贝），渲染阶段仅保留 RS 编码的帧数据
+        drop(manifest);
+        drop(meta_payload);
 
         // ── 阶段 2: 渲染线程 (异步) + display loop (严格串行) ──
         let (render_tx, render_rx) = mpsc::channel::<Vec<u8>>();
@@ -260,8 +288,13 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
         thread::spawn(move || {
             for frame in &data_frames {
                 let pixels = render_frame_default(
-                    frame, module_pixels, modules_w, modules_h,
-                    &render_gray, enable_heartbeat, None,
+                    frame,
+                    module_pixels,
+                    modules_w,
+                    modules_h,
+                    &render_gray,
+                    enable_heartbeat,
+                    None,
                 );
                 if render_tx.send(pixels).is_err() {
                     break; // display loop 退出
@@ -271,55 +304,70 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
         });
 
         // display loop: 严格串行，每帧 interval_ms
-        for pixels in render_rx {
+        let mut last_frame_time = unsafe { crate::win32::ffi::GetTickCount() };
+        for (i, pixels) in render_rx.into_iter().enumerate() {
             if !window.process_messages() {
-                eprintln!("[optrans] 用户中止发送");
+                info!("用户中止发送");
                 return Ok(());
             }
+
+            // 诊断：记录帧间隔（v0.19.4）
+            let now = unsafe { crate::win32::ffi::GetTickCount() };
+            let actual_interval = now.wrapping_sub(last_frame_time);
+            if actual_interval > (interval_ms as u32) * 2 {
+                debug!(
+                    "  [帧间隔] 第 {} 帧实际间隔 {}ms（期望 {}ms），可能丢帧！",
+                    i + 1,
+                    actual_interval,
+                    interval_ms
+                );
+            }
+            last_frame_time = now;
+
             window.update_bitmap(&pixels);
             if !window.sleep_with_messages(interval_ms) {
-                eprintln!("[optrans] 用户中止发送");
+                info!("用户中止发送");
                 return Ok(());
             }
         }
     }
 
     // 6. 发送 EOT 帧
-    eprintln!("[optrans] 发送 EOT 信号...");
-    for i in 0..EOT_REPEAT {
-        if !window.process_messages() {
-            eprintln!("[optrans] 用户中止发送");
-            return Ok(());
-        }
-
-        let pixels = render_frame_default(&eot_frame, module_pixels, modules_w, modules_h, &gray_config, false, None);
-        window.update_bitmap(&pixels);
-        eprintln!(
-            "  [EOT {}/{}] seq={}",
-            i + 1,
-            EOT_REPEAT,
-            eot_frame.sequence()
-        );
-
-        if !window.sleep_with_messages(interval_ms) {
-            eprintln!("[optrans] 用户中止发送");
-            return Ok(());
-        }
+    info!("发送 EOT 信号...");
+    if !window.process_messages() {
+        info!("用户中止发送");
+        return Ok(());
     }
 
-    // 7. EOT 帧驻留 500ms，确保接收端有充足时间检测
-    eprintln!("[optrans] EOT 帧驻留 {}ms，等待接收端确认...", BOUNDARY_DWELL_MS);
+    let pixels = render_frame_default(
+        &eot_frame,
+        module_pixels,
+        modules_w,
+        modules_h,
+        &gray_config,
+        false,
+        None,
+    );
+    window.update_bitmap(&pixels);
+    debug!("  [EOT] seq={}", eot_frame.sequence());
+
+    // 7. EOT 帧驻留，确保接收端有充足时间检测
+    info!(
+        "EOT 帧驻留 {}ms，等待接收端确认...",
+        BOUNDARY_DWELL_MS
+    );
     let dwell_start = unsafe { crate::win32::ffi::GetTickCount() };
     loop {
         if !window.process_messages() {
             break;
         }
-        if (unsafe { crate::win32::ffi::GetTickCount() } - dwell_start) >= BOUNDARY_DWELL_MS as u32 {
+        if (unsafe { crate::win32::ffi::GetTickCount() } - dwell_start) >= BOUNDARY_DWELL_MS as u32
+        {
             break;
         }
         unsafe { crate::win32::ffi::Sleep(50) };
     }
-    eprintln!("[optrans] 发送完成，窗口即将关闭");
+    info!("发送完成，窗口即将关闭");
 
     // window 的 Drop 实现会自动调用 DestroyWindow 关闭窗口
     Ok(())

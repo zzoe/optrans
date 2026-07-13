@@ -11,6 +11,8 @@ use sha2::{Digest, Sha256};
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::MetaPayload;
 
+use log::debug;
+
 /// 文件组装器：按块索引重组文件
 pub struct FileAssembler {
     /// 文件元数据
@@ -84,8 +86,8 @@ impl FileAssembler {
     pub fn finalize_to_file(self, output_path: &Path) -> OptransResult<()> {
         let data = self.finalize()?;
         fs::write(output_path, &data)?;
-        eprintln!(
-            "[optrans] 文件已写入: {:?} ({} bytes)",
+        debug!(
+            "文件已写入: {:?} ({} bytes)",
             output_path,
             data.len()
         );

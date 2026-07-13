@@ -51,7 +51,7 @@ pub fn decode_format_info(
 
     // 原始尝试
     match vote_and_check(&raw_bits, repetitions) {
-        Ok(info) => return Ok(info),
+        Ok(info) => Ok(info),
         Err(first_err) => {
             let is_fake = matches!(&first_err, OptransError::InvalidFormatInfo(m) if m.starts_with("假帧"));
             if is_fake {
@@ -69,11 +69,10 @@ pub fn decode_format_info(
                         }
                         // v0.13: 平移后帧宽不变，但为防御性也尝试不同重复次数
                         let r2 = format_info_params(adj.modules_w).0;
-                        if r2 != repetitions && raw2.len() >= format_info_params(adj.modules_w).1 {
-                            if let Ok(info) = vote_and_check(&raw2, r2) {
+                        if r2 != repetitions && raw2.len() >= format_info_params(adj.modules_w).1
+                            && let Ok(info) = vote_and_check(&raw2, r2) {
                                 return Ok(info);
                             }
-                        }
                     }
                 }
             }
@@ -82,13 +81,12 @@ pub fn decode_format_info(
                 let raw2 = extract::extract_format_modules_with_radius(
                     pixels, img_width, img_height, loc, radius,
                 );
-                if raw2.len() >= min_bits {
-                    if let Ok(info) = vote_and_check(&raw2, repetitions) {
+                if raw2.len() >= min_bits
+                    && let Ok(info) = vote_and_check(&raw2, repetitions) {
                         return Ok(info);
                     }
-                }
             }
-            return Err(first_err);
+            Err(first_err)
         }
     }
 }
@@ -116,7 +114,7 @@ fn vote_and_check(raw_bits: &[u8], repetitions: usize) -> OptransResult<FormatIn
 
     let encoded_bits = &raw_bits[..min_required];
 
-    let mut decoded_15bytes = vec![0u8; 15];
+    let mut decoded_15bytes = [0u8; 15];
     for byte_idx in 0..15 {
         let mut byte_val: u8 = 0;
         for bit in 0..8 {
@@ -198,8 +196,8 @@ fn calc_gray_module_count(byte_count: usize, levels: u32) -> usize {
     match levels {
         2 => byte_count * 8,
         4 => byte_count * 4,
-        5 => ((byte_count + 1) / 2) * 7,
-        8 => (byte_count * 8 + 2) / 3,
+        5 => byte_count.div_ceil(2) * 7,
+        8 => (byte_count * 8).div_ceil(3),
         16 => byte_count * 2,
         _ => byte_count * 8,
     }
@@ -223,8 +221,7 @@ pub fn decode_payload(
     }
 
     let payload_bytes = info.payload_bytes as usize;
-    let num_rs_blocks = (payload_bytes + crate::common::constants::RS_DATA_LEN - 1)
-        / crate::common::constants::RS_DATA_LEN;
+    let num_rs_blocks = payload_bytes.div_ceil(crate::common::constants::RS_DATA_LEN);
     let encoded_bytes = 4 + num_rs_blocks * crate::common::constants::RS_TOTAL_LEN;
 
     let encoded_bits = match encoding_mode {

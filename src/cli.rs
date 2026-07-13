@@ -66,68 +66,6 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         debug: bool,
     },
-    /// 测试模式：发送端显示单帧硬编码数据，接收端截取解码
-    Test {
-        #[command(subcommand)]
-        mode: TestMode,
-    },
-}
-
-/// 测试模式子命令
-#[derive(Subcommand, Debug, Clone)]
-pub enum TestMode {
-    /// 发送固定测试内容（复用 send 完整流程，仅文件内容固定为 "HELLO OPTRANS TEST"）
-    Send {
-        /// 每模块像素数（2-8 之间的偶数，默认 4）
-        #[arg(long, default_value_t = constants::MODULE_PIXELS_DEFAULT)]
-        module_pixels: u32,
-
-        /// 帧间隔毫秒数（默认 300ms）
-        #[arg(long, default_value_t = constants::FRAME_INTERVAL_MS)]
-        interval_ms: u64,
-
-        /// 灰度级数：2/4/5/8/16（默认 2，二值最抗远程桌面压缩）
-        #[arg(long, default_value_t = constants::GRAY_LEVELS_DEFAULT)]
-        gray_levels: u32,
-
-        /// 帧边距像素数（编码图案四周的黑边，远程桌面场景建议 120）
-        #[arg(long, default_value_t = constants::FRAME_MARGIN_PX_DEFAULT)]
-        frame_margin: u32,
-
-        /// 禁用差分编码（P 帧），全发 I 帧
-        #[arg(long, default_value_t = false)]
-        no_diff: bool,
-
-        /// 禁用心跳噪声注入
-        #[arg(long, default_value_t = false)]
-        no_heartbeat: bool,
-
-        /// 强制 I 帧间隔（连续 P 帧数超过此值后发 I 帧，默认 10）
-        #[arg(long, default_value_t = constants::I_FRAME_INTERVAL_DEFAULT)]
-        i_frame_interval: u32,
-    },
-    /// 接收测试帧（复用 receive 完整流程）
-    Receive {
-        /// 输出文件路径（可选；不指定时从发送端元数据解析文件名）
-        output: Option<std::path::PathBuf>,
-
-        /// 每模块像素数（必须与发送端一致，默认 4）
-        #[arg(long, default_value_t = constants::MODULE_PIXELS_DEFAULT)]
-        module_pixels: u32,
-
-        /// 编码模式：auto / binary / gray[-N]（默认 auto）
-        #[arg(long, default_value = "auto")]
-        encoding_mode: String,
-
-        /// 调试模式：把解码失败的截图保存到 optrans_debug/ 目录
-        #[arg(long, default_value_t = false)]
-        debug: bool,
-    },
-    /// 从指定 PNG 图片解码测试帧（用于离线调试）
-    DecodeImage {
-        /// PNG 图片路径
-        path: std::path::PathBuf,
-    },
 }
 
 /// 发送端参数（清理后的结构体）
@@ -162,11 +100,6 @@ pub struct ReceiveArgs {
     pub encoding_mode: EncodingMode,
     /// 调试模式：保存解码失败的截图
     pub debug: bool,
-}
-
-/// 解析 CLI 参数并返回清理后的结构体
-pub fn parse() -> (SendArgs, ReceiveArgs) {
-    panic!("请使用 parse_command() 函数");
 }
 
 /// 解析 CLI 并返回子命令枚举

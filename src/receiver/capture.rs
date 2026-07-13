@@ -14,6 +14,8 @@ use crate::common::error::{OptransError, OptransResult};
 use crate::win32::ffi;
 use crate::win32::helpers::{check_hdc, last_error};
 
+use log::warn;
+
 /// CAPTUREBLT 光栅操作：BitBlt 时包含所有通过分层窗口覆盖的内容
 const CAPTUREBLT: u32 = 0x40000000;
 
@@ -99,7 +101,7 @@ pub fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> OptransResult<(Vec<u8>,
                 if !is_all_white(&p.0) {
                     return Ok((p.0.clone(), p.1, p.2, 1));
                 }
-                eprintln!("[capture] 策略1(GetWindowDC) 全白，尝试策略2");
+                warn!("策略1(GetWindowDC) 全白，尝试策略2");
             }
         }
     }
@@ -113,7 +115,7 @@ pub fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> OptransResult<(Vec<u8>,
             if !is_all_white(&p.0) {
                 return Ok((p.0.clone(), p.1, p.2, 2));
             }
-            eprintln!("[capture] 策略2(GetDC) 全白，尝试策略3(CAPTUREBLT)");
+            warn!("策略2(GetDC) 全白，尝试策略3(CAPTUREBLT)");
         }
     }
 

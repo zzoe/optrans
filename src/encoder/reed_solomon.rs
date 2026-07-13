@@ -34,7 +34,7 @@ impl RsEncoder {
     /// 编码后的数据，格式为 `[4 bytes total_len LE] + [RS blocks...]`
     pub fn encode(&self, data: &[u8]) -> OptransResult<Vec<u8>> {
         let total_len = data.len() as u32;
-        let num_blocks = (data.len() + RS_DATA_LEN - 1) / RS_DATA_LEN;
+        let num_blocks = data.len().div_ceil(RS_DATA_LEN);
         if num_blocks == 0 {
             // 空数据：仅返回长度头
             let mut output = Vec::with_capacity(4);

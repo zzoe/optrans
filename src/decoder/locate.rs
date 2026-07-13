@@ -8,6 +8,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use log::debug;
+
 use crate::common::types::{FinderPattern, FrameLocation};
 
 /// locate_frame 的诊断统计信息
@@ -36,7 +38,7 @@ fn diag_ratelimited(msg: &str) {
     let last = LAST_DIAG_MS.load(Ordering::Relaxed);
     if now.saturating_sub(last) >= 2000 {
         LAST_DIAG_MS.store(now, Ordering::Relaxed);
-        eprintln!("[optrans] {}", msg);
+        debug!("{}", msg);
     }
 }
 
@@ -96,7 +98,7 @@ pub fn locate_by_corners(
     let modules_h = ((bl.1 - tl.1) / avg_module_size).round() as u32 + 7;
 
     // 合理性检查
-    if modules_w < 25 || modules_w > 1000 || modules_h < 25 || modules_h > 1000 {
+    if !(25..=1000).contains(&modules_w) || !(25..=1000).contains(&modules_h) {
         diag_ratelimited(&format!(
             "角落定位: modules 尺寸异常 ({}w×{}h)，跳过",
             modules_w, modules_h
@@ -812,7 +814,7 @@ fn search_triangles(
 
                 // --- 约束 (c): 矩形约束 (ratio 0.3–3.0，允许长方形帧) ---
                 let ratio = d_top / d_left;
-                if ratio < 0.3 || ratio > 3.0 {
+                if !(0.3..=3.0).contains(&ratio) {
                     continue;
                 }
 
@@ -840,7 +842,7 @@ fn search_triangles(
                 // --- 估算 modules_w 和 modules_h（支持长方形帧） ---
                 let modules_w = (d_top / avg_m).round() as u32 + 7;
                 let modules_h = (d_left / avg_m).round() as u32 + 7;
-                if modules_w < 25 || modules_w > 1000 || modules_h < 25 || modules_h > 1000 {
+                if !(25..=1000).contains(&modules_w) || !(25..=1000).contains(&modules_h) {
                     continue;
                 }
                 let modules_per_side = modules_w.max(modules_h);

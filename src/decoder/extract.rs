@@ -8,6 +8,61 @@
 use crate::common::types::{EncodingMode, FrameLocation};
 use crate::common::constants::{SAMPLE_RADIUS_BINARY, SAMPLE_RADIUS_GRAY};
 
+// ═══════════════════════════════════════════════════════════════════
+//  仿射变换预计算（v0.19.4 优化）
+// ═══════════════════════════════════════════════════════════════════
+//
+// Finder pattern 定位后，从模块坐标 → 像素坐标的仿射变换参数是常量。
+// 预计算一次，避免每个模块都重复 10+ 次 f64 运算。
+// 对于 640×400 帧的 25 万+ 数据模块，节省约 250 万次浮点运算。
+
+/// 预计算的仿射变换参数：从模块坐标 (col, row) → 像素坐标 (x, y)
+struct AffineTransform {
+    dst_dx_x: f64,
+    dst_dx_y: f64,
+    dst_dy_x: f64,
+    dst_dy_y: f64,
+    /// base_x = dst_tl_x - dst_dx_x*3.5 - dst_dy_x*3.5
+    base_x: f64,
+    /// base_y = dst_tl_y - dst_dx_y*3.5 - dst_dy_y*3.5
+    base_y: f64,
+}
+
+impl AffineTransform {
+    fn from_location(loc: &FrameLocation) -> Self {
+        let n_w = loc.modules_w as f64;
+        let n_h = loc.modules_h as f64;
+        let src_tl_x = 3.5;
+        let src_tl_y = 3.5;
+        let src_tr_x = n_w - 3.5;
+        let src_bl_y = n_h - 3.5;
+
+        let src_dx = src_tr_x - src_tl_x;
+        let src_dy = src_bl_y - src_tl_y;
+
+        let dst_dx_x = (loc.tr.center_x - loc.tl.center_x) / src_dx;
+        let dst_dx_y = (loc.tr.center_y - loc.tl.center_y) / src_dx;
+        let dst_dy_x = (loc.bl.center_x - loc.tl.center_x) / src_dy;
+        let dst_dy_y = (loc.bl.center_y - loc.tl.center_y) / src_dy;
+
+        // 预计算偏移，避免每个模块都做 (mx - 3.5) 运算
+        let base_x = loc.tl.center_x - dst_dx_x * src_tl_x - dst_dy_x * src_tl_y;
+        let base_y = loc.tl.center_y - dst_dx_y * src_tl_x - dst_dy_y * src_tl_y;
+
+        AffineTransform { dst_dx_x, dst_dx_y, dst_dy_x, dst_dy_y, base_x, base_y }
+    }
+
+    /// 模块中心 → 像素坐标（仅 4 次乘 + 4 次加）
+    #[inline]
+    fn to_pixel(&self, module_col: usize, module_row: usize) -> (f64, f64) {
+        let mx = module_col as f64 + 0.5;
+        let my = module_row as f64 + 0.5;
+        let px = self.base_x + self.dst_dx_x * mx + self.dst_dy_x * my;
+        let py = self.base_y + self.dst_dx_y * mx + self.dst_dy_y * my;
+        (px, py)
+    }
+}
+
 /// 从格式信息区提取所有模块的比特值
 ///
 /// 格式信息区：模块行 0 和 行 1，列 7..n_w-8
@@ -42,11 +97,13 @@ pub fn extract_format_modules_with_radius(
     let start_col = s;
     let end_col = n_w - s;
 
+    let affine = AffineTransform::from_location(loc);
+
     let mut bits = Vec::with_capacity((end_col - start_col) * 2);
 
     for row in 0..2usize {
         for col in start_col..end_col {
-            let (px, py) = module_pixel_center(loc, col, row);
+            let (px, py) = affine.to_pixel(col, row);
             let module_val = if radius <= 0 {
                 sample_pixel_point(pixels, img_width, img_height, px, py)
             } else {
@@ -57,31 +114,6 @@ pub fn extract_format_modules_with_radius(
     }
 
     bits
-}
-
-/// 计算模块中心的像素坐标（基于 TL/TR/BL 三个 finder 的仿射变换）
-#[inline]
-fn module_pixel_center(loc: &FrameLocation, module_col: usize, module_row: usize) -> (f64, f64) {
-    let n_w = loc.modules_w as f64;
-    let n_h = loc.modules_h as f64;
-    let src_tl_x = 3.5;
-    let src_tl_y = 3.5;
-    let src_tr_x = n_w - 3.5;
-    let src_bl_y = n_h - 3.5;
-
-    let src_dx = src_tr_x - src_tl_x;
-    let src_dy = src_bl_y - src_tl_y;
-
-    let dst_dx_x = (loc.tr.center_x - loc.tl.center_x) / src_dx;
-    let dst_dx_y = (loc.tr.center_y - loc.tl.center_y) / src_dx;
-    let dst_dy_x = (loc.bl.center_x - loc.tl.center_x) / src_dy;
-    let dst_dy_y = (loc.bl.center_y - loc.tl.center_y) / src_dy;
-
-    let mx = module_col as f64 + 0.5;
-    let my = module_row as f64 + 0.5;
-    let px = loc.tl.center_x + dst_dx_x * (mx - src_tl_x) + dst_dy_x * (my - src_tl_y);
-    let py = loc.tl.center_y + dst_dx_y * (mx - src_tl_x) + dst_dy_y * (my - src_tl_y);
-    (px, py)
 }
 
 /// 单点采样：直接取模块中心像素亮度，阈值 128（用于降级重试 radius=0）
@@ -120,6 +152,8 @@ pub fn extract_data_modules(
     let n_h = loc.modules_h as usize;
     let s = 7usize;
 
+    let affine = AffineTransform::from_location(loc);
+
     let mut values = Vec::with_capacity(payload_bits);
 
     for row in 0..n_h {
@@ -137,11 +171,11 @@ pub fn extract_data_modules(
                 break;
             }
 
-            let module_val = sample_module(
+            let module_val = sample_module_with_affine(
                 pixels,
                 img_width,
                 img_height,
-                loc,
+                &affine,
                 col,
                 row,
                 encoding_mode,
@@ -187,45 +221,36 @@ pub fn sample_module(
     module_row: usize,
     encoding_mode: &EncodingMode,
 ) -> u8 {
-    let n_w = loc.modules_w as f64;
-    let n_h = loc.modules_h as f64;
+    let affine = AffineTransform::from_location(loc);
+    sample_module_with_affine(pixels, img_width, img_height, &affine, module_col, module_row, encoding_mode)
+}
 
-    // 建立仿射变换：模块坐标 → 像素坐标
-    // TL finder 中心在模块坐标 (3.5, 3.5)
-    // TR finder 中心在模块坐标 (n_w - 3.5, 3.5)
-    // BL finder 中心在模块坐标 (3.5, n_h - 3.5)
-    let src_tl_x = 3.5;
-    let src_tl_y = 3.5;
-    let src_tr_x = n_w - 3.5;
-    let src_bl_y = n_h - 3.5;
-
-    let dst_tl_x = loc.tl.center_x;
-    let dst_tl_y = loc.tl.center_y;
-    let dst_tr_x = loc.tr.center_x;
-    let dst_tr_y = loc.tr.center_y;
-    let dst_bl_x = loc.bl.center_x;
-    let dst_bl_y = loc.bl.center_y;
-
-    let src_dx = src_tr_x - src_tl_x;
-    let src_dy = src_bl_y - src_tl_y;
-
-    let dst_dx_x = (dst_tr_x - dst_tl_x) / src_dx;
-    let dst_dx_y = (dst_tr_y - dst_tl_y) / src_dx;
-    let dst_dy_x = (dst_bl_x - dst_tl_x) / src_dy;
-    let dst_dy_y = (dst_bl_y - dst_tl_y) / src_dy;
-
-    let mx = module_col as f64 + 0.5; // 模块中心
-    let my = module_row as f64 + 0.5; // 模块中心
-    let px = dst_tl_x + dst_dx_x * (mx - src_tl_x) + dst_dy_x * (my - src_tl_y);
-    let py = dst_tl_y + dst_dx_y * (mx - src_tl_x) + dst_dy_y * (my - src_tl_y);
+/// 使用预计算的仿射变换采样单个模块（避免重复计算仿射参数）
+///
+/// v0.19.4: 灰度级 ≤4 时用 3×3 均值（与二值相同窗口大小），避免 5×5 窗口
+/// 跨模块重叠；灰度级 >4 时才用 5×5 中值抗噪。
+#[inline]
+fn sample_module_with_affine(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    affine: &AffineTransform,
+    module_col: usize,
+    module_row: usize,
+    encoding_mode: &EncodingMode,
+) -> u8 {
+    let (px, py) = affine.to_pixel(module_col, module_row);
 
     match encoding_mode {
         EncodingMode::Binary | EncodingMode::Auto => {
-            // 二值模式：3×3 均值 + 阈值 128
             sample_module_binary_at(pixels, img_width, img_height, px, py)
         }
+        EncodingMode::Gray(levels) if *levels <= 4 => {
+            // 低灰度级：3×3 均值，返回原始亮度（0-255）
+            sample_pixel_region_luminance(pixels, img_width, img_height, px, py, SAMPLE_RADIUS_BINARY)
+        }
         EncodingMode::Gray(_) => {
-            // 灰度模式：5×5 中值 → 返回原始灰度值
+            // 高灰度级（5/8/16）：5×5 中值抗噪
             sample_module_gray(pixels, img_width, img_height, px, py)
         }
     }
@@ -257,7 +282,9 @@ pub fn sample_module_gray(
 
 /// 在像素坐标周围采样区域取亮度中值
 ///
-/// 采样 radius×radius 区域，排序取中值。
+/// 采样 radius×radius 区域，取中值。
+/// v0.19.4: 用固定大小栈数组代替堆 Vec，消除每次采样的 alloc 开销。
+/// 每帧数十万次采样，此优化可减少大量 malloc/free 调用。
 fn sample_pixel_region_median(
     pixels: &[u8],
     img_width: i32,
@@ -270,7 +297,9 @@ fn sample_pixel_region_median(
     let cx = px.round() as i32;
     let cy = py.round() as i32;
 
-    let mut luminances: Vec<u32> = Vec::with_capacity(((2 * radius + 1) * (2 * radius + 1)) as usize);
+    // 最大 radius=2 → 5×5=25 个像素，用栈数组避免堆分配
+    let mut luminances: [u32; 25] = [0; 25];
+    let mut count: usize = 0;
 
     for dy in -radius..=radius {
         for dx in -radius..=radius {
@@ -278,21 +307,67 @@ fn sample_pixel_region_median(
             let sy = cy + dy;
             if sx >= 0 && sx < img_width && sy >= 0 && sy < img_height {
                 let idx = (sy as usize * w + sx as usize) * 4;
-                let r = pixels[idx] as u32;
-                let g = pixels[idx + 1] as u32;
-                let b = pixels[idx + 2] as u32;
-                luminances.push((r * 299 + g * 587 + b * 114) / 1000);
+                if idx + 2 < pixels.len() {
+                    let r = pixels[idx] as u32;
+                    let g = pixels[idx + 1] as u32;
+                    let b = pixels[idx + 2] as u32;
+                    luminances[count] = (r * 299 + g * 587 + b * 114) / 1000;
+                    count += 1;
+                }
             }
         }
     }
 
-    if luminances.is_empty() {
+    if count == 0 {
         return 0;
     }
 
-    luminances.sort_unstable();
-    let median = luminances[luminances.len() / 2];
-    median as u8
+    // 仅排序有效元素
+    luminances[..count].sort_unstable();
+    luminances[count / 2] as u8
+}
+
+/// 在像素坐标周围采样区域取亮度均值（返回 0-255 原始值）
+///
+/// 与 sample_pixel_region_mean 相同算法，但不做二值化阈值判断。
+/// 用于低灰度级（≤4）模式：3×3 窗口不会跨模块边界，原始亮度值
+/// 被 classify_gray 分类到对应灰度级别。
+fn sample_pixel_region_luminance(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    px: f64,
+    py: f64,
+    radius: i32,
+) -> u8 {
+    let w = img_width as usize;
+    let cx = px.round() as i32;
+    let cy = py.round() as i32;
+
+    let mut sum: u32 = 0;
+    let mut count: u32 = 0;
+
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let sx = cx + dx;
+            let sy = cy + dy;
+            if sx >= 0 && sx < img_width && sy >= 0 && sy < img_height {
+                let idx = (sy as usize * w + sx as usize) * 4;
+                if idx + 2 < pixels.len() {
+                    let r = pixels[idx] as u32;
+                    let g = pixels[idx + 1] as u32;
+                    let b = pixels[idx + 2] as u32;
+                    sum += (r * 299 + g * 587 + b * 114) / 1000;
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    if count == 0 {
+        return 0;
+    }
+    (sum / count) as u8
 }
 
 /// 在像素坐标周围采样区域取亮度均值（用于二值模式）
@@ -398,7 +473,7 @@ fn decode_gray_direct(
     original_len: usize,
 ) -> Vec<u8> {
     let total_bits = original_len * 8;
-    let num_bytes = (total_bits + 7) / 8;
+    let num_bytes = total_bits.div_ceil(8);
     let mut bytes = vec![0u8; num_bytes];
     let mask = (1u32 << bits_per_module) - 1;
 

@@ -1,8 +1,8 @@
 [package]
 name = "optrans"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
-description = "通过屏幕视觉编码在 Horizon 远程桌面两端传输文件"
+description = "无网络文件传输：通过屏幕视觉编码在隔离网络间单向传递文件"
 
 [[bin]]
 name = "optrans"
@@ -12,7 +12,8 @@ path = "src/main.rs"
 clap = { version = "*", features = ["derive"] }
 sha2 = "*"
 reed-solomon = "*"
-image = { version = "*", default-features = false, features = ["png"] }
+log = "*"
+pretty_env_logger = "*"
 
 [profile.release]
 opt-level = 3

@@ -14,6 +14,8 @@ use crate::common::types::{
 use crate::decoder::decode::{decode_p_frame_payload, parse_meta_payload};
 use crate::decoder::reed_solomon::rs_decode_data;
 
+use log::warn;
+
 /// 接收端 I 帧缓存
 #[derive(Debug, Clone)]
 pub struct ReceiverCache {
@@ -194,8 +196,8 @@ impl FrameCollector {
         let (base_frame_seq, diff_entries) = decode_p_frame_payload(&frame.payload)?;
 
         if !self.check_base_frame(base_frame_seq) {
-            eprintln!(
-                "[optrans] 丢弃 P 帧 seq={}: base_frame_seq={} 与缓存不匹配 (缓存={})",
+            warn!(
+                "丢弃 P 帧 seq={}: base_frame_seq={} 与缓存不匹配 (缓存={})",
                 frame.frame_sequence,
                 base_frame_seq,
                 self.cache.as_ref().map(|c| c.i_frame_seq).unwrap_or(0)
@@ -215,15 +217,15 @@ impl FrameCollector {
         };
 
         // 计算 RS 编码后的字节数
-        let num_rs_blocks = (i_payload_bytes + RS_DATA_LEN - 1) / RS_DATA_LEN;
+        let num_rs_blocks = i_payload_bytes.div_ceil(RS_DATA_LEN);
         let encoded_bytes = 4 + num_rs_blocks * RS_TOTAL_LEN;
 
         // 计算需要的灰度模块数
         let needed_modules = match gray_levels {
             2 => encoded_bytes * 8,
             4 => encoded_bytes * 4,
-            5 => ((encoded_bytes + 1) / 2) * 7,
-            8 => (encoded_bytes * 8 + 2) / 3,
+            5 => encoded_bytes.div_ceil(2) * 7,
+            8 => (encoded_bytes * 8).div_ceil(3),
             16 => encoded_bytes * 2,
             _ => encoded_bytes * 8,
         };
@@ -265,7 +267,7 @@ impl FrameCollector {
         match &self.cache {
             Some(c) => c.i_frame_seq == base_frame_seq,
             None => {
-                eprintln!("[optrans] 收到 P 帧但无 I 帧缓存，丢弃");
+                warn!("收到 P 帧但无 I 帧缓存，丢弃");
                 false
             }
         }
