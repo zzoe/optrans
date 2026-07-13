@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 
-use crate::cli::ReceiveArgs;
+use crate::common::types::EncodingMode;
 use crate::common::error::{OptransError, OptransResult};
-use crate::common::types::{DecodedFrame, EncodingMode, FrameKind, FrameLocation, FrameType, IngestResult};
+use crate::common::types::{DecodedFrame, FrameKind, FrameLocation, FrameType, IngestResult};
 use crate::decoder::decode::{decode_format_info, decode_frame};
 use crate::decoder::locate::{locate_frame_all_with_diag, LocateDiagnostics};
 use crate::receiver::capture::capture_full_screen;
@@ -22,8 +22,7 @@ use crate::receiver::collect::FrameCollector;
 use crate::receiver::reassemble::FileAssembler;
 
 /// 执行接收操作的主入口（v0.19: 流水线架构）
-pub fn run_receive(args: ReceiveArgs) -> OptransResult<()> {
-    let encoding_mode = args.encoding_mode.clone();
+pub fn run_receive(output: Option<std::path::PathBuf>, encoding_mode: EncodingMode) -> OptransResult<()> {
 
     info!("开始接收...");
     info!("截屏模式: 全屏（Ctrl+C 退出）");
@@ -36,8 +35,7 @@ pub fn run_receive(args: ReceiveArgs) -> OptransResult<()> {
     let (tx, rx) = mpsc::channel::<DecodedFrame>();
 
     // ── shared state ──
-    let output_path = args.output.clone();
-    let shared_output = output_path.clone();
+    let shared_output = output.clone();
     let done = Arc::new(AtomicBool::new(false));
 
     // ── aggregator 线程 ──

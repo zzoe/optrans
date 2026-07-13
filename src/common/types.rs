@@ -63,23 +63,6 @@ pub enum EncodingMode {
 }
 
 impl EncodingMode {
-    /// 从字符串解析编码模式（用于 CLI）
-    pub fn from_str(s: &str) -> Option<EncodingMode> {
-        match s {
-            "auto" => Some(EncodingMode::Auto),
-            "binary" => Some(EncodingMode::Binary),
-            other => {
-                if let Some(level_str) = other.strip_prefix("gray-") {
-                    let level: u32 = level_str.parse().ok()?;
-                    Some(EncodingMode::Gray(level))
-                } else if other == "gray" {
-                    Some(EncodingMode::Gray(crate::common::constants::GRAY_LEVELS_DEFAULT))
-                } else {
-                    None
-                }
-            }
-        }
-    }
 }
 
 // ─── v0.2 新增：DiffEntry ───

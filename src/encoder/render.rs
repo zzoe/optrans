@@ -242,7 +242,7 @@ fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
 /// 超出数据模块数的部分被截断，末尾少数模块留白。
 ///
 /// v0.6: 应用数据掩码（XOR）打散大片同色区域，提升采样稳定性。
-fn build_data_gray_sequence(
+pub(crate) fn build_data_gray_sequence(
     encoded_payload: &[u8],
     n_w: usize,
     n_h: usize,

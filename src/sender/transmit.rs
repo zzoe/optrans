@@ -4,11 +4,11 @@
 //! v0.9: 多块合并发送，每帧填满 payload 容量。
 //! v0.19.3: render 线程异步预渲染，display loop 严格串行计时。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
-use crate::cli::SendArgs;
+use crate::common::constants;
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::{BlockData, GrayEncodingConfig};
 use crate::encoder::frame::Frame;
@@ -86,13 +86,13 @@ fn frame_capacity_for_modules(
 }
 
 /// 执行发送操作的主入口
-pub fn run_send(args: SendArgs) -> OptransResult<()> {
-    let module_pixels = args.module_pixels;
-    let interval_ms = args.interval_ms;
-    let gray_levels = args.gray_levels;
-    let _enable_diff = args.enable_diff;
-    let enable_heartbeat = args.enable_heartbeat;
-    let _i_frame_interval = args.i_frame_interval;
+pub fn run_send(path: PathBuf) -> OptransResult<()> {
+    let module_pixels = constants::MODULE_PIXELS_DEFAULT;
+    let interval_ms = constants::FRAME_INTERVAL_MS;
+    let gray_levels = constants::GRAY_LEVELS_DEFAULT;
+    let frame_margin = constants::FRAME_MARGIN_PX_DEFAULT;
+    let enable_heartbeat = true;
+    let i_frame_interval = constants::I_FRAME_INTERVAL_DEFAULT;
 
     // 验证灰度级数
     let valid_levels = crate::common::constants::VALID_GRAY_LEVELS;
@@ -115,7 +115,7 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
 
     // 1. 根据屏幕尺寸计算每帧最大容量
     let (modules_w, modules_h, max_payload_per_frame) =
-        calculate_frame_capacity(module_pixels, &gray_config, args.frame_margin);
+        calculate_frame_capacity(module_pixels, &gray_config, frame_margin);
 
     if max_payload_per_frame <= 4 {
         return Err(OptransError::InvalidArgument(
@@ -129,7 +129,7 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
 
     // 2. 读取文件并分块
     let manifest =
-        crate::sender::chunker::read_file_with_block_size(Path::new(&args.path), block_size)?;
+        crate::sender::chunker::read_file_with_block_size(Path::new(&path), block_size)?;
 
     info!(
         "文件: {} ({} bytes, {} 块, 每块≤{}B)",
@@ -150,7 +150,7 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
 
     // 4. 创建全屏最大化窗口
     let mut window =
-        SenderWindow::create_sized(module_pixels, modules_w, modules_h, args.frame_margin)?;
+        SenderWindow::create_sized(module_pixels, modules_w, modules_h, frame_margin)?;
 
     info!(
         "帧尺寸: {}w×{}h modules ({}×{}px, max_payload={}B)",
@@ -270,8 +270,77 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
             global_seq += 1;
         }
 
-        let total_frames = data_frames.len();
-        info!("▶ 已构建 {} 帧，启动渲染线程...", total_frames);
+        // ── P 帧差分优化 ──
+        // 对多帧数据传输，只有首帧作为 I 帧（全量），后续帧通过 diff 转为 P 帧。
+        // P 帧只渲染变化模块，payload 极小 → 渲染快 → 降低漏帧风险。
+        let gray_config_p = gray_config.clone();
+        let n_w = modules_w as usize;
+        let n_h = modules_h as usize;
+        let mut i_frame_cache: Vec<u8> = Vec::new(); // 缓存最近 I 帧的灰度序列
+        let mut p_since_last_i: u32 = 0;
+
+        // 预计算每帧的灰度序列
+        let gray_seqs: Vec<Vec<u8>> = data_frames.iter().map(|f| {
+            if f.encoded_payload.is_empty() {
+                Vec::new()
+            } else {
+                crate::encoder::render::build_data_gray_sequence(
+                    &f.encoded_payload, n_w, n_h, &gray_config_p,
+                )
+            }
+        }).collect();
+
+        // 重建帧列表，决策 I/P
+        let mut render_frames: Vec<(Frame, Option<Vec<crate::common::types::DiffEntry>>)> = Vec::new();
+
+        for (i, frame) in data_frames.into_iter().enumerate() {
+            if p_since_last_i == 0 || p_since_last_i >= i_frame_interval as u32
+                || i_frame_cache.is_empty()
+            {
+                // 强制 I 帧
+                i_frame_cache = gray_seqs[i].clone();
+                p_since_last_i = 0;
+                render_frames.push((frame, None));
+            } else {
+                // 尝试 P 帧：比较当前灰度序列与 I 帧缓存的差异
+                let cur = &gray_seqs[i];
+                let base = &i_frame_cache;
+                let min_len = cur.len().min(base.len());
+                let mut diff_count: usize = 0;
+                let mut diff_entries: Vec<crate::common::types::DiffEntry> = Vec::new();
+                for j in 0..min_len {
+                    if cur[j] != base[j] {
+                        diff_count += 1;
+                        diff_entries.push(crate::common::types::DiffEntry {
+                            module_index: j as u16,
+                            module_value: cur[j],
+                        });
+                    }
+                }
+                // 超过 min_len 的部分全部作为 diff
+                for j in min_len..cur.len() {
+                    diff_entries.push(crate::common::types::DiffEntry {
+                        module_index: j as u16,
+                        module_value: cur[j],
+                    });
+                }
+
+                // 如果 diff 超过总模块的 70%，退化为 I 帧
+                if diff_count > (min_len * 70 / 100) {
+                    i_frame_cache = cur.clone();
+                    p_since_last_i = 0;
+                    render_frames.push((frame, None));
+                } else {
+                    p_since_last_i += 1;
+                    render_frames.push((frame, Some(diff_entries)));
+                }
+            }
+        }
+
+        let total_frames = render_frames.len();
+        let p_count = render_frames.iter().filter(|(_, d)| d.is_some()).count();
+        let i_count = total_frames - p_count;
+        info!("▶ 已构建 {} 帧（{}I + {}P），启动渲染线程...", total_frames, i_count, p_count);
 
         // v0.19.4: 提前释放 manifest（含原始文件数据拷贝），渲染阶段仅保留 RS 编码的帧数据
         drop(manifest);
@@ -282,7 +351,9 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
 
         let render_gray = gray_config.clone();
         thread::spawn(move || {
-            for frame in &data_frames {
+            for (frame, diff_entries) in &render_frames {
+                let p_entries: Option<&[crate::common::types::DiffEntry]> =
+                    diff_entries.as_deref();
                 let pixels = render_frame_default(
                     frame,
                     module_pixels,
@@ -290,7 +361,7 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
                     modules_h,
                     &render_gray,
                     enable_heartbeat,
-                    None,
+                    p_entries,
                 );
                 if render_tx.send(pixels).is_err() {
                     break;
