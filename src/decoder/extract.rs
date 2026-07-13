@@ -2,11 +2,10 @@
 //!
 //! 通过 Finder Pattern 中心建立仿射变换，从截屏像素中采样每个模块的值。
 //! 包含格式信息区模块提取和数据矩阵模块提取。
-//! v0.2 新增：5×5 中值采样、多级灰度分类器、灰度解码。
-//! v0.5: 支持长方形帧，使用 loc.modules_w / loc.modules_h 替代 modules_per_side。
+//! v0.5: 支持长方形帧 / v0.21: 统一单像素采样（2/4/8/16 级全支持）
 
 use crate::common::types::{EncodingMode, FrameLocation};
-use crate::common::constants::{SAMPLE_RADIUS_BINARY, SAMPLE_RADIUS_GRAY};
+use crate::common::constants::SAMPLE_RADIUS_BINARY;
 
 // ═══════════════════════════════════════════════════════════════════
 //  仿射变换预计算（v0.19.4 优化）
@@ -208,7 +207,7 @@ fn is_in_finder(col: usize, row: usize, n_w: usize, n_h: usize) -> bool {
 /// 采样单个模块的值（根据编码模式选择采样策略）
 ///
 /// - Binary 模式：3×3 均值 + 阈值 128 → 0 或 1
-/// - Gray 模式：5×5 中值 → 原始灰度值 (0-255)
+/// - Gray 模式：单像素 → 原始灰度值 (0-255)，所有级别统一单点抗模块越界
 pub fn sample_module(
     pixels: &[u8],
     img_width: i32,
@@ -242,8 +241,8 @@ fn sample_module_with_affine(
         EncodingMode::Binary | EncodingMode::Auto => {
             sample_module_binary_at(pixels, img_width, img_height, px, py)
         }
-        EncodingMode::Gray(levels) if *levels <= 4 => {
-            // 单点采样：模块内像素值统一，3×3 窗口会跨模块边界带来误分类
+        EncodingMode::Gray(_) => {
+            // 单点采样：模块内像素值统一，窗口越界导致灰度分类错误
             let cx = px.round() as i32;
             let cy = py.round() as i32;
             let w = img_width as usize;
@@ -257,10 +256,6 @@ fn sample_module_with_affine(
                 0
             }
         }
-        EncodingMode::Gray(_) => {
-            // 高灰度级（5/8/16）：5×5 中值抗噪
-            sample_module_gray(pixels, img_width, img_height, px, py)
-        }
     }
 }
 
@@ -273,66 +268,6 @@ fn sample_module_binary_at(
     py: f64,
 ) -> u8 {
     sample_pixel_region_mean(pixels, img_width, img_height, px, py, SAMPLE_RADIUS_BINARY)
-}
-
-// ─── v0.2 新增：5×5 中值采样 ───
-
-/// 灰度采样（5×5 中值，返回原始亮度值 0-255）
-pub fn sample_module_gray(
-    pixels: &[u8],
-    img_width: i32,
-    img_height: i32,
-    px: f64,
-    py: f64,
-) -> u8 {
-    sample_pixel_region_median(pixels, img_width, img_height, px, py, SAMPLE_RADIUS_GRAY)
-}
-
-/// 在像素坐标周围采样区域取亮度中值
-///
-/// 采样 radius×radius 区域，取中值。
-/// v0.19.4: 用固定大小栈数组代替堆 Vec，消除每次采样的 alloc 开销。
-/// 每帧数十万次采样，此优化可减少大量 malloc/free 调用。
-fn sample_pixel_region_median(
-    pixels: &[u8],
-    img_width: i32,
-    img_height: i32,
-    px: f64,
-    py: f64,
-    radius: i32,
-) -> u8 {
-    let w = img_width as usize;
-    let cx = px.round() as i32;
-    let cy = py.round() as i32;
-
-    // 最大 radius=2 → 5×5=25 个像素，用栈数组避免堆分配
-    let mut luminances: [u32; 25] = [0; 25];
-    let mut count: usize = 0;
-
-    for dy in -radius..=radius {
-        for dx in -radius..=radius {
-            let sx = cx + dx;
-            let sy = cy + dy;
-            if sx >= 0 && sx < img_width && sy >= 0 && sy < img_height {
-                let idx = (sy as usize * w + sx as usize) * 4;
-                if idx + 2 < pixels.len() {
-                    let r = pixels[idx] as u32;
-                    let g = pixels[idx + 1] as u32;
-                    let b = pixels[idx + 2] as u32;
-                    luminances[count] = (r * 299 + g * 587 + b * 114) / 1000;
-                    count += 1;
-                }
-            }
-        }
-    }
-
-    if count == 0 {
-        return 0;
-    }
-
-    // 仅排序有效元素
-    luminances[..count].sort_unstable();
-    luminances[count / 2] as u8
 }
 
 /// 在像素坐标周围采样区域取亮度均值（用于二值模式）
