@@ -37,7 +37,10 @@ pub const RS_PARITY_LEN: usize = 38;
 pub const RS_TOTAL_LEN: usize = 255;
 
 /// 默认帧间隔（毫秒）
-pub const FRAME_INTERVAL_MS: u64 = 100;
+///
+/// 16 级灰度每帧 payload 大（~50KB RS 编码），渲染需更多时间。
+/// 200ms 给渲染和 Horizon 压缩留足余量。
+pub const FRAME_INTERVAL_MS: u64 = 200;
 
 /// 最大文件名长度（UTF-8 字节）
 pub const MAX_FILE_NAME_LEN: usize = 255;
@@ -79,8 +82,8 @@ pub const HEARTBEAT_BASE_GRAY: u8 = 128;
 /// 二值模式采样半径（3×3，radius=1）
 pub const SAMPLE_RADIUS_BINARY: i32 = 1;
 
-/// 默认灰度级数（4 = 推荐；16 = 最高密度但需理想传输环境）
-pub const GRAY_LEVELS_DEFAULT: u32 = 4;
+/// 默认灰度级数（16 = 最高密度，帧数最少 → 漏帧风险最低）
+pub const GRAY_LEVELS_DEFAULT: u32 = 16;
 
 /// 有效的灰度级数（2 的幂，bit 直映射）
 pub const VALID_GRAY_LEVELS: [u32; 4] = [2, 4, 8, 16];
