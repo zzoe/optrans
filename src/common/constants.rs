@@ -82,8 +82,11 @@ pub const SAMPLE_RADIUS_BINARY: i32 = 1;
 /// 灰度模式采样半径（5×5，radius=2）
 pub const SAMPLE_RADIUS_GRAY: i32 = 2;
 
-/// 默认灰度级数（2 = 二值；4 = 2x 密度）
+/// 默认灰度级数
+///
+/// 2 = 二值（最稳定）; 4 = 2 倍密度（推荐）;
+/// 8/16 = 实验性（需要理想传输环境）
 pub const GRAY_LEVELS_DEFAULT: u32 = 4;
 
-/// 有效的灰度级数列表
-pub const VALID_GRAY_LEVELS: [u32; 5] = [2, 4, 5, 8, 16];
+/// 有效的灰度级数列表（8/16 为实验性）
+pub const VALID_GRAY_LEVELS: [u32; 4] = [2, 4, 8, 16];

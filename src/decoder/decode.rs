@@ -197,7 +197,6 @@ fn calc_gray_module_count(byte_count: usize, levels: u32) -> usize {
     match levels {
         2 => byte_count * 8,
         4 => byte_count * 4,
-        5 => byte_count.div_ceil(2) * 7,
         8 => (byte_count * 8).div_ceil(3),
         16 => byte_count * 2,
         _ => byte_count * 8,
@@ -632,7 +631,6 @@ mod tests {
     fn test_calc_gray_module_count() {
         assert_eq!(calc_gray_module_count(100, 2), 800);
         assert_eq!(calc_gray_module_count(100, 4), 400);
-        assert_eq!(calc_gray_module_count(100, 5), 350);
         assert_eq!(calc_gray_module_count(100, 8), 267);
         assert_eq!(calc_gray_module_count(100, 16), 200);
     }

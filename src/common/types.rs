@@ -123,11 +123,6 @@ impl GrayEncodingConfig {
         if levels == 2 {
             return vec![0, 255];
         }
-        // 特判 5 级灰度，避免浮点精度问题
-        // 255.0 / 4.0 = 63.75，round() 在某些精度表示下会导致 i=3 时产生 191 而非 192
-        if levels == 5 {
-            return vec![0, 64, 128, 192, 255];
-        }
         let step = 255.0 / (levels - 1) as f64;
         (0..levels)
             .map(|i| (i as f64 * step).round() as u8)
@@ -147,16 +142,10 @@ impl GrayEncodingConfig {
         match self.levels {
             2 => 1,
             4 => 2,
-            5 => 0, // base-5, not direct
             8 => 3,
             16 => 4,
             _ => 1,
         }
-    }
-
-    /// 是否为 5 进制编码模式
-    pub fn is_base5(&self) -> bool {
-        self.levels == 5
     }
 }
 

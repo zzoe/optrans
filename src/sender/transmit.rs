@@ -69,10 +69,6 @@ fn frame_capacity_for_modules(
     let max_rs_encoded: usize = match gray_levels {
         2 => available / 8,
         4 => available / 4,
-        5 => {
-            let v = (available * 2) / 7;
-            v.saturating_sub(1)
-        }
         8 => (available * 3) / 8,
         16 => available / 2,
         _ => available / 8,

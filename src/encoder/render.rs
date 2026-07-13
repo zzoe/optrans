@@ -274,11 +274,7 @@ fn build_data_gray_sequence(
 /// # 返回
 /// (灰度值序列, 原始数据长度)
 pub fn encode_gray_n(data: &[u8], gray_config: &GrayEncodingConfig) -> (Vec<u8>, usize) {
-    if gray_config.is_base5() {
-        encode_gray_5(data)
-    } else {
-        encode_gray_direct(data, gray_config.bits_per_module(), &gray_config.gray_table)
-    }
+    encode_gray_direct(data, gray_config.bits_per_module(), &gray_config.gray_table)
 }
 
 /// 直映射灰度编码：每模块编码 N bits（N=1,2,3,4）
@@ -307,32 +303,6 @@ fn encode_gray_direct(data: &[u8], bits_per_module: u32, gray_table: &[u8]) -> (
         }
 
         gray_values.push(gray_table[(digit & mask) as usize]);
-    }
-
-    (gray_values, original_len)
-}
-
-/// 5 进制灰度编码：2 bytes → 7 modules
-///
-/// 数学原理：5⁷ = 78,125 > 65,536，效率 98.4%
-/// 每 2 个源字节（u16 LE）编码为 7 个基-5 数字，映射到灰度值。
-fn encode_gray_5(data: &[u8]) -> (Vec<u8>, usize) {
-    const GRAY_MAP: [u8; 5] = [0, 64, 128, 192, 255];
-    let original_len = data.len();
-    let mut gray_values = Vec::new();
-
-    // 按 2 字节分组
-    for chunk in data.chunks(2) {
-        let b0 = chunk[0] as u16;
-        let b1 = if chunk.len() > 1 { chunk[1] as u16 } else { 0 };
-        let mut v = b0 | (b1 << 8); // u16 LE
-
-        // 提取 7 个 5 进制数字（从低到高）
-        for _ in 0..7 {
-            let digit = (v % 5) as usize;
-            gray_values.push(GRAY_MAP[digit]);
-            v /= 5;
-        }
     }
 
     (gray_values, original_len)
@@ -480,17 +450,6 @@ mod tests {
         assert_eq!(((val >> 98) & 0x1) as u8, 1u8);
         // v0.6: encoding_mode_bit = 1 at bit 99
         assert_eq!(((val >> 99) & 0x1) as u8, 1u8);
-    }
-
-    #[test]
-    fn test_encode_gray_5_roundtrip() {
-        // 测试 5 进制编解码往返
-        let data: Vec<u8> = vec![0xAB, 0xCD, 0x12, 0x34, 0xFF];
-        let (gray_values, original_len) = encode_gray_5(&data);
-
-        // 解码验证
-        let decoded = decode_gray_5_internal(&gray_values, original_len);
-        assert_eq!(decoded, data);
     }
 
     #[test]
@@ -663,34 +622,6 @@ mod tests {
     }
 
     // ─── 内部解码辅助函数（仅用于测试） ───
-
-    /// 5 进制灰度解码（内部测试用）
-    fn decode_gray_5_internal(gray_values: &[u8], original_len: usize) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(original_len);
-        for chunk in gray_values.chunks(7) {
-        let mut v: u32 = 0;
-        let mut multiplier: u32 = 1;
-            for &gray in chunk {
-                let digit = classify_gray_5_internal(gray) as u32;
-                v += digit * multiplier;
-                multiplier *= 5;
-            }
-            bytes.push(v as u8);
-            bytes.push((v >> 8) as u8);
-        }
-        bytes.truncate(original_len);
-        bytes
-    }
-
-    fn classify_gray_5_internal(gray: u8) -> u8 {
-        match gray {
-            0..=31 => 0,
-            32..=95 => 1,
-            96..=159 => 2,
-            160..=223 => 3,
-            _ => 4,
-        }
-    }
 
     /// 直映射灰度解码（内部测试用）
     fn decode_gray_direct_internal(

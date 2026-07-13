@@ -416,18 +416,14 @@ pub fn decode_gray_n(
     thresholds: &[u8],
     original_len: usize,
 ) -> Vec<u8> {
-    if gray_levels == 5 {
-        decode_gray_5(gray_values, original_len)
-    } else {
-        let bits_per_module = match gray_levels {
-            2 => 1,
-            4 => 2,
-            8 => 3,
-            16 => 4,
-            _ => 1,
-        };
-        decode_gray_direct(gray_values, bits_per_module, thresholds, original_len)
-    }
+    let bits_per_module = match gray_levels {
+        2 => 1,
+        4 => 2,
+        8 => 3,
+        16 => 4,
+        _ => 1,
+    };
+    decode_gray_direct(gray_values, bits_per_module, thresholds, original_len)
 }
 
 /// 直映射灰度解码
@@ -462,44 +458,9 @@ fn decode_gray_direct(
     bytes
 }
 
-/// 5 进制灰度解码
-fn decode_gray_5(gray_values: &[u8], original_len: usize) -> Vec<u8> {
-    let thresholds: [u8; 4] = [32, 96, 160, 224];
-    let mut bytes = Vec::with_capacity(original_len);
-
-    for chunk in gray_values.chunks(7) {
-        let mut v: u32 = 0;
-        let mut multiplier: u32 = 1;
-
-        for &gray in chunk {
-            let digit = classify_gray(gray, &thresholds) as u32;
-            v += digit * multiplier;
-            multiplier *= 5;
-        }
-
-        bytes.push(v as u8);
-        bytes.push((v >> 8) as u8);
-    }
-
-    bytes.truncate(original_len);
-    bytes
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_classify_gray_5() {
-        let thresholds: [u8; 4] = [32, 96, 160, 224];
-        assert_eq!(classify_gray(0, &thresholds), 0);
-        assert_eq!(classify_gray(31, &thresholds), 0);
-        assert_eq!(classify_gray(32, &thresholds), 1);
-        assert_eq!(classify_gray(95, &thresholds), 1);
-        assert_eq!(classify_gray(128, &thresholds), 2);
-        assert_eq!(classify_gray(192, &thresholds), 3);
-        assert_eq!(classify_gray(255, &thresholds), 4);
-    }
 
     #[test]
     fn test_classify_gray_4() {
@@ -508,17 +469,6 @@ mod tests {
         assert_eq!(classify_gray(85, &thresholds), 1);
         assert_eq!(classify_gray(170, &thresholds), 2);
         assert_eq!(classify_gray(255, &thresholds), 3);
-    }
-
-    #[test]
-    fn test_decode_gray_5_roundtrip() {
-        // 编码已知数据
-        let data: Vec<u8> = vec![0xAB, 0xCD, 0x12, 0x34, 0xFF];
-        let gray_values = encode_gray_5_test(&data);
-
-        // 解码
-        let decoded = decode_gray_5(&gray_values, data.len());
-        assert_eq!(decoded, data);
     }
 
     #[test]
@@ -582,22 +532,6 @@ mod tests {
     }
 
     // ─── 测试辅助编码函数 ───
-
-    fn encode_gray_5_test(data: &[u8]) -> Vec<u8> {
-        const GRAY_MAP: [u8; 5] = [0, 64, 128, 192, 255];
-        let mut gray_values = Vec::new();
-        for chunk in data.chunks(2) {
-            let b0 = chunk[0] as u16;
-            let b1 = if chunk.len() > 1 { chunk[1] as u16 } else { 0 };
-            let mut v = b0 | (b1 << 8);
-            for _ in 0..7 {
-                let digit = (v % 5) as usize;
-                gray_values.push(GRAY_MAP[digit]);
-                v /= 5;
-            }
-        }
-        gray_values
-    }
 
     fn encode_gray_direct_test(data: &[u8], bits_per_module: u32, gray_table: &[u8]) -> Vec<u8> {
         let total_bits = (data.len() * 8) as u64;
