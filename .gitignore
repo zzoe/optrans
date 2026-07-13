@@ -2,3 +2,8 @@ target
 Cargo.lock
 .workbuddy
 *.bmp
+# 测试接收产物
+*.pdf
+*.png
+*.zip
+optrans_debug/
