@@ -574,6 +574,78 @@ mod tests {
         assert_eq!(pixels.len(), 800 * 800 * 4);
     }
 
+    /// v0.20: 4 级灰度渲染→解码往返测试
+    ///
+    /// 生成已知 payload，RS 编码，4 级灰度渲染到像素缓冲区，
+    /// 直接从像素读取模块值，解码验证一致性。
+    #[test]
+    fn test_gray4_pixel_roundtrip() {
+        use crate::common::mask;
+        use crate::decoder::extract;
+
+        let gray_config = GrayEncodingConfig::new(4);
+        let mp = 4u32;
+        let n_w = 200u32;
+        let n_h = 200u32;
+
+        // 生成 test payload
+        let payload: Vec<u8> = (0..200u32).map(|i| (i.wrapping_mul(37).wrapping_add(13) % 256) as u8).collect();
+
+        // RS 编码
+        let encoder = crate::encoder::reed_solomon::RsEncoder::new();
+        let rs_encoded = encoder.encode(&payload).unwrap();
+
+        let info = FormatInfo::new_data(0, 0, 1, rs_encoded.len() as u16, FrameKind::I, 1);
+        let frame = Frame { format_info: info, encoded_payload: rs_encoded.clone(), frame_kind: FrameKind::I };
+
+        // 渲染到像素缓冲区
+        let pixels = render_frame_default(&frame, mp, n_w, n_h, &gray_config, false, None);
+
+        // 直接从像素采样数据模块：模块内所有像素同色，取中心像素即可
+        let n_w_usize = n_w as usize;
+        let n_h_usize = n_h as usize;
+        let img_w = (n_w * mp) as usize;
+        let mp_usize = mp as usize;
+        let expected_count = rs_encoded.len() * 4;
+        let mut sampled = Vec::with_capacity(expected_count);
+
+        'outer: for row in 0..n_h_usize {
+            for col in 0..n_w_usize {
+                // 跳过 finder pattern
+                if col < 7 && row < 7 { continue; }
+                if col >= n_w_usize - 7 && row < 7 { continue; }
+                if col < 7 && row >= n_h_usize - 7 { continue; }
+                // 跳过格式信息区
+                if row < 2 && col >= 7 && col < n_w_usize - 7 { continue; }
+                // 已取够
+                if sampled.len() >= expected_count { break 'outer; }
+
+                // 模块中心像素坐标
+                let cx = col * mp_usize + mp_usize / 2;
+                let cy = row * mp_usize + mp_usize / 2;
+                let idx = (cy * img_w + cx) * 4;
+                if idx + 2 < pixels.len() {
+                    let r = pixels[idx] as u32;
+                    let g = pixels[idx + 1] as u32;
+                    let b = pixels[idx + 2] as u32;
+                    sampled.push(((r * 299 + g * 587 + b * 114) / 1000) as u8);
+                }
+            }
+        }
+
+        assert!(sampled.len() >= expected_count,
+            "采样不足: 需要 {} 模块, 实际 {} 个", expected_count, sampled.len());
+
+        // 灰度解码 → 去掩码 → RS 解码
+        let decoded = extract::decode_gray_n(&sampled, 4, &gray_config.thresholds, rs_encoded.len());
+        let unmasked = mask::apply_mask(&decoded);
+        let final_data = crate::decoder::reed_solomon::rs_decode_data(&unmasked)
+            .expect("RS 解码失败");
+
+        assert_eq!(final_data, payload,
+            "4级灰度往返测试失败！{} bytes", payload.len());
+    }
+
     #[test]
     fn test_render_frame_rectangular() {
         // 测试长方形帧渲染

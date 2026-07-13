@@ -489,6 +489,19 @@ unsafe extern "system" {
         fuColorUse: UINT,
     ) -> i32;
 
+    /// 创建 DIB section（设备无关位图，可直接访问像素缓冲区）
+    ///
+    /// BitBlt 直接写入 ppvBits 指向的缓冲区，跳过 DDB↔DIB 格式转换，
+    /// 保证像素值不丢失精度。
+    pub fn CreateDIBSection(
+        hdc: HDC,
+        pbmi: *const BITMAPINFO,
+        usage: UINT,
+        ppvBits: *mut *mut c_void,
+        hSection: isize,
+        offset: DWORD,
+    ) -> HBITMAP;
+
     /// 刷新 GDI 命令缓冲区
     ///
     /// 强制 GDI 立即执行所有排队的绘制命令。在远程桌面（BlastCodec/H.264/RDP）

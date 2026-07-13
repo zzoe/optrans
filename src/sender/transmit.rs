@@ -297,7 +297,7 @@ pub fn run_send(args: SendArgs) -> OptransResult<()> {
                     None,
                 );
                 if render_tx.send(pixels).is_err() {
-                    break; // display loop 退出
+                    break;
                 }
             }
             // render_tx dropped → display loop 的 rx.recv() 返回 Err

@@ -29,25 +29,22 @@ struct AffineTransform {
 }
 
 impl AffineTransform {
-    fn from_location(loc: &FrameLocation) -> Self {
-        let n_w = loc.modules_w as f64;
-        let n_h = loc.modules_h as f64;
-        let src_tl_x = 3.5;
-        let src_tl_y = 3.5;
-        let src_tr_x = n_w - 3.5;
-        let src_bl_y = n_h - 3.5;
+    /// v0.20: 强制使用约定的 module_pixels，不依赖 locate 推算的模块尺寸。
+    /// locate 可能匹配到虚假 finder（桌面噪点），推算的 modules_w / dst_dx 不可靠。
+    fn from_location(loc: &FrameLocation, module_pixels: u32) -> Self {
+        let mp = module_pixels as f64;
+        let src_dx = (loc.modules_w as f64 - 7.0).max(1.0);
+        let src_dy = (loc.modules_h as f64 - 7.0).max(1.0);
 
-        let src_dx = src_tr_x - src_tl_x;
-        let src_dy = src_bl_y - src_tl_y;
-
-        let dst_dx_x = (loc.tr.center_x - loc.tl.center_x) / src_dx;
+        // 主方向固定为 module_pixels，仅从 finder Y/X 差推算倾斜
+        let dst_dx_x = mp;
         let dst_dx_y = (loc.tr.center_y - loc.tl.center_y) / src_dx;
         let dst_dy_x = (loc.bl.center_x - loc.tl.center_x) / src_dy;
-        let dst_dy_y = (loc.bl.center_y - loc.tl.center_y) / src_dy;
+        let dst_dy_y = mp;
 
         // 预计算偏移，避免每个模块都做 (mx - 3.5) 运算
-        let base_x = loc.tl.center_x - dst_dx_x * src_tl_x - dst_dy_x * src_tl_y;
-        let base_y = loc.tl.center_y - dst_dx_y * src_tl_x - dst_dy_y * src_tl_y;
+        let base_x = loc.tl.center_x - dst_dx_x * 3.5 - dst_dy_x * 3.5;
+        let base_y = loc.tl.center_y - dst_dx_y * 3.5 - dst_dy_y * 3.5;
 
         AffineTransform { dst_dx_x, dst_dx_y, dst_dy_x, dst_dy_y, base_x, base_y }
     }
@@ -97,7 +94,7 @@ pub fn extract_format_modules_with_radius(
     let start_col = s;
     let end_col = n_w - s;
 
-    let affine = AffineTransform::from_location(loc);
+    let affine = AffineTransform::from_location(loc, loc.module_pixels);
 
     let mut bits = Vec::with_capacity((end_col - start_col) * 2);
 
@@ -152,7 +149,7 @@ pub fn extract_data_modules(
     let n_h = loc.modules_h as usize;
     let s = 7usize;
 
-    let affine = AffineTransform::from_location(loc);
+    let affine = AffineTransform::from_location(loc, loc.module_pixels);
 
     let mut values = Vec::with_capacity(payload_bits);
 
@@ -221,7 +218,7 @@ pub fn sample_module(
     module_row: usize,
     encoding_mode: &EncodingMode,
 ) -> u8 {
-    let affine = AffineTransform::from_location(loc);
+    let affine = AffineTransform::from_location(loc, loc.module_pixels);
     sample_module_with_affine(pixels, img_width, img_height, &affine, module_col, module_row, encoding_mode)
 }
 
@@ -246,8 +243,19 @@ fn sample_module_with_affine(
             sample_module_binary_at(pixels, img_width, img_height, px, py)
         }
         EncodingMode::Gray(levels) if *levels <= 4 => {
-            // 低灰度级：3×3 均值，返回原始亮度（0-255）
-            sample_pixel_region_luminance(pixels, img_width, img_height, px, py, SAMPLE_RADIUS_BINARY)
+            // 单点采样：模块内像素值统一，3×3 窗口会跨模块边界带来误分类
+            let cx = px.round() as i32;
+            let cy = py.round() as i32;
+            let w = img_width as usize;
+            let idx = ((cy as usize).wrapping_mul(w).wrapping_add(cx as usize)) * 4;
+            if idx + 2 < pixels.len() {
+                let r = pixels[idx] as u32;
+                let g = pixels[idx + 1] as u32;
+                let b = pixels[idx + 2] as u32;
+                ((r * 299 + g * 587 + b * 114) / 1000) as u8
+            } else {
+                0
+            }
         }
         EncodingMode::Gray(_) => {
             // 高灰度级（5/8/16）：5×5 中值抗噪
@@ -325,49 +333,6 @@ fn sample_pixel_region_median(
     // 仅排序有效元素
     luminances[..count].sort_unstable();
     luminances[count / 2] as u8
-}
-
-/// 在像素坐标周围采样区域取亮度均值（返回 0-255 原始值）
-///
-/// 与 sample_pixel_region_mean 相同算法，但不做二值化阈值判断。
-/// 用于低灰度级（≤4）模式：3×3 窗口不会跨模块边界，原始亮度值
-/// 被 classify_gray 分类到对应灰度级别。
-fn sample_pixel_region_luminance(
-    pixels: &[u8],
-    img_width: i32,
-    img_height: i32,
-    px: f64,
-    py: f64,
-    radius: i32,
-) -> u8 {
-    let w = img_width as usize;
-    let cx = px.round() as i32;
-    let cy = py.round() as i32;
-
-    let mut sum: u32 = 0;
-    let mut count: u32 = 0;
-
-    for dy in -radius..=radius {
-        for dx in -radius..=radius {
-            let sx = cx + dx;
-            let sy = cy + dy;
-            if sx >= 0 && sx < img_width && sy >= 0 && sy < img_height {
-                let idx = (sy as usize * w + sx as usize) * 4;
-                if idx + 2 < pixels.len() {
-                    let r = pixels[idx] as u32;
-                    let g = pixels[idx + 1] as u32;
-                    let b = pixels[idx + 2] as u32;
-                    sum += (r * 299 + g * 587 + b * 114) / 1000;
-                    count += 1;
-                }
-            }
-        }
-    }
-
-    if count == 0 {
-        return 0;
-    }
-    (sum / count) as u8
 }
 
 /// 在像素坐标周围采样区域取亮度均值（用于二值模式）

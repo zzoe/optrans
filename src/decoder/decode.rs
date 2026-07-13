@@ -179,6 +179,7 @@ fn shift_loc(loc: &FrameLocation, dx: f64, dy: f64) -> FrameLocation {
         modules_per_side: loc.modules_per_side,
         modules_w: loc.modules_w,
         modules_h: loc.modules_h,
+        module_pixels: loc.module_pixels,
     }
 }
 

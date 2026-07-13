@@ -194,7 +194,7 @@ fn run_capture_loop(
 
         // 2. 定位
         let t1 = Instant::now();
-        let candidates: Vec<(FrameLocation, LocateDiagnostics)>;
+        let mut candidates: Vec<(FrameLocation, LocateDiagnostics)>;
         let mut locate_cost = 0u128;
 
         let locked_loc = locked.get().cloned();
@@ -204,6 +204,24 @@ fn run_capture_loop(
         } else {
             candidates = locate_frame_all_with_diag(&pixels, img_w, img_h);
             locate_cost = t1.elapsed().as_millis();
+
+            // v0.20: sender 是全屏窗口，finder 位置可精确推算。
+            // 过滤掉桌面噪点误匹配的假候选（定位在错误屏幕区域）。
+            let margin = crate::common::constants::FRAME_MARGIN_PX_DEFAULT as f64;
+            let mp_f = crate::common::constants::MODULE_PIXELS_DEFAULT as f64;
+            let expected_tl_x = margin + 3.5 * mp_f;
+            let expected_tl_y = margin + 3.5 * mp_f;
+            let max_dist = 120.0; // 允许 120px 误差
+            let before = candidates.len();
+            candidates.retain(|(loc, _)| {
+                let dx = loc.tl.center_x - expected_tl_x;
+                let dy = loc.tl.center_y - expected_tl_y;
+                (dx * dx + dy * dy).sqrt() <= max_dist
+            });
+            debug!(
+                "[locate-filter] 过滤前{}个, 过滤后{}个, 期望TL=({},{})",
+                before, candidates.len(), expected_tl_x as u32, expected_tl_y as u32
+            );
 
             if candidates.is_empty() {
                 let waited = no_frame_start.elapsed();

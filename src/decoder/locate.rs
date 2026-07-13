@@ -127,6 +127,7 @@ pub fn locate_by_corners(
         modules_per_side,
         modules_w,
         modules_h,
+        module_pixels: tl.2.round() as u32, // 取 TL finder 估算的模块像素
     })
 }
 
@@ -874,6 +875,7 @@ fn search_triangles(
                         modules_per_side,
                         modules_w,
                         modules_h,
+                        module_pixels: tl_cand.module_size.round() as u32,
                     },
                     pixel_area,
                 ));

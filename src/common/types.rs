@@ -307,6 +307,8 @@ pub struct FrameLocation {
     pub modules_w: u32,
     /// v0.5: 垂直方向模块数
     pub modules_h: u32,
+    /// v0.20: 每模块像素数（由 send/receive 约定，非 locate 推算）
+    pub module_pixels: u32,
 }
 
 /// 解码完成的帧

@@ -20,6 +20,9 @@ use log::warn;
 const CAPTUREBLT: u32 = 0x40000000;
 
 /// 执行一次 BitBlt 截屏（内部辅助）
+///
+/// v0.20: 用 CreateDIBSection 替代 CreateCompatibleBitmap + GetDIBits，
+/// BitBlt 直接写入 32bpp 像素缓冲区，跳过 DDB↔DIB 格式转换。
 fn do_capture(
     src_dc: ffi::HDC,
     x: i32, y: i32, w: i32, h: i32,
@@ -28,21 +31,6 @@ fn do_capture(
     let mem_dc = unsafe { ffi::CreateCompatibleDC(src_dc) };
     if mem_dc == ffi::NULL as ffi::HDC {
         return Err(OptransError::Win32(format!("CreateCompatibleDC 失败: {}", last_error())));
-    }
-    let bitmap = unsafe { ffi::CreateCompatibleBitmap(src_dc, w, h) };
-    if bitmap == ffi::NULL as ffi::HBITMAP {
-        unsafe { ffi::DeleteDC(mem_dc) };
-        return Err(OptransError::Win32(format!("CreateCompatibleBitmap 失败: {}", last_error())));
-    }
-    let old_bitmap = unsafe { ffi::SelectObject(mem_dc, bitmap as ffi::HGDIOBJ) };
-    let result = unsafe { ffi::BitBlt(mem_dc, 0, 0, w, h, src_dc, x, y, rop) };
-    if result == 0 {
-        unsafe {
-            ffi::SelectObject(mem_dc, old_bitmap);
-            ffi::DeleteObject(bitmap as ffi::HGDIOBJ);
-            ffi::DeleteDC(mem_dc);
-        }
-        return Err(OptransError::Win32(format!("BitBlt 失败: {}", last_error())));
     }
 
     let bmi_header = ffi::BITMAPINFOHEADER {
@@ -55,21 +43,43 @@ fn do_capture(
         ..unsafe { std::mem::zeroed() }
     };
     let bmi = ffi::BITMAPINFO { bmiHeader: bmi_header, bmiColors: [ffi::RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 }] };
-    let pixels_size = (w as usize) * (h as usize) * 4;
-    let mut pixels = vec![0u8; pixels_size];
-    let scan_lines = unsafe {
-        ffi::GetDIBits(mem_dc, bitmap, 0, h as ffi::UINT,
-            pixels.as_mut_ptr() as *mut std::ffi::c_void,
-            &bmi as *const ffi::BITMAPINFO as *mut ffi::BITMAPINFO,
-            ffi::DIB_RGB_COLORS)
+    let mut ppv_bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let dib = unsafe {
+        ffi::CreateDIBSection(
+            src_dc,
+            &bmi as *const ffi::BITMAPINFO,
+            ffi::DIB_RGB_COLORS,
+            &mut ppv_bits,
+            0,
+            0,
+        )
     };
+    if dib == ffi::NULL as ffi::HBITMAP || ppv_bits.is_null() {
+        unsafe { ffi::DeleteDC(mem_dc) };
+        return Err(OptransError::Win32(format!("CreateDIBSection 失败: {}", last_error())));
+    }
+
+    let old_bitmap = unsafe { ffi::SelectObject(mem_dc, dib as ffi::HGDIOBJ) };
+    let result = unsafe { ffi::BitBlt(mem_dc, 0, 0, w, h, src_dc, x, y, rop) };
+    if result == 0 {
+        unsafe {
+            ffi::SelectObject(mem_dc, old_bitmap);
+            ffi::DeleteObject(dib as ffi::HGDIOBJ);
+            ffi::DeleteDC(mem_dc);
+        }
+        return Err(OptransError::Win32(format!("BitBlt 失败: {}", last_error())));
+    }
+    unsafe { ffi::GdiFlush() };
+
+    let pixels_size = (w as usize) * (h as usize) * 4;
+    let src_slice = unsafe { std::slice::from_raw_parts(ppv_bits as *const u8, pixels_size) };
+    let mut pixels = Vec::with_capacity(pixels_size);
+    pixels.extend_from_slice(src_slice);
+
     unsafe {
         ffi::SelectObject(mem_dc, old_bitmap);
-        ffi::DeleteObject(bitmap as ffi::HGDIOBJ);
+        ffi::DeleteObject(dib as ffi::HGDIOBJ);
         ffi::DeleteDC(mem_dc);
-    }
-    if scan_lines == 0 {
-        return Err(OptransError::Win32(format!("GetDIBits 失败: {}", last_error())));
     }
     Ok((pixels, w, h))
 }
@@ -86,11 +96,7 @@ fn is_all_white(pixels: &[u8]) -> bool {
 }
 
 /// 截取屏幕指定区域的 RGBA 像素（RDP 兼容，三级回退）
-///
-/// # 返回
-/// `(pixels_rgba, width, height, method)` — method: 1=GetWindowDC, 2=GetDC, 3=CAPTUREBLT
 pub fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> OptransResult<(Vec<u8>, i32, i32, u32)> {
-    // 策略 1: GetWindowDC(GetDesktopWindow()) — 桌面窗口 DC
     let desktop_hwnd = unsafe { ffi::GetDesktopWindow() };
     if desktop_hwnd != ffi::NULL as ffi::HWND {
         let dc = unsafe { ffi::GetWindowDC(desktop_hwnd) };
@@ -106,7 +112,6 @@ pub fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> OptransResult<(Vec<u8>,
         }
     }
 
-    // 策略 2: GetDC(NULL) — 经典桌面 DC
     let dc = unsafe { ffi::GetDC(ffi::NULL as ffi::HWND) };
     if dc != ffi::NULL as ffi::HDC {
         let r = do_capture(dc, x, y, w, h, SRCCOPY);
@@ -119,7 +124,6 @@ pub fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> OptransResult<(Vec<u8>,
         }
     }
 
-    // 策略 3: GetDC(NULL) + CAPTUREBLT — 包含分层窗口
     let dc = unsafe { ffi::GetDC(ffi::NULL as ffi::HWND) };
     check_hdc(dc)?;
     let r = do_capture(dc, x, y, w, h, SRCCOPY | CAPTUREBLT);
@@ -127,7 +131,6 @@ pub fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> OptransResult<(Vec<u8>,
     r.map(|p| (p.0, p.1, p.2, 3))
 }
 
-/// 截取整个屏幕的 RGBA 像素
 pub fn capture_full_screen() -> OptransResult<(Vec<u8>, i32, i32)> {
     let screen_w = unsafe { ffi::GetSystemMetrics(ffi::SM_CXSCREEN) };
     let screen_h = unsafe { ffi::GetSystemMetrics(ffi::SM_CYSCREEN) };
