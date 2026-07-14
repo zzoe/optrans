@@ -28,7 +28,7 @@ src/
 ├── receiver/
 │   ├── mod_impl.rs      # 接收主循环 (v0.19 流水线)
 │   ├── capture.rs       # GDI 全屏截屏
-│   ├── collect.rs       # 帧收集器 (去重/P帧合并)
+│   ├── collect.rs       # 帧收集器 (去重)
 │   └── reassemble.rs    # 文件重组 + SHA-256 校验
 ├── test_mode.rs         # 测试命令实现
 └── win32/

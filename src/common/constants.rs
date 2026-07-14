@@ -60,12 +60,7 @@ pub const SRCCOPY: u32 = 0x00CC0020;
 /// 抖动导致的边界效应。远程桌面场景（Horizon/Citrix）需通过 --frame-margin 增大。
 pub const FRAME_MARGIN_PX_DEFAULT: u32 = 20;
 
-// ─── v0.2 新增：差分编码参数 ───
-
-/// 默认 I 帧间隔（连续 P 帧数达到此值后强制 I 帧）
-pub const I_FRAME_INTERVAL_DEFAULT: u32 = 10;
-
-// ─── v0.2 新增：心跳参数 ───
+// ─── 心跳参数 ───
 pub const HEARTBEAT_PIXEL_SIZE: u32 = 2;
 
 /// 心跳变化幅度
@@ -74,7 +69,7 @@ pub const HEARTBEAT_DELTA: u8 = 1;
 /// 心跳基准灰度值
 pub const HEARTBEAT_BASE_GRAY: u8 = 128;
 
-// ─── v0.2 新增：采样参数 ───
+// ─── 采样参数 ───
 
 /// 二值模式采样半径（3×3，radius=1）
 pub const SAMPLE_RADIUS_BINARY: i32 = 1;

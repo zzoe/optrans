@@ -77,11 +77,6 @@ fn run_aggregator(
     loop {
         match rx.recv() {
             Ok(frame) => {
-                let kind_str = match frame.frame_kind {
-                    FrameKind::I => "I",
-                    FrameKind::P => "P",
-                };
-
                 match collector.ingest(frame) {
                     Ok(IngestResult::NewMeta(meta)) => {
                         info!(
@@ -93,8 +88,7 @@ fn run_aggregator(
                         let total = collector.meta().map(|m| m.total_blocks).unwrap_or(0);
                         let received = collector.blocks_received();
                         info!(
-                            "数据块({}) #{}, 进度: {}/{} ({:.0}%)",
-                            kind_str,
+                            "数据块 #{}, 进度: {}/{} ({:.0}%)",
                             idx,
                             received,
                             total,
@@ -106,7 +100,7 @@ fn run_aggregator(
                         );
                     }
                     Ok(IngestResult::EotReceived) => {
-                        info!("收到 EOT 信号({})", kind_str);
+                        info!("收到 EOT 信号");
                         if collector.is_complete() {
                             info!("所有数据块已收到，开始重组...");
                             return flush_and_write(collector, output_path);
@@ -227,6 +221,11 @@ fn run_capture_loop(
     let loc = meta_loc.unwrap();
 
     // ═══ Phase 2: 捕获数据帧 + EOT（纯转发，aggregator 负责计数/漏帧检测） ═══
+    // last_data_seq: 上一次截屏看到的 Data 帧序号（用于检测漏帧）
+    //   - meta(seq=0) 之后第一个数据帧 seq=1
+    //   - 同一帧重复截到（seq 相同）→ 正常，跳过
+    //   - seq > last + 1 → 中间有帧未截到 → 漏帧告警
+    let mut last_data_seq: Option<u16> = None;
     loop {
         if done.load(Ordering::SeqCst) { drop(tx); return Ok(()); }
 
@@ -240,6 +239,27 @@ fn run_capture_loop(
             Err(_) => continue,
         };
 
+        // 帧序号连续性检测（在 capture loop 中，不受线程池并发影响）
+        if info.frame_type == FrameType::Data || info.frame_type == FrameType::EOT {
+            let seq = info.frame_sequence;
+            if let Some(last) = last_data_seq {
+                if seq == last {
+                    // 同一帧重复截到，正常（sender 帧间隔内多次截屏）
+                    continue;
+                } else if seq > last.wrapping_add(1) {
+                    // 中间有帧未截到 → 漏帧
+                    let missed = last.wrapping_add(1);
+                    warn!(
+                        "⚠ 漏帧检测: 期望 seq={}，实际截到 seq={}（跳过 {} 帧）",
+                        missed, seq, seq.wrapping_sub(missed)
+                    );
+                }
+                // seq == last + 1: 正常递增
+                // seq < last: 倒退（理论上不该发生），忽略
+            }
+            last_data_seq = Some(seq);
+        }
+
         match info.frame_type {
             FrameType::EOT => {
                 info!("收到 EOT 信号");
@@ -250,8 +270,6 @@ fn run_capture_loop(
                     payload: Vec::new(),
                     frame_kind: FrameKind::I,
                     encoding_mode: EncodingMode::Binary,
-                    base_frame_seq: None,
-                    data_module_values: Vec::new(),
                 });
                 break;
             }

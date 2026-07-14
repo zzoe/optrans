@@ -1,13 +1,12 @@
 //! 帧构建模块
 //!
-//! 组装元数据帧、数据帧、P 帧和 EOT（传输结束）帧。
+//! 组装元数据帧、数据帧和 EOT（传输结束）帧。
 //! 每帧包含格式信息（FormatInfo）和 RS 编码后的载荷数据。
-//! v0.2 新增：P 帧构建、FrameKind 支持。
 
 use crate::common::constants::MAX_FILE_NAME_LEN;
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::{
-    BlockData, DiffEntry, FileManifest, FormatInfo, FrameKind, FrameType,
+    BlockData, FileManifest, FormatInfo, FrameKind, FrameType,
 };
 use crate::encoder::reed_solomon::RsEncoder;
 
@@ -18,7 +17,7 @@ pub struct Frame {
     pub format_info: FormatInfo,
     /// RS 编码后的载荷数据
     pub encoded_payload: Vec<u8>,
-    /// v0.2: 帧种类（I 或 P）
+    /// 帧种类（协议字段，本程序只用 I 帧）
     pub frame_kind: FrameKind,
 }
 
@@ -174,55 +173,6 @@ impl Frame {
         Ok(Frame { format_info: info, encoded_payload, frame_kind: FrameKind::I })
     }
 
-    /// 构建 P 帧（差分帧）
-    ///
-    /// P 帧 payload 结构（RS 编码前）：
-    /// ```text
-    /// base_frame_seq: 2 bytes LE
-    /// module_count:   2 bytes LE
-    /// module_entries: module_count × 3 bytes (module_index:2B LE + module_value:1B)
-    /// ```
-    pub fn new_p_frame(
-        diff_entries: &[DiffEntry],
-        seq: u16,
-        base_frame_seq: u16,
-        block_index: u32,
-        total_blocks: u32,
-        encoding_mode_bit: u8,
-    ) -> OptransResult<Frame> {
-        let module_count = diff_entries.len() as u16;
-        let payload_len = 2 + 2 + module_count as usize * 3;
-        let mut payload = Vec::with_capacity(payload_len);
-
-        // base_frame_seq (2 bytes LE)
-        payload.extend_from_slice(&base_frame_seq.to_le_bytes());
-        // module_count (2 bytes LE)
-        payload.extend_from_slice(&module_count.to_le_bytes());
-        // diff entries
-        for entry in diff_entries {
-            payload.extend_from_slice(&entry.module_index.to_le_bytes());
-            payload.push(entry.module_value);
-        }
-
-        let info = FormatInfo::new_data(
-            seq,
-            block_index,
-            total_blocks,
-            payload.len() as u32,
-            FrameKind::P,
-            encoding_mode_bit,
-        );
-
-        let encoder = RsEncoder::new();
-        let encoded_payload = encoder.encode(&payload)?;
-
-        Ok(Frame {
-            format_info: info,
-            encoded_payload,
-            frame_kind: FrameKind::P,
-        })
-    }
-
     /// 构建 EOT（传输结束）帧
     ///
     /// EOT 帧没有载荷数据，始终为 I 帧。
@@ -303,29 +253,6 @@ mod tests {
         assert_eq!(frame.format_info.total_blocks, 0);
         assert_eq!(frame.format_info.payload_bytes, 0);
         assert_eq!(frame.frame_kind, FrameKind::I);
-    }
-
-    #[test]
-    fn test_new_p_frame() {
-        let diff_entries = vec![
-            DiffEntry {
-                module_index: 10,
-                module_value: 128,
-            },
-            DiffEntry {
-                module_index: 20,
-                module_value: 64,
-            },
-        ];
-        let frame = Frame::new_p_frame(&diff_entries, 5, 3, 0, 10, 1).unwrap();
-
-        assert_eq!(frame.frame_kind, FrameKind::P);
-        assert_eq!(frame.format_info.frame_kind, FrameKind::P);
-        assert_eq!(frame.format_info.encoding_mode_bit, 1);
-        assert_eq!(frame.format_info.frame_sequence, 5);
-        // P 帧 payload: 2B(base) + 2B(count) + 2×3B(entries) = 10B
-        // RS 编码后: 4B header + 255B = 259B
-        assert_eq!(frame.encoded_payload.len(), 4 + crate::common::constants::RS_TOTAL_LEN);
     }
 
     #[test]

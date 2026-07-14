@@ -26,15 +26,13 @@ impl FrameType {
     }
 }
 
-// ─── v0.2 新增：帧种类（I/P） ───
+// ─── 帧种类 ───
 
-/// 帧种类：I 帧（全量）或 P 帧（差分）
+/// 帧种类（协议保留 P 帧枚举值，但本程序只使用 I 帧）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FrameKind {
-    /// I 帧：全量渲染所有模块
     I = 0,
-    /// P 帧：仅渲染变化模块，其余中灰背景
     P = 1,
 }
 
@@ -49,7 +47,7 @@ impl FrameKind {
     }
 }
 
-// ─── v0.2 新增：编码模式 ───
+// ─── 编码模式 ───
 
 /// 编码模式
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,18 +63,7 @@ pub enum EncodingMode {
 impl EncodingMode {
 }
 
-// ─── v0.2 新增：DiffEntry ───
-
-/// P 帧中的单个模块变更条目
-#[derive(Debug, Clone, Copy)]
-pub struct DiffEntry {
-    /// 模块在数据矩阵中的行优先索引
-    pub module_index: u16,
-    /// 模块的目标灰度值
-    pub module_value: u8,
-}
-
-// ─── v0.2 新增：灰度编码配置 ───
+// ─── 灰度编码配置 ───
 
 /// 灰度编码配置
 #[derive(Debug, Clone)]
@@ -197,7 +184,7 @@ impl FormatInfo {
     }
 
     /// 创建数据帧的格式信息（便捷构造器：I 帧 + 二值模式）
-    pub fn new_data_v01(seq: u16, block_index: u32, total_blocks: u32, payload_bytes: u32) -> Self {
+    pub fn new_data_binary(seq: u16, block_index: u32, total_blocks: u32, payload_bytes: u32) -> Self {
         Self::new_data(seq, block_index, total_blocks, payload_bytes, FrameKind::I, 0)
     }
 
@@ -297,14 +284,10 @@ pub struct DecodedFrame {
     pub total_blocks: u32,
     /// 解码后的载荷数据（RS 解码后，不含 block_index 前缀）
     pub payload: Vec<u8>,
-    /// v0.2: 帧种类（I 或 P）
+    /// 帧种类（协议字段，本程序只用 I 帧）
     pub frame_kind: FrameKind,
-    /// v0.2: 编码模式
+    /// 编码模式
     pub encoding_mode: EncodingMode,
-    /// v0.2: P 帧的基准 I 帧序号（I 帧为 None）
-    pub base_frame_seq: Option<u16>,
-    /// v0.2: I 帧数据模块原始值序列（用于 P 帧合并缓存，P 帧/元数据帧为空）
-    pub data_module_values: Vec<u8>,
 }
 
 /// 帧摄入结果

@@ -318,7 +318,7 @@ fn sample_pixel_region_mean(
     }
 }
 
-// ─── v0.2 新增：多级分类器 ───
+// ─── 多级分类器 ───
 
 /// 将亮度值分类为级别索引
 ///
@@ -337,7 +337,7 @@ pub fn classify_gray(luminance: u8, thresholds: &[u8]) -> u8 {
     thresholds.len() as u8
 }
 
-// ─── v0.2 新增：灰度解码 ───
+// ─── 灰度解码 ───
 
 /// 通用灰度解码：将模块灰度值序列解码为字节
 ///

@@ -3,13 +3,12 @@
 //! 从截屏像素中完整解码一帧：
 //! 1. 提取格式信息并解码（三重投票 + CRC 校验）
 //! 2. 提取数据载荷并 RS 解码
-//! v0.2 新增：frame_kind / encoding_mode 解析、P 帧 payload 解析、自动检测。
 
 use crate::common::crc::crc16_xmodem;
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::rs_utils::rs_encoded_size;
 use crate::common::types::{
-    DecodedFrame, DiffEntry, EncodingMode, FinderPattern, FormatInfo, FrameKind, FrameLocation,
+    DecodedFrame, EncodingMode, FinderPattern, FormatInfo, FrameKind, FrameLocation,
     FrameType, GrayEncodingConfig, MetaPayload,
 };
 use crate::decoder::extract;
@@ -204,11 +203,7 @@ fn calc_gray_module_count(byte_count: usize, levels: u32) -> usize {
     }
 }
 
-/// 解码帧的数据载荷（含模块灰度值）
-///
-/// v0.2: 返回 (RS解码后的载荷, 数据模块原始值序列)
-/// - I 帧：模块值用于缓存（供后续 P 帧合并）
-/// - P 帧：模块值为空（P 帧 payload 已是 diff entries）
+/// 解码帧的数据载荷
 pub fn decode_payload(
     pixels: &[u8],
     img_width: i32,
@@ -216,9 +211,9 @@ pub fn decode_payload(
     loc: &FrameLocation,
     info: &FormatInfo,
     encoding_mode: &EncodingMode,
-) -> OptransResult<(Vec<u8>, Vec<u8>)> {
+) -> OptransResult<Vec<u8>> {
     if info.payload_bytes == 0 {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Vec::new());
     }
 
     let payload_bytes = info.payload_bytes as usize;
@@ -276,56 +271,10 @@ pub fn decode_payload(
     // RS 解码
     let decoded = rs_decode_data(&encoded_data)?;
 
-    // 返回 (解码后载荷, 模块原始值) — 模块值用于 I 帧缓存
-    Ok((decoded, relevant_modules.to_vec()))
+    Ok(decoded)
 }
 
-/// 解析 P 帧载荷中的 diff entries
-pub fn decode_p_frame_payload(payload: &[u8]) -> OptransResult<(u16, Vec<DiffEntry>)> {
-    if payload.len() < 4 {
-        return Err(OptransError::FrameDecode("P 帧载荷不足，无法解析".to_string()));
-    }
-
-    let base_frame_seq = u16::from_le_bytes(
-        payload[..2]
-            .try_into()
-            .map_err(|_| OptransError::FrameDecode("base_frame_seq 解析失败".to_string()))?,
-    );
-
-    let module_count = u16::from_le_bytes(
-        payload[2..4]
-            .try_into()
-            .map_err(|_| OptransError::FrameDecode("module_count 解析失败".to_string()))?,
-    ) as usize;
-
-    let expected_len = 4 + module_count * 3;
-    if payload.len() < expected_len {
-        return Err(OptransError::FrameDecode(format!(
-            "P 帧载荷不足: 需要 {} bytes，实际 {} bytes",
-            expected_len,
-            payload.len()
-        )));
-    }
-
-    let mut entries = Vec::with_capacity(module_count);
-    for i in 0..module_count {
-        let offset = 4 + i * 3;
-        let module_index = u16::from_le_bytes(
-            payload[offset..offset + 2]
-                .try_into()
-                .map_err(|_| OptransError::FrameDecode("module_index 解析失败".to_string()))?,
-        );
-        let module_value = payload[offset + 2];
-        entries.push(DiffEntry {
-            module_index,
-            module_value,
-        });
-    }
-
-    Ok((base_frame_seq, entries))
-}
-
-/// 完整解码一帧（格式信息 + 载荷 + 模块值）
+/// 完整解码一帧（格式信息 + 载荷）
 pub fn decode_frame(
     pixels: &[u8],
     img_width: i32,
@@ -340,20 +289,8 @@ pub fn decode_frame(
         other => other.clone(),
     };
 
-    let (payload, module_values) =
+    let payload =
         decode_payload(pixels, img_width, img_height, loc, &format_info, &actual_mode)?;
-
-    // P 帧：从 payload 提取 base_frame_seq
-    let base_frame_seq = match format_info.frame_kind {
-        FrameKind::P => {
-            if payload.len() >= 4 {
-                Some(u16::from_le_bytes(payload[..2].try_into().unwrap_or([0, 0])))
-            } else {
-                None
-            }
-        }
-        FrameKind::I => None,
-    };
 
     Ok(DecodedFrame {
         frame_type: format_info.frame_type,
@@ -363,8 +300,6 @@ pub fn decode_frame(
         payload,
         frame_kind: format_info.frame_kind,
         encoding_mode: actual_mode,
-        base_frame_seq,
-        data_module_values: module_values,
     })
 }
 
@@ -591,25 +526,6 @@ mod tests {
         assert_eq!(meta.file_size, 12345);
         assert_eq!(meta.sha256, [0xAB; 32]);
         assert_eq!(meta.total_blocks, 10);
-    }
-
-    #[test]
-    fn test_decode_p_frame_payload() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&3u16.to_le_bytes());
-        payload.extend_from_slice(&2u16.to_le_bytes());
-        payload.extend_from_slice(&10u16.to_le_bytes());
-        payload.push(128u8);
-        payload.extend_from_slice(&20u16.to_le_bytes());
-        payload.push(64u8);
-
-        let (base_seq, entries) = decode_p_frame_payload(&payload).unwrap();
-        assert_eq!(base_seq, 3);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].module_index, 10);
-        assert_eq!(entries[0].module_value, 128);
-        assert_eq!(entries[1].module_index, 20);
-        assert_eq!(entries[1].module_value, 64);
     }
 
     #[test]

@@ -29,7 +29,6 @@ fn main() -> OptransResult<()> {
             info!("  帧边距: {}px", constants::FRAME_MARGIN_PX_DEFAULT);
             info!("  灰度级数: {}", constants::GRAY_LEVELS_DEFAULT);
             info!("  心跳: 启用");
-            info!("  I帧间隔: {}", constants::I_FRAME_INTERVAL_DEFAULT);
             optrans::sender::transmit::run_send(path)
         }
         Command::Receive { output } => {

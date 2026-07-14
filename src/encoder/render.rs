@@ -1,7 +1,6 @@
 //! 帧 → 像素缓冲区渲染
 //!
 //! 将 Frame 渲染为 RGBA 像素缓冲区，用于窗口显示。
-//! v0.2 新增：灰度渲染、心跳注入、P 帧背景填充。
 //! v0.5: 支持长方形帧，render_frame 接受 (modules_w, modules_h) 双维度参数。
 
 use crate::common::constants::{
@@ -9,7 +8,7 @@ use crate::common::constants::{
     RGBA_CHANNELS,
 };
 use crate::common::crc::crc16_xmodem;
-use crate::common::types::{DiffEntry, GrayEncodingConfig};
+use crate::common::types::GrayEncodingConfig;
 use crate::encoder::frame::Frame;
 use crate::encoder::pattern::{generate_finder_pattern, is_finder_module, is_format_module};
 
@@ -22,7 +21,6 @@ use crate::encoder::pattern::{generate_finder_pattern, is_finder_module, is_form
 /// - `modules_h`: 垂直方向模块数
 /// - `gray_config`: 灰度编码配置
 /// - `enable_heartbeat`: 是否注入心跳噪声
-/// - `p_frame_entries`: P 帧的差异条目（仅 P 帧有效，I 帧传 None）
 ///
 /// # 返回
 /// RGBA 像素缓冲区，尺寸为 `(modules_w * module_pixels) × (modules_h * module_pixels) × 4` 字节
@@ -33,7 +31,6 @@ pub fn render_frame(
     modules_h: u32,
     gray_config: &GrayEncodingConfig,
     enable_heartbeat: bool,
-    p_frame_entries: Option<&[DiffEntry]>,
 ) -> Vec<u8> {
     let n_w = modules_w as usize;
     let n_h = modules_h as usize;
@@ -50,21 +47,7 @@ pub fn render_frame(
     let format_bits = encode_format_info_bits(&frame.format_info, modules_w);
 
     // 预计算数据矩阵灰度值序列
-    let is_p_frame = matches!(frame.frame_kind, crate::common::types::FrameKind::P);
-    let data_gray_values = if is_p_frame {
-        // P 帧：数据区全中灰背景，仅 diff entries 覆盖
-        Vec::new()
-    } else {
-        // I 帧：正常灰度编码
-        build_data_gray_sequence(&frame.encoded_payload, n_w, n_h, gray_config)
-    };
-
-    // 为 P 帧构建 diff entry 查找表（module_index → gray_value）
-    let diff_lookup: std::collections::HashMap<u16, u8> = if let Some(entries) = p_frame_entries {
-        entries.iter().map(|e| (e.module_index, e.module_value)).collect()
-    } else {
-        std::collections::HashMap::new()
-    };
+    let data_gray_values = build_data_gray_sequence(&frame.encoded_payload, n_w, n_h, gray_config);
 
     // 遍历每个模块坐标，填充像素
     let mut data_module_idx: usize = 0;
@@ -110,12 +93,7 @@ pub fn render_frame(
                 }
             } else {
                 // 数据矩阵模块
-                if is_p_frame {
-                    // P 帧：默认中灰背景，有 diff entry 则覆盖
-                    let idx = data_module_idx as u16;
-                    data_module_idx += 1;
-                    diff_lookup.get(&idx).copied().unwrap_or(128u8)
-                } else if data_module_idx < data_gray_values.len() {
+                if data_module_idx < data_gray_values.len() {
                     let val = data_gray_values[data_module_idx];
                     data_module_idx += 1;
                     val
@@ -131,7 +109,7 @@ pub fn render_frame(
     }
 
     // 心跳注入
-    if enable_heartbeat && !is_p_frame {
+    if enable_heartbeat {
         inject_heartbeat(&mut pixels, img_width, n_w, n_h, mp, frame.format_info.frame_sequence);
     }
 
@@ -242,7 +220,7 @@ fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
 /// 超出数据模块数的部分被截断，末尾少数模块留白。
 ///
 /// v0.6: 应用数据掩码（XOR）打散大片同色区域，提升采样稳定性。
-pub(crate) fn build_data_gray_sequence(
+fn build_data_gray_sequence(
     encoded_payload: &[u8],
     n_w: usize,
     n_h: usize,
@@ -263,7 +241,7 @@ pub(crate) fn build_data_gray_sequence(
     gray_values.into_iter().take(max_data_modules).collect()
 }
 
-// ─── v0.2 新增：通用灰度编码 ───
+// ─── 通用灰度编码 ───
 
 /// 通用灰度编码：将字节切片按指定级数编码为模块灰度值序列
 ///
@@ -308,7 +286,7 @@ fn encode_gray_direct(data: &[u8], bits_per_module: u32, gray_table: &[u8]) -> (
     (gray_values, original_len)
 }
 
-// ─── v0.2 新增：心跳注入 ───
+// ─── 心跳注入 ───
 
 /// 在像素缓冲区右下角注入心跳噪声
 ///
@@ -396,7 +374,6 @@ pub fn render_frame_default(
     modules_h: u32,
     gray_config: &GrayEncodingConfig,
     enable_heartbeat: bool,
-    p_frame_entries: Option<&[DiffEntry]>,
 ) -> Vec<u8> {
     render_frame(
         frame,
@@ -405,7 +382,6 @@ pub fn render_frame_default(
         modules_h,
         gray_config,
         enable_heartbeat,
-        p_frame_entries,
     )
 }
 
@@ -417,7 +393,7 @@ mod tests {
 
     #[test]
     fn test_pack_format_info_roundtrip() {
-        let info = FormatInfo::new_data_v01(42, 100, 500, 2000);
+        let info = FormatInfo::new_data_binary(42, 100, 500, 2000);
         let mut packed = vec![0u8; 13];
         pack_format_info(&info, &mut packed);
 
@@ -529,7 +505,7 @@ mod tests {
         };
         let config = GrayEncodingConfig::new(2);
         let n = MODULES_PER_SIDE_DEFAULT;
-        let pixels = render_frame_default(&frame, 4, n, n, &config, false, None);
+        let pixels = render_frame_default(&frame, 4, n, n, &config, false);
         assert_eq!(pixels.len(), 800 * 800 * 4);
     }
 
@@ -558,7 +534,7 @@ mod tests {
         let frame = Frame { format_info: info, encoded_payload: rs_encoded.clone(), frame_kind: FrameKind::I };
 
         // 渲染到像素缓冲区
-        let pixels = render_frame_default(&frame, mp, n_w, n_h, &gray_config, false, None);
+        let pixels = render_frame_default(&frame, mp, n_w, n_h, &gray_config, false);
 
         // 直接从像素采样数据模块：模块内所有像素同色，取中心像素即可
         let n_w_usize = n_w as usize;
@@ -617,7 +593,7 @@ mod tests {
         let config = GrayEncodingConfig::new(2);
         let n_w: u32 = 160;
         let n_h: u32 = 90;
-        let pixels = render_frame_default(&frame, 4, n_w, n_h, &config, false, None);
+        let pixels = render_frame_default(&frame, 4, n_w, n_h, &config, false);
         assert_eq!(pixels.len(), (640 * 360 * 4) as usize);
     }
 
