@@ -6,24 +6,30 @@
 //! v0.18: 帧位置锁定 — 首次后复用 FrameLocation，跳过全屏扫描。
 //! v0.8: 高频解码错误日志增加节流。
 
-use std::sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 
-use crate::common::types::EncodingMode;
 use crate::common::error::{OptransError, OptransResult};
+use crate::common::types::EncodingMode;
 use crate::common::types::{DecodedFrame, FrameKind, FrameLocation, FrameType, IngestResult};
 use crate::decoder::decode::{decode_format_info, decode_frame};
-use crate::decoder::locate::{locate_frame_all_with_diag, LocateDiagnostics};
+use crate::decoder::locate::{LocateDiagnostics, locate_frame_all_with_diag};
 use crate::receiver::capture::capture_full_screen;
 use crate::receiver::collect::FrameCollector;
 use crate::receiver::reassemble::FileAssembler;
 
 /// 执行接收操作的主入口（v0.19: 流水线架构）
-pub fn run_receive(output: Option<std::path::PathBuf>, encoding_mode: EncodingMode) -> OptransResult<()> {
-
+pub fn run_receive(
+    output: Option<std::path::PathBuf>,
+    encoding_mode: EncodingMode,
+) -> OptransResult<()> {
     info!("开始接收...");
     info!("截屏模式: 全屏（Ctrl+C 退出）");
     info!("定位模式: 全屏扫描 → 帧锁定");
@@ -52,7 +58,7 @@ pub fn run_receive(output: Option<std::path::PathBuf>, encoding_mode: EncodingMo
     // ── 等 aggregator 结束 ──
     match aggregator.join() {
         Ok(agg_result) => {
-            result?;  // propagate capture errors first
+            result?; // propagate capture errors first
             agg_result
         }
         Err(_) => Err(OptransError::FrameDecode("aggregator 线程 panic".into())),
@@ -72,7 +78,10 @@ fn run_aggregator(
     loop {
         match rx.recv() {
             Ok(frame) => {
-                let kind_str = match frame.frame_kind { FrameKind::I => "I", FrameKind::P => "P" };
+                let kind_str = match frame.frame_kind {
+                    FrameKind::I => "I",
+                    FrameKind::P => "P",
+                };
 
                 match collector.ingest(frame) {
                     Ok(IngestResult::NewMeta(meta)) => {
@@ -86,8 +95,15 @@ fn run_aggregator(
                         let received = collector.blocks_received();
                         info!(
                             "数据块({}) #{}, 进度: {}/{} ({:.0}%)",
-                            kind_str, idx, received, total,
-                            if total > 0 { received as f64 / total as f64 * 100.0 } else { 0.0 }
+                            kind_str,
+                            idx,
+                            received,
+                            total,
+                            if total > 0 {
+                                received as f64 / total as f64 * 100.0
+                            } else {
+                                0.0
+                            }
                         );
                     }
                     Ok(IngestResult::EotReceived) => {
@@ -99,7 +115,8 @@ fn run_aggregator(
                             let missing = collector.missing_blocks();
                             return Err(OptransError::FrameDecode(format!(
                                 "收到 EOT 但缺失 {} 块: {:?}，传输失败",
-                                missing.len(), missing
+                                missing.len(),
+                                missing
                             )));
                         }
                     }
@@ -113,7 +130,9 @@ fn run_aggregator(
             Err(mpsc::RecvError) => {
                 warn!("sender 通道关闭，flush 缓冲区...");
                 if collector.meta().is_none() {
-                    return Err(OptransError::FrameDecode("未收到元数据帧，无法重组文件".into()));
+                    return Err(OptransError::FrameDecode(
+                        "未收到元数据帧，无法重组文件".into(),
+                    ));
                 }
                 return flush_and_write(collector, output_path);
             }
@@ -125,9 +144,10 @@ fn flush_and_write(
     collector: FrameCollector,
     output_path: Option<std::path::PathBuf>,
 ) -> OptransResult<()> {
-    let meta = collector.meta().cloned().ok_or_else(|| {
-        OptransError::FrameDecode("未收到元数据帧，无法重组文件".into())
-    })?;
+    let meta = collector
+        .meta()
+        .cloned()
+        .ok_or_else(|| OptransError::FrameDecode("未收到元数据帧，无法重组文件".into()))?;
     let expected_file_size = meta.file_size;
     let blocks = collector.take_blocks();
 
@@ -180,8 +200,10 @@ fn run_capture_loop(
         loop_count += 1;
         let loop_start = Instant::now();
 
-        // 1. 截屏
+        // 1. 截屏（防撕裂：等待 50ms 让 SetDIBitsToDevice 完成）
         let t0 = Instant::now();
+        let _ = capture_full_screen();
+        thread::sleep(Duration::from_millis(50));
         let (pixels, img_w, img_h) = match capture_full_screen() {
             Ok(r) => r,
             Err(e) => {
@@ -199,7 +221,13 @@ fn run_capture_loop(
         let locked_loc = locked.lock().unwrap().clone();
 
         if let Some(ref loc) = locked_loc {
-            candidates = vec![(loc.clone(), LocateDiagnostics { candidates_found: 0, candidates_verified: 0 })];
+            candidates = vec![(
+                loc.clone(),
+                LocateDiagnostics {
+                    candidates_found: 0,
+                    candidates_verified: 0,
+                },
+            )];
         } else {
             candidates = locate_frame_all_with_diag(&pixels, img_w, img_h);
             locate_cost = t1.elapsed().as_millis();
@@ -219,7 +247,10 @@ fn run_capture_loop(
             });
             debug!(
                 "[locate-filter] 过滤前{}个, 过滤后{}个, 期望TL=({},{})",
-                before, candidates.len(), expected_tl_x as u32, expected_tl_y as u32
+                before,
+                candidates.len(),
+                expected_tl_x as u32,
+                expected_tl_y as u32
             );
 
             if candidates.is_empty() {
@@ -234,22 +265,37 @@ fn run_capture_loop(
             if !locate_diag_printed {
                 locate_diag_printed = true;
                 let diag = &candidates[0].1;
-                debug!("定位诊断: 候选{}个/验证{}个, 有效三角组{}个（显示前10）",
-                    diag.candidates_found, diag.candidates_verified, candidates.len());
+                debug!(
+                    "定位诊断: 候选{}个/验证{}个, 有效三角组{}个（显示前10）",
+                    diag.candidates_found,
+                    diag.candidates_verified,
+                    candidates.len()
+                );
                 let show_n = candidates.len().min(10);
                 for (i, (loc, _)) in candidates.iter().enumerate().take(show_n) {
-                    let is_frame_like = loc.modules_w >= 550 && loc.modules_w <= 710
-                        && loc.modules_h >= 300 && loc.modules_h <= 460;
-                    debug!("[#{}]{} TL=({:.1},{:.1}) TR=({:.1},{:.1}) BL=({:.1},{:.1}) frame={}w×{}h",
-                        i, if is_frame_like { " ★" } else { "" },
-                        loc.tl.center_x, loc.tl.center_y,
-                        loc.tr.center_x, loc.tr.center_y,
-                        loc.bl.center_x, loc.bl.center_y,
-                        loc.modules_w, loc.modules_h);
+                    let is_frame_like = loc.modules_w >= 550
+                        && loc.modules_w <= 710
+                        && loc.modules_h >= 300
+                        && loc.modules_h <= 460;
+                    debug!(
+                        "[#{}]{} TL=({:.1},{:.1}) TR=({:.1},{:.1}) BL=({:.1},{:.1}) frame={}w×{}h",
+                        i,
+                        if is_frame_like { " ★" } else { "" },
+                        loc.tl.center_x,
+                        loc.tl.center_y,
+                        loc.tr.center_x,
+                        loc.tr.center_y,
+                        loc.bl.center_x,
+                        loc.bl.center_y,
+                        loc.modules_w,
+                        loc.modules_h
+                    );
                 }
                 let rank = candidates.iter().position(|(loc, _)| {
-                    loc.modules_w >= 550 && loc.modules_w <= 710
-                        && loc.modules_h >= 300 && loc.modules_h <= 460
+                    loc.modules_w >= 550
+                        && loc.modules_w <= 710
+                        && loc.modules_h >= 300
+                        && loc.modules_h <= 460
                 });
                 if let Some(r) = rank {
                     debug!("  >>> 帧型首位排名 #{}, 共{}候选", r, candidates.len());
@@ -260,7 +306,11 @@ fn run_capture_loop(
         }
 
         no_frame_start = Instant::now();
-        let locate_ms = if locked_loc.is_some() { 0u128 } else { locate_cost };
+        let locate_ms = if locked_loc.is_some() {
+            0u128
+        } else {
+            locate_cost
+        };
 
         // 3. 快速预判 — decode_format_info 拿 {frame_type, frame_sequence}
         let t2 = Instant::now();
@@ -276,7 +326,8 @@ fn run_capture_loop(
                         let eot_frame = DecodedFrame {
                             frame_type: FrameType::EOT,
                             frame_sequence: info.frame_sequence,
-                            block_index: 0, total_blocks: 0,
+                            block_index: 0,
+                            total_blocks: 0,
                             payload: Vec::new(),
                             frame_kind: FrameKind::I,
                             encoding_mode: EncodingMode::Binary,
@@ -315,8 +366,8 @@ fn run_capture_loop(
             thread::spawn(move || {
                 match decode_frame(&pixels_arc, img_w, img_h, &loc, &enc_mode) {
                     Ok(frame) => {
-                        let is_meta_or_data = matches!(frame.frame_type,
-                            FrameType::Meta | FrameType::Data);
+                        let is_meta_or_data =
+                            matches!(frame.frame_type, FrameType::Meta | FrameType::Data);
                         if is_meta_or_data && frame.payload.is_empty() {
                             return;
                         }
@@ -355,8 +406,10 @@ fn run_capture_loop(
                                     *miss = 0;
                                 }
                             }
-                            debug!("格式信息解码失败: {} (tl={:.0},{:.0})",
-                                msg, loc.tl.center_x, loc.tl.center_y);
+                            debug!(
+                                "格式信息解码失败: {} (tl={:.0},{:.0})",
+                                msg, loc.tl.center_x, loc.tl.center_y
+                            );
                         }
                     }
                     _ => {
@@ -376,9 +429,14 @@ fn run_capture_loop(
         // 时序日志
         let total_ms = loop_start.elapsed().as_millis();
         if loop_count.is_multiple_of(10) {
-            debug!("时序: 截屏{}ms 定位{}ms 预判{}ms 总{}ms @{}fps",
-                capture_ms, locate_ms, precheck_ms, total_ms,
-                1000 / total_ms.max(1));
+            debug!(
+                "时序: 截屏{}ms 定位{}ms 预判{}ms 总{}ms @{}fps",
+                capture_ms,
+                locate_ms,
+                precheck_ms,
+                total_ms,
+                1000 / total_ms.max(1)
+            );
         }
     }
 }
