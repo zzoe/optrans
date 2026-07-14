@@ -13,7 +13,7 @@ use std::sync::{
 };
 use std::thread;
 
-use log::{debug, info, warn};
+use log::{info, warn};
 
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::EncodingMode;
@@ -191,9 +191,8 @@ fn run_capture_loop(
     let pool = threadpool::ThreadPool::new(2);
     let enc_mode = encoding_mode.clone();
 
-    // ═══ Phase 1: 等待 Meta 帧 → 锁定位置 + 获取 total_blocks ═══
+    // ═══ Phase 1: 等待 Meta 帧 → 锁定位置 ═══
     let mut meta_loc: Option<FrameLocation> = None;
-    let mut total_blocks: u32 = 0;
     loop {
         if done.load(Ordering::SeqCst) { drop(tx); return Ok(()); }
 
@@ -214,7 +213,6 @@ fn run_capture_loop(
                     if !frame.payload.is_empty() {
                         let _ = tx.send(frame);
                         meta_loc = Some(loc.clone());
-                        total_blocks = info.total_blocks;
                         found = true;
                         break;
                     }
@@ -222,14 +220,13 @@ fn run_capture_loop(
             }
         }
         if found {
-            info!("✓ Meta 帧解析成功，共 {} 个数据块，位置已锁定", total_blocks);
+            info!("✓ Meta 帧解析成功，位置已锁定");
             break;
         }
     }
     let loc = meta_loc.unwrap();
 
-    // ═══ Phase 2: 捕获数据帧 ═══
-    let mut blocks_received = 0u32;
+    // ═══ Phase 2: 捕获数据帧 + EOT（纯转发，aggregator 负责计数/漏帧检测） ═══
     loop {
         if done.load(Ordering::SeqCst) { drop(tx); return Ok(()); }
 
@@ -238,10 +235,9 @@ fn run_capture_loop(
             Err(e) => { warn!("截屏失败: {}，重试...", e); continue; }
         };
 
-        // 用锁定位
         let info = match decode_format_info(&pixels, img_w, img_h, &loc) {
             Ok(i) => i,
-            Err(_) => continue, // format info 未通过 → 帧不完整 → 下一屏
+            Err(_) => continue,
         };
 
         match info.frame_type {
@@ -260,34 +256,19 @@ fn run_capture_loop(
                 break;
             }
             FrameType::Data => {
-                // 第一帧必须是 block #0
-                if blocks_received == 0 && info.block_index != 0 {
-                    return Err(OptransError::FrameDecode(format!(
-                        "首帧序号 {} ≠ 0，丢失前 {} 块",
-                        info.block_index, info.block_index
-                    )));
-                }
-
                 let pixels_arc = Arc::new(pixels);
                 let enc = enc_mode.clone();
                 let tx_c = tx.clone();
                 let lloc = loc.clone();
                 pool.execute(move || {
-                    match decode_frame(&pixels_arc, img_w, img_h, &lloc, &enc) {
-                        Ok(frame) if !frame.payload.is_empty() => {
+                    if let Ok(frame) = decode_frame(&pixels_arc, img_w, img_h, &lloc, &enc) {
+                        if !frame.payload.is_empty() {
                             let _ = tx_c.send(frame);
                         }
-                        Err(e) => { debug!("payload 解码失败: {}", e); }
-                        _ => {}
                     }
                 });
-
-                blocks_received += 1;
-                if blocks_received >= total_blocks {
-                    info!("所有 {} 个数据块已收到，等待 EOT...", total_blocks);
-                }
             }
-            _ => {} // Meta 帧在这里忽略（phase 1 已处理）
+            _ => {}
         }
     }
 
