@@ -191,252 +191,133 @@ fn run_capture_loop(
 ) -> OptransResult<()> {
     let mut no_frame_start = Instant::now();
     let mut last_heartbeat = Instant::now();
-    let locked = Arc::new(std::sync::Mutex::new(None::<FrameLocation>));
-    let locked_miss: Arc<std::sync::Mutex<u32>> = Arc::new(std::sync::Mutex::new(0));
+    let locked: Arc<std::sync::OnceLock<FrameLocation>> = Arc::new(std::sync::OnceLock::new());
     let mut locate_diag_printed = false;
     let mut loop_count: u64 = 0;
 
+    // 并发解码上限（避免线程爆炸）
+    let decode_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     loop {
         loop_count += 1;
-        let loop_start = Instant::now();
+        if done.load(Ordering::SeqCst) {
+            drop(tx);
+            return Ok(());
+        }
 
-        // 1. 截屏（防撕裂：等待 50ms 让 SetDIBitsToDevice 完成）
-        let t0 = Instant::now();
-        let _ = capture_full_screen();
-        thread::sleep(Duration::from_millis(50));
+        // 1. 截屏
         let (pixels, img_w, img_h) = match capture_full_screen() {
             Ok(r) => r,
-            Err(e) => {
-                warn!("截屏失败: {}，重试...", e);
-                continue;
-            }
+            Err(e) => { warn!("截屏失败: {}，重试...", e); continue; }
         };
-        let capture_ms = t0.elapsed().as_millis();
 
-        // 2. 定位
-        let t1 = Instant::now();
-        let mut candidates: Vec<(FrameLocation, LocateDiagnostics)>;
-        let mut locate_cost = 0u128;
-
-        let locked_loc = locked.lock().unwrap().clone();
-
-        if let Some(ref loc) = locked_loc {
-            candidates = vec![(
-                loc.clone(),
-                LocateDiagnostics {
-                    candidates_found: 0,
-                    candidates_verified: 0,
-                },
-            )];
+        // 2. 定位：锁定时直接用，否则全屏扫描
+        let candidates = if let Some(loc) = locked.get() {
+            vec![(loc.clone(), LocateDiagnostics { candidates_found: 0, candidates_verified: 0 })]
         } else {
-            candidates = locate_frame_all_with_diag(&pixels, img_w, img_h);
-            locate_cost = t1.elapsed().as_millis();
-
-            // v0.20: sender 是全屏窗口，finder 位置可精确推算。
-            // 过滤掉桌面噪点误匹配的假候选（定位在错误屏幕区域）。
-            let margin = crate::common::constants::FRAME_MARGIN_PX_DEFAULT as f64;
-            let mp_f = crate::common::constants::MODULE_PIXELS_DEFAULT as f64;
-            let expected_tl_x = margin + 3.5 * mp_f;
-            let expected_tl_y = margin + 3.5 * mp_f;
-            let max_dist = 120.0; // 允许 120px 误差
-            let before = candidates.len();
-            candidates.retain(|(loc, _)| {
-                let dx = loc.tl.center_x - expected_tl_x;
-                let dy = loc.tl.center_y - expected_tl_y;
-                (dx * dx + dy * dy).sqrt() <= max_dist
-            });
-            debug!(
-                "[locate-filter] 过滤前{}个, 过滤后{}个, 期望TL=({},{})",
-                before,
-                candidates.len(),
-                expected_tl_x as u32,
-                expected_tl_y as u32
-            );
-
-            if candidates.is_empty() {
-                let waited = no_frame_start.elapsed();
-                if waited.as_secs() >= 3 && last_heartbeat.elapsed() >= Duration::from_secs(3) {
-                    debug!("等待发送端... (已等待 {}s)", waited.as_secs());
+            let raw = locate_frame_all_with_diag(&pixels, img_w, img_h);
+            if raw.is_empty() {
+                if no_frame_start.elapsed().as_secs() >= 3
+                    && last_heartbeat.elapsed() >= Duration::from_secs(3)
+                {
+                    debug!("等待发送端...");
                     last_heartbeat = Instant::now();
                 }
                 continue;
             }
+            // 位置过滤
+            let margin = crate::common::constants::FRAME_MARGIN_PX_DEFAULT as f64;
+            let mp = crate::common::constants::MODULE_PIXELS_DEFAULT as f64;
+            let ex = margin + 3.5 * mp;
+            let ey = margin + 3.5 * mp;
+            let max_dist = 120.0;
+            let before = raw.len();
+            let filtered: Vec<_> = raw.into_iter()
+                .filter(|(loc, _)| {
+                    let dx = loc.tl.center_x - ex;
+                    let dy = loc.tl.center_y - ey;
+                    (dx*dx + dy*dy).sqrt() <= max_dist
+                })
+                .collect();
+            debug!("[find] {}→{} candidates", before, filtered.len());
 
-            if !locate_diag_printed {
+            if !locate_diag_printed && !filtered.is_empty() {
                 locate_diag_printed = true;
-                let diag = &candidates[0].1;
-                debug!(
-                    "定位诊断: 候选{}个/验证{}个, 有效三角组{}个（显示前10）",
-                    diag.candidates_found,
-                    diag.candidates_verified,
-                    candidates.len()
-                );
-                let show_n = candidates.len().min(10);
-                for (i, (loc, _)) in candidates.iter().enumerate().take(show_n) {
-                    let is_frame_like = loc.modules_w >= 550
-                        && loc.modules_w <= 710
-                        && loc.modules_h >= 300
-                        && loc.modules_h <= 460;
-                    debug!(
-                        "[#{}]{} TL=({:.1},{:.1}) TR=({:.1},{:.1}) BL=({:.1},{:.1}) frame={}w×{}h",
-                        i,
-                        if is_frame_like { " ★" } else { "" },
-                        loc.tl.center_x,
-                        loc.tl.center_y,
-                        loc.tr.center_x,
-                        loc.tr.center_y,
-                        loc.bl.center_x,
-                        loc.bl.center_y,
-                        loc.modules_w,
-                        loc.modules_h
-                    );
-                }
-                let rank = candidates.iter().position(|(loc, _)| {
-                    loc.modules_w >= 550
-                        && loc.modules_w <= 710
-                        && loc.modules_h >= 300
-                        && loc.modules_h <= 460
-                });
-                if let Some(r) = rank {
-                    debug!("  >>> 帧型首位排名 #{}, 共{}候选", r, candidates.len());
-                } else {
-                    debug!("  >>> 未找到帧型！共{}候选", candidates.len());
-                }
+                let d = &filtered[0].1;
+                info!("定位: {}候选/{}验证 → {}三角组, TL=({:.0},{:.0}) frame={}×{}",
+                    d.candidates_found, d.candidates_verified, filtered.len(),
+                    filtered[0].0.tl.center_x, filtered[0].0.tl.center_y,
+                    filtered[0].0.modules_w, filtered[0].0.modules_h);
             }
-        }
-
-        no_frame_start = Instant::now();
-        let locate_ms = if locked_loc.is_some() {
-            0u128
-        } else {
-            locate_cost
+            filtered
         };
 
-        // 3. 快速预判 — decode_format_info 拿 {frame_type, frame_sequence}
-        let t2 = Instant::now();
-        let mut first_error: Option<(OptransError, FrameLocation)> = None;
-        let mut best_candidate: Option<usize> = None; // candidate index
+        no_frame_start = Instant::now();
 
+        // 3. 预判：format_info 快速 CRC 校验
+        let mut best_candidate: Option<usize> = None;
         for (ci, (loc, _)) in candidates.iter().enumerate() {
             match decode_format_info(&pixels, img_w, img_h, loc) {
                 Ok(info) => {
-                    // EOT 检测
                     if info.frame_type == FrameType::EOT {
                         info!("收到 EOT 信号");
-                        let eot_frame = DecodedFrame {
+                        let _ = tx.send(DecodedFrame {
                             frame_type: FrameType::EOT,
                             frame_sequence: info.frame_sequence,
-                            block_index: 0,
-                            total_blocks: 0,
+                            block_index: 0, total_blocks: 0,
                             payload: Vec::new(),
                             frame_kind: FrameKind::I,
                             encoding_mode: EncodingMode::Binary,
                             base_frame_seq: None,
                             data_module_values: Vec::new(),
-                        };
-                        let _ = tx.send(eot_frame);
+                        });
                         drop(tx);
                         return Ok(());
                     }
-
                     best_candidate = Some(ci);
                     break;
                 }
-                Err(e) => {
-                    if first_error.is_none() {
-                        first_error = Some((e, loc.clone()));
-                    }
-                }
+                Err(_) => {}
             }
         }
 
-        let precheck_ms = t2.elapsed().as_millis();
-
-        // 4. 如果有有效候选，spawn decode 线程
+        // 4. 解码
         if let Some(ci) = best_candidate {
             let loc = candidates[ci].0.clone();
-            // v0.19.4: Arc 共享截屏数据，避免每线程 8MB clone
             let pixels_arc = Arc::new(pixels);
             let enc_mode = encoding_mode.clone();
             let tx_clone = tx.clone();
             let locked_clone = Arc::clone(&locked);
-            let locked_miss_clone = Arc::clone(&locked_miss);
-            let is_first = locked_loc.is_none();
+            let slots_clone = Arc::clone(&decode_in_flight);
+            let is_first = locked.get().is_none();
 
-            thread::spawn(move || {
-                match decode_frame(&pixels_arc, img_w, img_h, &loc, &enc_mode) {
-                    Ok(frame) => {
-                        let is_meta_or_data =
-                            matches!(frame.frame_type, FrameType::Meta | FrameType::Data);
-                        if is_meta_or_data && frame.payload.is_empty() {
-                            return;
-                        }
-                        // v0.23.3: 仅在数据帧 decode 成功后锁定位置。
-                        // meta 帧为二值模式，finder 定位精度对灰度数据帧可能不足，
-                        // 过早锁定会导致 16 级灰度采样跨阈值 → payload RS 解码持续失败。
-                        if is_first && matches!(frame.frame_type, FrameType::Data) {
-                            let was_none = locked_clone.lock().unwrap().is_none();
-                            *locked_clone.lock().unwrap() = Some(loc.clone());
-                            if was_none {
-                                *locked_miss_clone.lock().unwrap() = 0;
-                                info!("✓ 首个有效帧解码成功，已与发送端建立连接");
-                                info!("🔒 帧位置已锁定（跳过全屏扫描）");
+            // 限制并发 decode 线程数（最多 4）
+            if slots_clone.load(Ordering::Relaxed) < 4 {
+                slots_clone.fetch_add(1, Ordering::Relaxed);
+                thread::spawn(move || {
+                    match decode_frame(&pixels_arc, img_w, img_h, &loc, &enc_mode) {
+                        Ok(frame) => {
+                            if matches!(frame.frame_type, FrameType::Meta | FrameType::Data)
+                                && frame.payload.is_empty() { slots_clone.fetch_sub(1, Ordering::Relaxed); return; }
+                            if is_first && matches!(frame.frame_type, FrameType::Data) {
+                                let _ = locked_clone.set(loc.clone());
+                                info!("✓ 首个有效帧解码成功，已锁定位置");
                             }
+                            let _ = tx_clone.send(frame);
+                            slots_clone.fetch_sub(1, Ordering::Relaxed);
                         }
-                        let _ = tx_clone.send(frame);
-                    }
-                    Err(e) => {
-                        // decode failed → capture will retry next round
-                        debug!("payload 解码失败: {}", e);
-                    }
-                }
-            });
-        } else {
-            // format_info 全部失败 — 输出第一个错误
-            if let Some((err, loc)) = first_error {
-                match &err {
-                    OptransError::InvalidFormatInfo(msg) => {
-                        if !msg.starts_with("假帧") {
-                            if locked_loc.is_some() {
-                                let mut miss = locked_miss.lock().unwrap();
-                                *miss += 1;
-                                if *miss >= 10 {
-                                    info!("⚠ 锁定位连续{}次格式信息解码失败，重置锁定", *miss);
-                                    *locked.lock().unwrap() = None;
-                                    *miss = 0;
-                                }
-                            }
-                            debug!(
-                                "格式信息解码失败: {} (tl={:.0},{:.0})",
-                                msg, loc.tl.center_x, loc.tl.center_y
-                            );
+                        Err(e) => {
+                            debug!("payload 解码失败: {}", e);
+                            slots_clone.fetch_sub(1, Ordering::Relaxed);
                         }
                     }
-                    _ => {
-                        warn!("帧解码失败: {}", err);
-                    }
-                }
-            }
-
-            // aggregator 已完成（文件已写入）且发送端已消失 → 退出
-            if locked_loc.is_some() && done.load(Ordering::SeqCst) {
-                info!("发送端已关闭，接收完成");
-                drop(tx);
-                return Ok(());
+                });
             }
         }
 
-        // 时序日志
-        let total_ms = loop_start.elapsed().as_millis();
+        // 时序
         if loop_count.is_multiple_of(10) {
-            debug!(
-                "时序: 截屏{}ms 定位{}ms 预判{}ms 总{}ms @{}fps",
-                capture_ms,
-                locate_ms,
-                precheck_ms,
-                total_ms,
-                1000 / total_ms.max(1)
-            );
+            debug!("capture loop @{}fps", 0);
         }
     }
 }

@@ -95,9 +95,9 @@ pub fn render_frame(
                 } else {
                     255u8
                 }
-            } else if is_format_module(module_col as u32, module_row as u32, n_w_u32) {
+            } else if is_format_module(module_col as u32, module_row as u32, n_w_u32, n_h_u32) {
                 // 格式信息区模块（始终二值：黑/白）
-                let format_idx = format_module_index(module_col, module_row, n_w);
+                let format_idx = format_module_index(module_col, module_row, n_w, n_h);
                 if format_idx < format_bits.len() {
                     // 与数据模块约定一致：bit 1 → 白(255)，bit 0 → 黑(0)
                     if format_bits[format_idx] == 1 {
@@ -140,15 +140,15 @@ pub fn render_frame(
 
 /// 计算格式信息模块在比特序列中的索引
 ///
-/// 格式信息区：模块行 0 和行 1，列 7..n_w-8
-/// 填充顺序：先行 0（从左到右），再行 1（从左到右）
-fn format_module_index(col: usize, row: usize, n_w: usize) -> usize {
-    let s = 7; // finder pattern 尺寸
+/// 格式信息区：模块行 n_h-2 和 n_h-1（帧底部），列 7..n_w-8
+/// 填充顺序：先行 n_h-2（从左到右），再行 n_h-1（从左到右）
+fn format_module_index(col: usize, row: usize, n_w: usize, n_h: usize) -> usize {
+    let s = 7;
     let start_col = s;
     let end_col = n_w - s;
     let cols_per_row = end_col - start_col;
 
-    if row == 0 {
+    if row == n_h - 2 {
         col - start_col
     } else {
         cols_per_row + (col - start_col)
@@ -574,8 +574,8 @@ mod tests {
                 if col < 7 && row < 7 { continue; }
                 if col >= n_w_usize - 7 && row < 7 { continue; }
                 if col < 7 && row >= n_h_usize - 7 { continue; }
-                // 跳过格式信息区
-                if row < 2 && col >= 7 && col < n_w_usize - 7 { continue; }
+                // 跳过格式信息区（v0.24: 位于帧底部）
+                if row >= n_h_usize - 2 && col >= 7 && col < n_w_usize - 7 { continue; }
                 // 已取够
                 if sampled.len() >= expected_count { break 'outer; }
 

@@ -50,10 +50,11 @@ pub fn is_finder_module(col: u32, row: u32, n_w: u32, n_h: u32) -> bool {
 
 /// 判断模块坐标是否位于格式信息区
 ///
-/// 格式信息区：模块行 0 和 行 1，位于两个 finder pattern 之间（列 7..n_w-8）
-/// 仅使用水平维度 n_w。
-pub fn is_format_module(col: u32, row: u32, n_w: u32) -> bool {
-    if row >= 2 {
+/// 格式信息区：模块行 n_h-2 和 n_h-1（帧底部最后两行）
+/// 位于两个 finder pattern 之间（列 7..n_w-8）。
+/// v0.24: 从顶部移到帧末尾——底部最后渲染，格式信息完整=全帧已渲染（防撕裂）
+pub fn is_format_module(col: u32, row: u32, n_w: u32, n_h: u32) -> bool {
+    if row < n_h - 2 {
         return false;
     }
     let s = 7; // finder pattern 尺寸

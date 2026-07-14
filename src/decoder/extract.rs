@@ -95,9 +95,13 @@ pub fn extract_format_modules_with_radius(
 
     let affine = AffineTransform::from_location(loc, loc.module_pixels);
 
+    let n_h = loc.modules_h as usize;
+
     let mut bits = Vec::with_capacity((end_col - start_col) * 2);
 
-    for row in 0..2usize {
+    // v0.24: 格式信息从帧顶部移到帧底部（n_h-2, n_h-1）
+    // 底部是最后渲染的行，格式信息完整 = 全帧已渲染 → 防撕裂
+    for row in (n_h - 2)..n_h {
         for col in start_col..end_col {
             let (px, py) = affine.to_pixel(col, row);
             let module_val = if radius <= 0 {
@@ -158,8 +162,8 @@ pub fn extract_data_modules(
             if is_in_finder(col, row, n_w, n_h) {
                 continue;
             }
-            // 跳过格式信息区
-            if row < 2 && col >= s && col < n_w - s {
+            // 跳过格式信息区（v0.24: 位于帧底部最后两行）
+            if row >= n_h - 2 && col >= s && col < n_w - s {
                 continue;
             }
 
