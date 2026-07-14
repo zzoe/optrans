@@ -181,82 +181,6 @@ fn flush_and_write(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Decode 线程池 — 复用线程，忙时自动扩容
-// ═══════════════════════════════════════════════════════════════════
-
-/// 解码任务
-struct DecodeTask {
-    pixels: Arc<Vec<u8>>,
-    img_w: i32,
-    img_h: i32,
-    loc: FrameLocation,
-    enc_mode: EncodingMode,
-    result_tx: mpsc::Sender<DecodedFrame>,
-    locked: Arc<std::sync::OnceLock<FrameLocation>>,
-    is_first: bool,
-}
-
-/// 可增长的 decode 线程池
-struct DecodePool {
-    senders: std::sync::Mutex<Vec<mpsc::Sender<DecodeTask>>>,
-}
-
-impl DecodePool {
-    fn new(pre_spawn: usize) -> Self {
-        let pool = Self { senders: std::sync::Mutex::new(Vec::new()) };
-        for _ in 0..pre_spawn {
-            pool.spawn_worker();
-        }
-        pool
-    }
-
-    fn spawn_worker(&self) {
-        let (task_tx, task_rx) = mpsc::channel::<DecodeTask>();
-        self.senders.lock().unwrap().push(task_tx);
-        thread::spawn(move || {
-            while let Ok(task) = task_rx.recv() {
-                match decode_frame(&task.pixels, task.img_w, task.img_h, &task.loc, &task.enc_mode) {
-                    Ok(frame) => {
-                        if matches!(frame.frame_type, FrameType::Meta | FrameType::Data)
-                            && frame.payload.is_empty() { continue; }
-                        if task.is_first && matches!(frame.frame_type, FrameType::Data) {
-                            let _ = task.locked.set(task.loc.clone());
-                            info!("✓ 首个有效帧解码成功，已锁定位置");
-                        }
-                        let _ = task.result_tx.send(frame);
-                    }
-                    Err(e) => { debug!("payload 解码失败: {}", e); }
-                }
-            }
-        });
-    }
-
-    /// 提交任务。如果现有 worker 都忙则自动创建新 worker
-    fn submit(&self, task: DecodeTask) {
-        let senders = self.senders.lock().unwrap();
-        for sender in senders.iter() {
-            if sender.send(DecodeTask {
-                pixels: Arc::clone(&task.pixels),
-                img_w: task.img_w,
-                img_h: task.img_h,
-                loc: task.loc.clone(),
-                enc_mode: task.enc_mode.clone(),
-                result_tx: task.result_tx.clone(),
-                locked: Arc::clone(&task.locked),
-                is_first: task.is_first,
-            }).is_ok() {
-                return;
-            }
-        }
-        // 所有 worker 忙，扩容
-        drop(senders);
-        self.spawn_worker();
-        self.senders.lock().unwrap().last().unwrap()
-            .send(task).expect("新 worker 应能接收任务");
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
 //  Capture 循环 — 截屏 + 快速预判 + 线程池 decode
 // ═══════════════════════════════════════════════════════════════════
 
@@ -270,7 +194,7 @@ fn run_capture_loop(
     let locked: Arc<std::sync::OnceLock<FrameLocation>> = Arc::new(std::sync::OnceLock::new());
     let mut locate_diag_printed = false;
     let mut loop_count: u64 = 0;
-    let pool = DecodePool::new(2);  // 预创建 2 个 worker
+    let pool = threadpool::ThreadPool::new(2);
 
     loop {
         loop_count += 1;
@@ -355,16 +279,27 @@ fn run_capture_loop(
             }
         }
 
-        // 4. 解码（线程池：复用 worker，忙时自动扩容）
+        // 4. 解码（线程池：复用 worker，忙时自动排队）
         if let Some(ci) = best_candidate {
-            pool.submit(DecodeTask {
-                pixels: Arc::new(pixels),
-                img_w, img_h,
-                loc: candidates[ci].0.clone(),
-                enc_mode: encoding_mode.clone(),
-                result_tx: tx.clone(),
-                locked: Arc::clone(&locked),
-                is_first: locked.get().is_none(),
+            let loc = candidates[ci].0.clone();
+            let pixels_arc = Arc::new(pixels);
+            let enc_mode = encoding_mode.clone();
+            let tx_clone = tx.clone();
+            let locked_clone = Arc::clone(&locked);
+            let is_first = locked.get().is_none();
+            pool.execute(move || {
+                match decode_frame(&pixels_arc, img_w, img_h, &loc, &enc_mode) {
+                    Ok(frame) => {
+                        if matches!(frame.frame_type, FrameType::Meta | FrameType::Data)
+                            && frame.payload.is_empty() { return; }
+                        if is_first && matches!(frame.frame_type, FrameType::Data) {
+                            let _ = locked_clone.set(loc);
+                            info!("✓ 首个有效帧解码成功，已锁定位置");
+                        }
+                        let _ = tx_clone.send(frame);
+                    }
+                    Err(e) => { debug!("payload 解码失败: {}", e); }
+                }
             });
         }
 

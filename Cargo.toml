@@ -14,6 +14,7 @@ sha2 = "*"
 reed-solomon = "*"
 log = "*"
 pretty_env_logger = "*"
+threadpool = "*"
 
 [profile.release]
 opt-level = 3
