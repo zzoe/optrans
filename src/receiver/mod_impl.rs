@@ -171,7 +171,8 @@ fn run_capture_loop(
 ) -> OptransResult<()> {
     let mut no_frame_start = Instant::now();
     let mut last_heartbeat = Instant::now();
-    let locked = Arc::new(std::sync::OnceLock::<FrameLocation>::new());
+    let locked = Arc::new(std::sync::Mutex::new(None::<FrameLocation>));
+    let locked_miss: Arc<std::sync::Mutex<u32>> = Arc::new(std::sync::Mutex::new(0));
     let mut locate_diag_printed = false;
     let mut loop_count: u64 = 0;
 
@@ -195,7 +196,7 @@ fn run_capture_loop(
         let mut candidates: Vec<(FrameLocation, LocateDiagnostics)>;
         let mut locate_cost = 0u128;
 
-        let locked_loc = locked.get().cloned();
+        let locked_loc = locked.lock().unwrap().clone();
 
         if let Some(ref loc) = locked_loc {
             candidates = vec![(loc.clone(), LocateDiagnostics { candidates_found: 0, candidates_verified: 0 })];
@@ -308,6 +309,7 @@ fn run_capture_loop(
             let enc_mode = encoding_mode.clone();
             let tx_clone = tx.clone();
             let locked_clone = Arc::clone(&locked);
+            let locked_miss_clone = Arc::clone(&locked_miss);
             let is_first = locked_loc.is_none();
 
             thread::spawn(move || {
@@ -318,10 +320,14 @@ fn run_capture_loop(
                         if is_meta_or_data && frame.payload.is_empty() {
                             return;
                         }
-                        // v0.19: 仅 decode 成功后锁定，避免 CRC 碰撞假阳性
-                        if is_first {
-                            let is_new = locked_clone.set(loc.clone()).is_ok();
-                            if is_new {
+                        // v0.23.3: 仅在数据帧 decode 成功后锁定位置。
+                        // meta 帧为二值模式，finder 定位精度对灰度数据帧可能不足，
+                        // 过早锁定会导致 16 级灰度采样跨阈值 → payload RS 解码持续失败。
+                        if is_first && matches!(frame.frame_type, FrameType::Data) {
+                            let was_none = locked_clone.lock().unwrap().is_none();
+                            *locked_clone.lock().unwrap() = Some(loc.clone());
+                            if was_none {
+                                *locked_miss_clone.lock().unwrap() = 0;
                                 info!("✓ 首个有效帧解码成功，已与发送端建立连接");
                                 info!("🔒 帧位置已锁定（跳过全屏扫描）");
                             }
@@ -340,6 +346,15 @@ fn run_capture_loop(
                 match &err {
                     OptransError::InvalidFormatInfo(msg) => {
                         if !msg.starts_with("假帧") {
+                            if locked_loc.is_some() {
+                                let mut miss = locked_miss.lock().unwrap();
+                                *miss += 1;
+                                if *miss >= 10 {
+                                    info!("⚠ 锁定位连续{}次格式信息解码失败，重置锁定", *miss);
+                                    *locked.lock().unwrap() = None;
+                                    *miss = 0;
+                                }
+                            }
                             debug!("格式信息解码失败: {} (tl={:.0},{:.0})",
                                 msg, loc.tl.center_x, loc.tl.center_y);
                         }
