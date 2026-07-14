@@ -377,11 +377,14 @@ impl SenderWindow {
         }
     }
 
-    /// 使窗口客户区无效，触发重绘
+    /// 使窗口客户区无效，触发重绘，并等待像素上屏。
     ///
-    /// v0.19.4: `GdiFlush()` 强制 GDI 清空命令缓冲区。在远程桌面（BlastCodec）
-    /// 环境下，这相当于告知编码器"当前帧绘制完毕"，防止编码器将连续多帧
-    /// 合并导致接收端冻屏后突刷多帧。
+    /// 三步保证帧已展示：
+    /// 1. `InvalidateRect` + `UpdateWindow` — 同步发送 WM_PAINT，SetDIBitsToDevice 执行
+    /// 2. `GdiFlush` — 刷新 GDI 命令缓冲区，确保绘制命令已提交到显示驱动
+    /// 3. `DwmFlush` — 阻塞等待 DWM 完成下一次合成，确保像素已从 framebuffer
+    ///    提交到屏幕。远程桌面场景下，这保证远程桌面协议捕获到的是最新帧
+    ///    而非上一帧（DWM 未合成时捕获会拿到旧内容）。
     fn invalidate(&self) {
         unsafe {
             // 标记整个客户区为"脏"，以便 UpdateWindow 真正发送 WM_PAINT
@@ -389,8 +392,10 @@ impl SenderWindow {
             // 立即发送 WM_PAINT（跳过消息队列）
             ffi::UpdateWindow(self.hwnd);
             // 强制 GDI 立即执行所有排队的绘制命令
-            // 远程桌面下相当于帧边界信号，防止 BlastCodec 合并连续多帧
             ffi::GdiFlush();
+            // 等待 DWM 完成合成，确保像素已上屏
+            // DWM 按 vsync 刷新（~60Hz），此调用阻塞至下一次合成完成
+            let _ = ffi::DwmFlush();
         }
     }
 

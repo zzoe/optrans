@@ -37,6 +37,8 @@ pub type WPARAM = usize;
 pub type LRESULT = isize;
 /// 布尔类型（Windows BOOL）
 pub type BOOL = i32;
+/// COM/DWM 函数返回值
+pub type HRESULT = i32;
 /// 双字
 pub type DWORD = u32;
 /// 无符号整数
@@ -508,6 +510,19 @@ unsafe extern "system" {
     /// 环境下，调用此函数相当于告知编码器"当前帧绘制完毕，请立即编码发送"，
     /// 防止编码器将连续多帧合并为一次更新导致接收端丢帧。
     pub fn GdiFlush() -> BOOL;
+}
+
+// ============================================================================
+// dwmapi.dll — Desktop Window Manager
+// ============================================================================
+
+#[link(name = "dwmapi")]
+unsafe extern "system" {
+    /// 阻塞直到 DWM 完成下一次合成并呈现。
+    ///
+    /// 调用此函数可保证窗口绘制内容已从 framebuffer 提交到屏幕，
+    /// 避免"GDI 已提交但 DWM 未合成"的中间状态导致远程桌面捕获到旧帧。
+    pub fn DwmFlush() -> HRESULT;
 }
 
 // ============================================================================
