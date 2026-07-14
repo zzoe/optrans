@@ -48,7 +48,7 @@ impl Frame {
         let total_blocks = manifest.blocks.len() as u32;
         payload.extend_from_slice(&total_blocks.to_le_bytes());
 
-        let info = FormatInfo::new_meta(seq, total_blocks, payload.len() as u16);
+        let info = FormatInfo::new_meta(seq, total_blocks, payload.len() as u32);
 
         let encoder = RsEncoder::new();
         let encoded_payload = encoder.encode(&payload)?;
@@ -78,7 +78,7 @@ impl Frame {
             seq,
             block.index,
             total_blocks,
-            payload.len() as u16,
+            payload.len() as u32,
             FrameKind::I,
             encoding_mode_bit,
         );
@@ -122,7 +122,7 @@ impl Frame {
         let first_index = blocks.first().map(|b| b.index).unwrap_or(0);
         let info = FormatInfo::new_data(
             seq, first_index, total_blocks,
-            payload.len() as u16, FrameKind::I, encoding_mode_bit,
+            payload.len() as u32, FrameKind::I, encoding_mode_bit,
         );
 
         let encoder = RsEncoder::new();
@@ -152,7 +152,7 @@ impl Frame {
 
         // 元数据 entry: block_index = 0xFFFFFFFF
         payload.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-        payload.extend_from_slice(&(meta_payload.len() as u16).to_le_bytes());
+        payload.extend_from_slice(&(meta_payload.len() as u32).to_le_bytes());
         payload.extend_from_slice(meta_payload);
 
         // 数据 entries
@@ -165,7 +165,7 @@ impl Frame {
 
         let info = FormatInfo::new_data(
             seq, 0, total_blocks,
-            payload.len() as u16, FrameKind::I, encoding_mode_bit,
+            payload.len() as u32, FrameKind::I, encoding_mode_bit,
         );
 
         let encoder = RsEncoder::new();
@@ -208,7 +208,7 @@ impl Frame {
             seq,
             block_index,
             total_blocks,
-            payload.len() as u16,
+            payload.len() as u32,
             FrameKind::P,
             encoding_mode_bit,
         );

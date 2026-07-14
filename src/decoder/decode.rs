@@ -451,9 +451,9 @@ fn unpack_format_info(data: &[u8]) -> OptransResult<FormatInfo> {
     let frame_sequence = ((val >> 2) & 0xFFFF) as u16;
     let block_index = ((val >> 18) & 0xFFFF_FFFF) as u32;
     let total_blocks = ((val >> 50) & 0xFFFF_FFFF) as u32;
-    let payload_bytes = ((val >> 82) & 0xFFFF) as u16; // 16 bits (v0.6)
-    let frame_kind_val = ((val >> 98) & 0x1) as u8;
-    let encoding_mode_bit = ((val >> 99) & 0x1) as u8;
+    let payload_bytes = ((val >> 82) & 0xFFFFF) as u32; // 20 bits (v0.24: 原 16b)
+    let frame_kind_val = ((val >> 102) & 0x1) as u8;
+    let encoding_mode_bit = ((val >> 103) & 0x1) as u8;
 
     let frame_type = FrameType::from_u8(frame_type_raw).ok_or_else(|| {
         OptransError::InvalidFormatInfo(format!("未知帧类型: {}", frame_type_raw))
@@ -496,8 +496,8 @@ mod tests {
             val |= (info.block_index as u128) << 18;
             val |= (info.total_blocks as u128) << 50;
             val |= (info.payload_bytes as u128) << 82;
-            val |= (info.frame_kind as u128) << 98;
-            val |= (info.encoding_mode_bit as u128) << 99;
+            val |= (info.frame_kind as u128) << 102;
+            val |= (info.encoding_mode_bit as u128) << 103;
             for i in 0..13 {
                 packed[i] = ((val >> (i * 8)) & 0xFF) as u8;
             }
@@ -533,8 +533,8 @@ mod tests {
             val |= (info.block_index as u128) << 18;
             val |= (info.total_blocks as u128) << 50;
             val |= (info.payload_bytes as u128) << 82;
-            val |= (info.frame_kind as u128) << 98;
-            val |= (info.encoding_mode_bit as u128) << 99;
+            val |= (info.frame_kind as u128) << 102;
+            val |= (info.encoding_mode_bit as u128) << 103;
             for i in 0..13 {
                 packed[i] = ((val >> (i * 8)) & 0xFF) as u8;
             }

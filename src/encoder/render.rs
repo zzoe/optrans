@@ -208,10 +208,10 @@ fn encode_format_info_bits(info: &crate::common::types::FormatInfo, n_w: u32) ->
 /// - bits 2-17:   frame_sequence (16b)
 /// - bits 18-49:  block_index (32b)
 /// - bits 50-81:  total_blocks (32b)
-/// - bits 82-97:  payload_bytes (16b) ← 原 13 bits，扩展到 16 bits
-/// - bit  98:     frame_kind (1b)
-/// - bit  99:     encoding_mode_bit (1b)
-/// - bits 100-103: 保留（4b，未使用）
+/// - bits 82-101: payload_bytes (20b) ← v0.24: 原 16b 扩展到 20b
+/// - bit  102:    frame_kind (1b)
+/// - bit  103:    encoding_mode_bit (1b)
+/// 总计：104 bits → 13 bytes
 fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
     let ft = info.frame_type as u128;
     let seq = info.frame_sequence as u128;
@@ -226,9 +226,9 @@ fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
     val |= seq << 2; // bits 2-17
     val |= bi << 18; // bits 18-49
     val |= tb << 50; // bits 50-81
-    val |= pb << 82; // bits 82-97 (16 bits)
-    val |= fk << 98; // bit 98: frame_kind
-    val |= emb << 99; // bit 99: encoding_mode_bit
+    val |= pb << 82; // bits 82-101 (20 bits)
+    val |= fk << 102; // bit 102: frame_kind
+    val |= emb << 103; // bit 103: encoding_mode_bit
 
     // 100 bits → 13 bytes（小端序写入，剩余 4 bits 为 0）
     for i in 0..13 {
@@ -429,8 +429,8 @@ mod tests {
         assert_eq!(((val >> 2) & 0xFFFF) as u16, 42);
         assert_eq!(((val >> 18) & 0xFFFF_FFFF) as u32, 100);
         assert_eq!(((val >> 50) & 0xFFFF_FFFF) as u32, 500);
-        // v0.6: payload_bytes 扩展到 16 bits
-        assert_eq!(((val >> 82) & 0xFFFF) as u16, 2000);
+        // v0.24: payload_bytes 扩展到 20 bits
+        assert_eq!(((val >> 82) & 0xFFFFF) as u32, 2000);
         // v0.6: frame_kind=I(0) at bit 98, encoding_mode_bit=0 at bit 99
         assert_eq!(((val >> 98) & 0x1) as u8, 0);
         assert_eq!(((val >> 99) & 0x1) as u8, 0);
@@ -446,10 +446,10 @@ mod tests {
             acc | ((packed[i] as u128) << (i * 8))
         });
 
-        // v0.6: frame_kind = P(1) at bit 98
-        assert_eq!(((val >> 98) & 0x1) as u8, 1u8);
-        // v0.6: encoding_mode_bit = 1 at bit 99
-        assert_eq!(((val >> 99) & 0x1) as u8, 1u8);
+        // v0.24: frame_kind = P(1) at bit 102
+        assert_eq!(((val >> 102) & 0x1) as u8, 1u8);
+        // v0.24: encoding_mode_bit = 1 at bit 103
+        assert_eq!(((val >> 103) & 0x1) as u8, 1u8);
     }
 
     #[test]
@@ -554,7 +554,7 @@ mod tests {
         let encoder = crate::encoder::reed_solomon::RsEncoder::new();
         let rs_encoded = encoder.encode(&payload).unwrap();
 
-        let info = FormatInfo::new_data(0, 0, 1, rs_encoded.len() as u16, FrameKind::I, 1);
+        let info = FormatInfo::new_data(0, 0, 1, rs_encoded.len() as u32, FrameKind::I, 1);
         let frame = Frame { format_info: info, encoded_payload: rs_encoded.clone(), frame_kind: FrameKind::I };
 
         // 渲染到像素缓冲区

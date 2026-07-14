@@ -24,7 +24,7 @@ pub struct ReceiverCache {
     /// 缓存的 I 帧的 frame_sequence
     pub i_frame_seq: u16,
     /// I 帧的 payload_bytes（用于 P 帧合并时计算解码长度）
-    pub i_frame_payload_bytes: u16,
+    pub i_frame_payload_bytes: u32,
 }
 
 /// 帧收集器：去重、分类存储
@@ -106,7 +106,7 @@ impl FrameCollector {
                     self.cache_i_frame(
                         frame.data_module_values,
                         frame.frame_sequence,
-                        (block_data_len + 4) as u16,
+                        (block_data_len + 4) as u32,
                     );
                 }
 
@@ -184,7 +184,7 @@ impl FrameCollector {
             self.cache_i_frame(
                 frame.data_module_values.clone(),
                 frame.frame_sequence,
-                payload.len() as u16,
+                payload.len() as u32,
             );
         }
 
@@ -289,7 +289,7 @@ impl FrameCollector {
     }
 
     /// 缓存 I 帧数据模块值
-    fn cache_i_frame(&mut self, modules: Vec<u8>, seq: u16, payload_bytes: u16) {
+    fn cache_i_frame(&mut self, modules: Vec<u8>, seq: u16, payload_bytes: u32) {
         self.cache = Some(ReceiverCache {
             i_frame_modules: modules,
             i_frame_seq: seq,
