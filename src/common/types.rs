@@ -26,27 +26,6 @@ impl FrameType {
     }
 }
 
-// ─── 帧种类 ───
-
-/// 帧种类（协议保留 P 帧枚举值，但本程序只使用 I 帧）
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum FrameKind {
-    I = 0,
-    P = 1,
-}
-
-impl FrameKind {
-    /// 从 u8 值转换为 FrameKind
-    pub fn from_u8(v: u8) -> Option<FrameKind> {
-        match v {
-            0 => Some(FrameKind::I),
-            1 => Some(FrameKind::P),
-            _ => None,
-        }
-    }
-}
-
 // ─── 编码模式 ───
 
 /// 编码模式
@@ -128,7 +107,7 @@ impl GrayEncodingConfig {
 /// - total_blocks:   32 bits (bit 50-81)
 /// - payload_bytes:  20 bits (bit 82-101)
 ///   (max 1,048,575，16 级灰度单帧可达 ~127KB)
-/// - frame_kind:     1 bit  (bit 102)
+/// - reserved:       1 bit   (bit 102, 恒为 0)
 /// - encoding_mode_bit: 1 bit (bit 103)
 /// 总计：104 bits（13 bytes）
 #[derive(Debug, Clone)]
@@ -143,8 +122,6 @@ pub struct FormatInfo {
     pub total_blocks: u32,
     /// 载荷字节数（RS 编码前）
     pub payload_bytes: u32,
-    /// 帧种类：I 帧(0) 或 P 帧(1)
-    pub frame_kind: FrameKind,
     /// 编码模式位：二值=0，灰度=1
     pub encoding_mode_bit: u8,
 }
@@ -158,18 +135,16 @@ impl FormatInfo {
             block_index: 0,
             total_blocks,
             payload_bytes,
-            frame_kind: FrameKind::I,
             encoding_mode_bit: 0,
         }
     }
 
-    /// 创建数据帧的格式信息（带帧种类和编码模式位）
+    /// 创建数据帧的格式信息
     pub fn new_data(
         seq: u16,
         block_index: u32,
         total_blocks: u32,
         payload_bytes: u32,
-        frame_kind: FrameKind,
         encoding_mode_bit: u8,
     ) -> Self {
         FormatInfo {
@@ -178,14 +153,13 @@ impl FormatInfo {
             block_index,
             total_blocks,
             payload_bytes,
-            frame_kind,
             encoding_mode_bit,
         }
     }
 
-    /// 创建数据帧的格式信息（便捷构造器：I 帧 + 二值模式）
+    /// 创建数据帧的格式信息（便捷构造器：二值模式）
     pub fn new_data_binary(seq: u16, block_index: u32, total_blocks: u32, payload_bytes: u32) -> Self {
-        Self::new_data(seq, block_index, total_blocks, payload_bytes, FrameKind::I, 0)
+        Self::new_data(seq, block_index, total_blocks, payload_bytes, 0)
     }
 
     /// 创建 EOT 帧的格式信息
@@ -196,7 +170,6 @@ impl FormatInfo {
             block_index: 0,
             total_blocks: 0,
             payload_bytes: 0,
-            frame_kind: FrameKind::I,
             encoding_mode_bit: 0,
         }
     }
@@ -284,8 +257,6 @@ pub struct DecodedFrame {
     pub total_blocks: u32,
     /// 解码后的载荷数据（RS 解码后，不含 block_index 前缀）
     pub payload: Vec<u8>,
-    /// 帧种类（协议字段，本程序只用 I 帧）
-    pub frame_kind: FrameKind,
     /// 编码模式
     pub encoding_mode: EncodingMode,
 }

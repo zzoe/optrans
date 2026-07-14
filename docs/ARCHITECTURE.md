@@ -67,7 +67,7 @@ Data frame payload:
 
 ```
 bits:       [0..15] [16..47] [48..55] [56..63] [64..79] [80..95]
-fields:     unused  SHA-32   frame_kind total_blocks frame_seq encoding_mode
+fields:     unused  SHA-32   reserved   total_blocks frame_seq encoding_mode
 bits:       [96]    [97]
 fields:     merge_ext frame_type
 ```

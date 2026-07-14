@@ -37,12 +37,6 @@ impl FrameCollector {
             return Ok(IngestResult::Duplicate);
         }
 
-        // 协议保留 P 帧枚举值，但本程序不产生 P 帧。
-        // 若收到 P 帧（来自不兼容的发送端），直接拒绝。
-        if frame.frame_kind == crate::common::types::FrameKind::P {
-            return Ok(IngestResult::Invalid);
-        }
-
         // 先尝试摄入，成功后再标记为已处理
         // 如果摄入失败（如元数据载荷为空），不占用 seq，允许后续重试
         let result = self.ingest_frame(frame)?;

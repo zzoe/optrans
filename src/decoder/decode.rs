@@ -8,7 +8,7 @@ use crate::common::crc::crc16_xmodem;
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::rs_utils::rs_encoded_size;
 use crate::common::types::{
-    DecodedFrame, EncodingMode, FinderPattern, FormatInfo, FrameKind, FrameLocation,
+    DecodedFrame, EncodingMode, FinderPattern, FormatInfo, FrameLocation,
     FrameType, GrayEncodingConfig, MetaPayload,
 };
 use crate::decoder::extract;
@@ -298,7 +298,6 @@ pub fn decode_frame(
         block_index: format_info.block_index,
         total_blocks: format_info.total_blocks,
         payload,
-        frame_kind: format_info.frame_kind,
         encoding_mode: actual_mode,
     })
 }
@@ -387,14 +386,12 @@ fn unpack_format_info(data: &[u8]) -> OptransResult<FormatInfo> {
     let block_index = ((val >> 18) & 0xFFFF_FFFF) as u32;
     let total_blocks = ((val >> 50) & 0xFFFF_FFFF) as u32;
     let payload_bytes = ((val >> 82) & 0xFFFFF) as u32; // 20 bits
-    let frame_kind_val = ((val >> 102) & 0x1) as u8;
+    // bit 102: reserved（忽略）
     let encoding_mode_bit = ((val >> 103) & 0x1) as u8;
 
     let frame_type = FrameType::from_u8(frame_type_raw).ok_or_else(|| {
         OptransError::InvalidFormatInfo(format!("未知帧类型: {}", frame_type_raw))
     })?;
-
-    let frame_kind = FrameKind::from_u8(frame_kind_val).unwrap_or(FrameKind::I);
 
     Ok(FormatInfo {
         frame_type,
@@ -402,7 +399,6 @@ fn unpack_format_info(data: &[u8]) -> OptransResult<FormatInfo> {
         block_index,
         total_blocks,
         payload_bytes,
-        frame_kind,
         encoding_mode_bit,
     })
 }
@@ -419,7 +415,6 @@ mod tests {
             block_index: 100,
             total_blocks: 500,
             payload_bytes: 2000,
-            frame_kind: FrameKind::I,
             encoding_mode_bit: 0,
         };
 
@@ -431,7 +426,6 @@ mod tests {
             val |= (info.block_index as u128) << 18;
             val |= (info.total_blocks as u128) << 50;
             val |= (info.payload_bytes as u128) << 82;
-            val |= (info.frame_kind as u128) << 102;
             val |= (info.encoding_mode_bit as u128) << 103;
             for i in 0..13 {
                 packed[i] = ((val >> (i * 8)) & 0xFF) as u8;
@@ -444,41 +438,7 @@ mod tests {
         assert_eq!(unpacked.block_index, 100);
         assert_eq!(unpacked.total_blocks, 500);
         assert_eq!(unpacked.payload_bytes, 2000);
-        assert_eq!(unpacked.frame_kind, FrameKind::I);
         assert_eq!(unpacked.encoding_mode_bit, 0);
-    }
-
-    #[test]
-    fn test_unpack_format_info_v02() {
-        let info = FormatInfo {
-            frame_type: FrameType::Data,
-            frame_sequence: 7,
-            block_index: 3,
-            total_blocks: 10,
-            payload_bytes: 500,
-            frame_kind: FrameKind::P,
-            encoding_mode_bit: 1,
-        };
-
-        let mut packed = vec![0u8; 13];
-        {
-            let mut val: u128 = 0;
-            val |= info.frame_type as u128;
-            val |= (info.frame_sequence as u128) << 2;
-            val |= (info.block_index as u128) << 18;
-            val |= (info.total_blocks as u128) << 50;
-            val |= (info.payload_bytes as u128) << 82;
-            val |= (info.frame_kind as u128) << 102;
-            val |= (info.encoding_mode_bit as u128) << 103;
-            for i in 0..13 {
-                packed[i] = ((val >> (i * 8)) & 0xFF) as u8;
-            }
-        }
-
-        let unpacked = unpack_format_info(&packed).unwrap();
-        assert_eq!(unpacked.frame_type, FrameType::Data);
-        assert_eq!(unpacked.frame_kind, FrameKind::P);
-        assert_eq!(unpacked.encoding_mode_bit, 1);
     }
 
     #[test]
@@ -490,7 +450,6 @@ mod tests {
             block_index: 0,
             total_blocks: 1,
             payload_bytes: 1_048_575,
-            frame_kind: FrameKind::I,
             encoding_mode_bit: 0,
         };
 
@@ -501,7 +460,6 @@ mod tests {
         val |= (info.block_index as u128) << 18;
         val |= (info.total_blocks as u128) << 50;
         val |= (info.payload_bytes as u128) << 82;
-        val |= (info.frame_kind as u128) << 102;
         val |= (info.encoding_mode_bit as u128) << 103;
         for i in 0..13 {
             packed[i] = ((val >> (i * 8)) & 0xFF) as u8;

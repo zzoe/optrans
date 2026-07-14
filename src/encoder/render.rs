@@ -187,7 +187,7 @@ fn encode_format_info_bits(info: &crate::common::types::FormatInfo, n_w: u32) ->
 /// - bits 18-49:  block_index (32b)
 /// - bits 50-81:  total_blocks (32b)
 /// - bits 82-101: payload_bytes (20b)
-/// - bit  102:    frame_kind (1b)
+/// - bit  102:    reserved (1b, 恒为 0)
 /// - bit  103:    encoding_mode_bit (1b)
 /// 总计：104 bits → 13 bytes
 fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
@@ -196,7 +196,6 @@ fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
     let bi = info.block_index as u128;
     let tb = info.total_blocks as u128;
     let pb = info.payload_bytes as u128;
-    let fk = info.frame_kind as u128; // bit 102
     let emb = info.encoding_mode_bit as u128; // bit 103
 
     let mut val: u128 = 0;
@@ -205,7 +204,7 @@ fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
     val |= bi << 18; // bits 18-49
     val |= tb << 50; // bits 50-81
     val |= pb << 82; // bits 82-101 (20 bits)
-    val |= fk << 102; // bit 102: frame_kind
+    // bit 102: reserved (0)
     val |= emb << 103; // bit 103: encoding_mode_bit
 
     // 104 bits → 13 bytes（小端序写入）
@@ -389,7 +388,7 @@ pub fn render_frame_default(
 mod tests {
     use super::*;
     use crate::common::constants::MODULES_PER_SIDE_DEFAULT;
-    use crate::common::types::{FormatInfo, FrameKind, FrameType};
+    use crate::common::types::{FormatInfo, FrameType};
 
     #[test]
     fn test_pack_format_info_roundtrip() {
@@ -407,25 +406,9 @@ mod tests {
         assert_eq!(((val >> 50) & 0xFFFF_FFFF) as u32, 500);
         // v0.24: payload_bytes 扩展到 20 bits
         assert_eq!(((val >> 82) & 0xFFFFF) as u32, 2000);
-        // frame_kind=I(0) at bit 102, encoding_mode_bit=0 at bit 103
+        // bit 102 reserved (0), encoding_mode_bit=0 at bit 103
         assert_eq!(((val >> 102) & 0x1) as u8, 0);
         assert_eq!(((val >> 103) & 0x1) as u8, 0);
-    }
-
-    #[test]
-    fn test_pack_format_info_with_frame_kind() {
-        let info = FormatInfo::new_data(42, 100, 500, 2000, FrameKind::P, 1);
-        let mut packed = vec![0u8; 13];
-        pack_format_info(&info, &mut packed);
-
-        let val: u128 = (0..13).fold(0u128, |acc, i| {
-            acc | ((packed[i] as u128) << (i * 8))
-        });
-
-        // v0.24: frame_kind = P(1) at bit 102
-        assert_eq!(((val >> 102) & 0x1) as u8, 1u8);
-        // v0.24: encoding_mode_bit = 1 at bit 103
-        assert_eq!(((val >> 103) & 0x1) as u8, 1u8);
     }
 
     #[test]
@@ -501,7 +484,6 @@ mod tests {
         let frame = Frame {
             format_info: info,
             encoded_payload: vec![0u8; 100],
-            frame_kind: FrameKind::I,
         };
         let config = GrayEncodingConfig::new(2);
         let n = MODULES_PER_SIDE_DEFAULT;
@@ -530,8 +512,8 @@ mod tests {
         let encoder = crate::encoder::reed_solomon::RsEncoder::new();
         let rs_encoded = encoder.encode(&payload).unwrap();
 
-        let info = FormatInfo::new_data(0, 0, 1, rs_encoded.len() as u32, FrameKind::I, 1);
-        let frame = Frame { format_info: info, encoded_payload: rs_encoded.clone(), frame_kind: FrameKind::I };
+        let info = FormatInfo::new_data(0, 0, 1, rs_encoded.len() as u32, 1);
+        let frame = Frame { format_info: info, encoded_payload: rs_encoded.clone() };
 
         // 渲染到像素缓冲区
         let pixels = render_frame_default(&frame, mp, n_w, n_h, &gray_config, false);
@@ -588,7 +570,6 @@ mod tests {
         let frame = Frame {
             format_info: info,
             encoded_payload: vec![0u8; 100],
-            frame_kind: FrameKind::I,
         };
         let config = GrayEncodingConfig::new(2);
         let n_w: u32 = 160;

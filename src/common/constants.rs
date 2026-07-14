@@ -37,7 +37,7 @@ pub const RS_PARITY_LEN: usize = 38;
 pub const RS_TOTAL_LEN: usize = 255;
 
 /// 默认帧间隔（毫秒）
-pub const FRAME_INTERVAL_MS: u64 = 100;
+pub const FRAME_INTERVAL_MS: u64 = 200;
 
 /// 最大文件名长度（UTF-8 字节）
 pub const MAX_FILE_NAME_LEN: usize = 255;

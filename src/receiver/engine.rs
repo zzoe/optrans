@@ -17,7 +17,7 @@ use log::{info, warn};
 
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::EncodingMode;
-use crate::common::types::{DecodedFrame, FrameKind, FrameLocation, FrameType, IngestResult};
+use crate::common::types::{DecodedFrame, FrameLocation, FrameType, IngestResult};
 use crate::decoder::decode::{decode_format_info, decode_frame};
 use crate::decoder::locate::locate_frame_all_with_diag;
 use crate::receiver::capture::capture_full_screen;
@@ -268,7 +268,6 @@ fn run_capture_loop(
                     frame_sequence: info.frame_sequence,
                     block_index: 0, total_blocks: 0,
                     payload: Vec::new(),
-                    frame_kind: FrameKind::I,
                     encoding_mode: EncodingMode::Binary,
                 });
                 break;

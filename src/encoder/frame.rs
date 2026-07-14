@@ -6,7 +6,7 @@
 use crate::common::constants::MAX_FILE_NAME_LEN;
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::{
-    BlockData, FileManifest, FormatInfo, FrameKind, FrameType,
+    BlockData, FileManifest, FormatInfo, FrameType,
 };
 use crate::encoder::reed_solomon::RsEncoder;
 
@@ -17,8 +17,6 @@ pub struct Frame {
     pub format_info: FormatInfo,
     /// RS 编码后的载荷数据
     pub encoded_payload: Vec<u8>,
-    /// 帧种类（协议字段，本程序只用 I 帧）
-    pub frame_kind: FrameKind,
 }
 
 impl Frame {
@@ -55,11 +53,10 @@ impl Frame {
         Ok(Frame {
             format_info: info,
             encoded_payload,
-            frame_kind: FrameKind::I,
         })
     }
 
-    /// 构建数据帧（I 帧）
+    /// 构建数据帧
     ///
     /// 数据帧载荷包含：block_index(4B LE) + block_data
     pub fn new_data(
@@ -78,7 +75,6 @@ impl Frame {
             block.index,
             total_blocks,
             payload.len() as u32,
-            FrameKind::I,
             encoding_mode_bit,
         );
 
@@ -88,11 +84,10 @@ impl Frame {
         Ok(Frame {
             format_info: info,
             encoded_payload,
-            frame_kind: FrameKind::I,
         })
     }
 
-    /// 构建多块合并数据帧（I 帧，v0.9）
+    /// 构建多块合并数据帧（v0.9）
     ///
     /// 将多个数据块打包到一个帧中，填满 payload 容量。
     /// 载荷格式：[count: u16 LE][entries...]
@@ -121,13 +116,13 @@ impl Frame {
         let first_index = blocks.first().map(|b| b.index).unwrap_or(0);
         let info = FormatInfo::new_data(
             seq, first_index, total_blocks,
-            payload.len() as u32, FrameKind::I, encoding_mode_bit,
+            payload.len() as u32, encoding_mode_bit,
         );
 
         let encoder = RsEncoder::new();
         let encoded_payload = encoder.encode(&payload)?;
 
-        Ok(Frame { format_info: info, encoded_payload, frame_kind: FrameKind::I })
+        Ok(Frame { format_info: info, encoded_payload })
     }
 
     /// 构建元数据+数据合并帧（v0.10）
@@ -164,18 +159,18 @@ impl Frame {
 
         let info = FormatInfo::new_data(
             seq, 0, total_blocks,
-            payload.len() as u32, FrameKind::I, encoding_mode_bit,
+            payload.len() as u32, encoding_mode_bit,
         );
 
         let encoder = RsEncoder::new();
         let encoded_payload = encoder.encode(&payload)?;
 
-        Ok(Frame { format_info: info, encoded_payload, frame_kind: FrameKind::I })
+        Ok(Frame { format_info: info, encoded_payload })
     }
 
     /// 构建 EOT（传输结束）帧
     ///
-    /// EOT 帧没有载荷数据，始终为 I 帧。
+    /// EOT 帧没有载荷数据。
     pub fn new_eot(seq: u16) -> OptransResult<Frame> {
         let info = FormatInfo::new_eot(seq);
         let encoder = RsEncoder::new();
@@ -184,7 +179,6 @@ impl Frame {
         Ok(Frame {
             format_info: info,
             encoded_payload,
-            frame_kind: FrameKind::I,
         })
     }
 
@@ -225,7 +219,6 @@ mod tests {
         assert_eq!(frame.format_info.frame_type, FrameType::Meta);
         assert_eq!(frame.format_info.frame_sequence, 0);
         assert_eq!(frame.format_info.total_blocks, 1);
-        assert_eq!(frame.frame_kind, FrameKind::I);
         assert!(frame.encoded_payload.len() >= 4);
     }
 
@@ -240,7 +233,6 @@ mod tests {
         assert_eq!(frame.format_info.frame_sequence, 3);
         assert_eq!(frame.format_info.block_index, 5);
         assert_eq!(frame.format_info.total_blocks, 10);
-        assert_eq!(frame.frame_kind, FrameKind::I);
         assert_eq!(frame.format_info.encoding_mode_bit, 1);
     }
 
@@ -252,7 +244,6 @@ mod tests {
         assert_eq!(frame.format_info.block_index, 0);
         assert_eq!(frame.format_info.total_blocks, 0);
         assert_eq!(frame.format_info.payload_bytes, 0);
-        assert_eq!(frame.frame_kind, FrameKind::I);
     }
 
     #[test]
