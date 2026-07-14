@@ -12,7 +12,6 @@ use std::sync::{
     mpsc,
 };
 use std::thread;
-use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 
@@ -20,7 +19,7 @@ use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::EncodingMode;
 use crate::common::types::{DecodedFrame, FrameKind, FrameLocation, FrameType, IngestResult};
 use crate::decoder::decode::{decode_format_info, decode_frame};
-use crate::decoder::locate::{LocateDiagnostics, locate_frame_all_with_diag};
+use crate::decoder::locate::locate_frame_all_with_diag;
 use crate::receiver::capture::capture_full_screen;
 use crate::receiver::collect::FrameCollector;
 use crate::receiver::reassemble::FileAssembler;
@@ -189,135 +188,109 @@ fn run_capture_loop(
     encoding_mode: &EncodingMode,
     done: &AtomicBool,
 ) -> OptransResult<()> {
-    let mut no_frame_start = Instant::now();
-    let mut last_heartbeat = Instant::now();
-    let locked: Arc<std::sync::OnceLock<FrameLocation>> = Arc::new(std::sync::OnceLock::new());
-    let mut locate_diag_printed = false;
-    let mut loop_count: u64 = 0;
-    let mut last_seq: u16 = u16::MAX;  // 检测帧切换（防首帧撕裂）
     let pool = threadpool::ThreadPool::new(2);
+    let enc_mode = encoding_mode.clone();
 
+    // ═══ Phase 1: 等待 Meta 帧 → 锁定位置 + 获取 total_blocks ═══
+    let mut meta_loc: Option<FrameLocation> = None;
+    let mut total_blocks: u32 = 0;
     loop {
-        loop_count += 1;
-        if done.load(Ordering::SeqCst) {
-            drop(tx);
-            return Ok(());
-        }
+        if done.load(Ordering::SeqCst) { drop(tx); return Ok(()); }
 
-        // 1. 截屏
         let (pixels, img_w, img_h) = match capture_full_screen() {
             Ok(r) => r,
             Err(e) => { warn!("截屏失败: {}，重试...", e); continue; }
         };
 
-        // 2. 定位：锁定时直接用，否则全屏扫描
-        let candidates = if let Some(loc) = locked.get() {
-            vec![(loc.clone(), LocateDiagnostics { candidates_found: 0, candidates_verified: 0 })]
-        } else {
-            let raw = locate_frame_all_with_diag(&pixels, img_w, img_h);
-            if raw.is_empty() {
-                if no_frame_start.elapsed().as_secs() >= 3
-                    && last_heartbeat.elapsed() >= Duration::from_secs(3)
-                {
-                    debug!("等待发送端...");
-                    last_heartbeat = Instant::now();
-                }
-                continue;
-            }
-            // 位置过滤
-            let margin = crate::common::constants::FRAME_MARGIN_PX_DEFAULT as f64;
-            let mp = crate::common::constants::MODULE_PIXELS_DEFAULT as f64;
-            let ex = margin + 3.5 * mp;
-            let ey = margin + 3.5 * mp;
-            let max_dist = 120.0;
-            let before = raw.len();
-            let filtered: Vec<_> = raw.into_iter()
-                .filter(|(loc, _)| {
-                    let dx = loc.tl.center_x - ex;
-                    let dy = loc.tl.center_y - ey;
-                    (dx*dx + dy*dy).sqrt() <= max_dist
-                })
-                .collect();
-            debug!("[find] {}→{} candidates", before, filtered.len());
+        let candidates = locate_frame_all_with_diag(&pixels, img_w, img_h);
+        if candidates.is_empty() { continue; }
 
-            if !locate_diag_printed && !filtered.is_empty() {
-                locate_diag_printed = true;
-                let d = &filtered[0].1;
-                info!("定位: {}候选/{}验证 → {}三角组, TL=({:.0},{:.0}) frame={}×{}",
-                    d.candidates_found, d.candidates_verified, filtered.len(),
-                    filtered[0].0.tl.center_x, filtered[0].0.tl.center_y,
-                    filtered[0].0.modules_w, filtered[0].0.modules_h);
-            }
-            filtered
-        };
-
-        no_frame_start = Instant::now();
-
-        // 3. 预判：format_info 快速 CRC 校验 + 帧切换检测
-        //    format info 在帧底部（最后渲染），CRC 通过 = 全帧完整 → 可安全解码
-        let mut best_candidate: Option<(usize, crate::common::types::FormatInfo)> = None;
-        for (ci, (loc, _)) in candidates.iter().enumerate() {
-            match decode_format_info(&pixels, img_w, img_h, loc) {
-                Ok(info) => {
-                    if info.frame_type == FrameType::EOT {
-                        info!("收到 EOT 信号");
-                        let _ = tx.send(DecodedFrame {
-                            frame_type: FrameType::EOT,
-                            frame_sequence: info.frame_sequence,
-                            block_index: 0, total_blocks: 0,
-                            payload: Vec::new(),
-                            frame_kind: FrameKind::I,
-                            encoding_mode: EncodingMode::Binary,
-                            base_frame_seq: None,
-                            data_module_values: Vec::new(),
-                        });
-                        drop(tx);
-                        return Ok(());
+        let pixels_arc = Arc::new(pixels);
+        let mut found = false;
+        for (loc, _) in &candidates {
+            if let Ok(info) = decode_format_info(&pixels_arc, img_w, img_h, loc) {
+                if info.frame_type != FrameType::Meta { continue; }
+                if let Ok(frame) = decode_frame(&pixels_arc, img_w, img_h, loc, &enc_mode) {
+                    if !frame.payload.is_empty() {
+                        let _ = tx.send(frame);
+                        meta_loc = Some(loc.clone());
+                        total_blocks = info.total_blocks;
+                        found = true;
+                        break;
                     }
-                    best_candidate = Some((ci, info));
-                    break;
                 }
-                Err(_) => {}
             }
         }
-
-        // format info 未通过 → 帧不完整（底部未渲染完成），跳过继续截下一屏
-        let Some((ci, info)) = best_candidate else { continue; };
-
-        // 帧切换检测：新帧首次截屏时底部可能未渲染完，跳过等下一屏
-        if info.frame_sequence != last_seq && last_seq != u16::MAX {
-            last_seq = info.frame_sequence;
-            continue;
-        }
-        last_seq = info.frame_sequence;
-
-        // 4. 解码（线程池：帧完整，安全提交）
-        {
-            let loc = candidates[ci].0.clone();
-            let pixels_arc = Arc::new(pixels);
-            let enc_mode = encoding_mode.clone();
-            let tx_clone = tx.clone();
-            let locked_clone = Arc::clone(&locked);
-            let is_first = locked.get().is_none();
-            pool.execute(move || {
-                match decode_frame(&pixels_arc, img_w, img_h, &loc, &enc_mode) {
-                    Ok(frame) => {
-                        if matches!(frame.frame_type, FrameType::Meta | FrameType::Data)
-                            && frame.payload.is_empty() { return; }
-                        if is_first {
-                            let _ = locked_clone.set(loc);
-                            info!("✓ 已锁定帧位置（跳过全屏扫描）");
-                        }
-                        let _ = tx_clone.send(frame);
-                    }
-                    Err(e) => { debug!("payload 解码失败: {}", e); }
-                }
-            });
-        }
-
-        // 时序
-        if loop_count.is_multiple_of(10) {
-            debug!("capture loop @{}fps", 0);
+        if found {
+            info!("✓ Meta 帧解析成功，共 {} 个数据块，位置已锁定", total_blocks);
+            break;
         }
     }
+    let loc = meta_loc.unwrap();
+
+    // ═══ Phase 2: 捕获数据帧 ═══
+    let mut blocks_received = 0u32;
+    loop {
+        if done.load(Ordering::SeqCst) { drop(tx); return Ok(()); }
+
+        let (pixels, img_w, img_h) = match capture_full_screen() {
+            Ok(r) => r,
+            Err(e) => { warn!("截屏失败: {}，重试...", e); continue; }
+        };
+
+        // 用锁定位
+        let info = match decode_format_info(&pixels, img_w, img_h, &loc) {
+            Ok(i) => i,
+            Err(_) => continue, // format info 未通过 → 帧不完整 → 下一屏
+        };
+
+        match info.frame_type {
+            FrameType::EOT => {
+                info!("收到 EOT 信号");
+                let _ = tx.send(DecodedFrame {
+                    frame_type: FrameType::EOT,
+                    frame_sequence: info.frame_sequence,
+                    block_index: 0, total_blocks: 0,
+                    payload: Vec::new(),
+                    frame_kind: FrameKind::I,
+                    encoding_mode: EncodingMode::Binary,
+                    base_frame_seq: None,
+                    data_module_values: Vec::new(),
+                });
+                break;
+            }
+            FrameType::Data => {
+                // 第一帧必须是 block #0
+                if blocks_received == 0 && info.block_index != 0 {
+                    return Err(OptransError::FrameDecode(format!(
+                        "首帧序号 {} ≠ 0，丢失前 {} 块",
+                        info.block_index, info.block_index
+                    )));
+                }
+
+                let pixels_arc = Arc::new(pixels);
+                let enc = enc_mode.clone();
+                let tx_c = tx.clone();
+                let lloc = loc.clone();
+                pool.execute(move || {
+                    match decode_frame(&pixels_arc, img_w, img_h, &lloc, &enc) {
+                        Ok(frame) if !frame.payload.is_empty() => {
+                            let _ = tx_c.send(frame);
+                        }
+                        Err(e) => { debug!("payload 解码失败: {}", e); }
+                        _ => {}
+                    }
+                });
+
+                blocks_received += 1;
+                if blocks_received >= total_blocks {
+                    info!("所有 {} 个数据块已收到，等待 EOT...", total_blocks);
+                }
+            }
+            _ => {} // Meta 帧在这里忽略（phase 1 已处理）
+        }
+    }
+
+    drop(tx);
+    Ok(())
 }
