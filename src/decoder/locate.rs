@@ -704,6 +704,16 @@ fn find_three_corners(candidates: &[FinderCandidate]) -> Vec<FrameLocation> {
         }
     });
     const MAX_CANDIDATES: usize = 50;
+    // v0.24.2: 先按距期望位置排序再截断——16 级灰度产生大量假候选时不会挤掉正确的
+    let margin = crate::common::constants::FRAME_MARGIN_PX_DEFAULT as f64;
+    let mp = crate::common::constants::MODULE_PIXELS_DEFAULT as f64;
+    let expected_x = margin + 3.5 * mp;
+    let expected_y = margin + 3.5 * mp;
+    all_results.sort_by(|(a_loc, _), (b_loc, _)| {
+        let da = (a_loc.tl.center_x - expected_x).abs() + (a_loc.tl.center_y - expected_y).abs();
+        let db = (b_loc.tl.center_x - expected_x).abs() + (b_loc.tl.center_y - expected_y).abs();
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    });
     all_results.truncate(MAX_CANDIDATES);
     all_results.into_iter().map(|(loc, _)| loc).collect()
 }
