@@ -194,6 +194,7 @@ fn run_capture_loop(
     let locked: Arc<std::sync::OnceLock<FrameLocation>> = Arc::new(std::sync::OnceLock::new());
     let mut locate_diag_printed = false;
     let mut loop_count: u64 = 0;
+    let mut last_seq: u16 = u16::MAX;  // 检测帧切换（防首帧撕裂）
     let pool = threadpool::ThreadPool::new(2);
 
     loop {
@@ -252,9 +253,9 @@ fn run_capture_loop(
 
         no_frame_start = Instant::now();
 
-        // 3. 预判：format_info 快速 CRC 校验
+        // 3. 预判：format_info 快速 CRC 校验 + 帧切换检测
         //    format info 在帧底部（最后渲染），CRC 通过 = 全帧完整 → 可安全解码
-        let mut best_candidate: Option<usize> = None;
+        let mut best_candidate: Option<(usize, crate::common::types::FormatInfo)> = None;
         for (ci, (loc, _)) in candidates.iter().enumerate() {
             match decode_format_info(&pixels, img_w, img_h, loc) {
                 Ok(info) => {
@@ -273,7 +274,7 @@ fn run_capture_loop(
                         drop(tx);
                         return Ok(());
                     }
-                    best_candidate = Some(ci);
+                    best_candidate = Some((ci, info));
                     break;
                 }
                 Err(_) => {}
@@ -281,7 +282,14 @@ fn run_capture_loop(
         }
 
         // format info 未通过 → 帧不完整（底部未渲染完成），跳过继续截下一屏
-        let Some(ci) = best_candidate else { continue; };
+        let Some((ci, info)) = best_candidate else { continue; };
+
+        // 帧切换检测：新帧首次截屏时底部可能未渲染完，跳过等下一屏
+        if info.frame_sequence != last_seq && last_seq != u16::MAX {
+            last_seq = info.frame_sequence;
+            continue;
+        }
+        last_seq = info.frame_sequence;
 
         // 4. 解码（线程池：帧完整，安全提交）
         {
