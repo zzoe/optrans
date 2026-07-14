@@ -42,7 +42,7 @@ fn main() -> OptransResult<()> {
             }
             info!("  模块像素: {}", constants::MODULE_PIXELS_DEFAULT);
             info!("  编码模式: {:?}", encoding_mode);
-            optrans::receiver::mod_impl::run_receive(output, encoding_mode)
+            optrans::receiver::engine::run_receive(output, encoding_mode)
         }
     }
 }

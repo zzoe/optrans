@@ -6,5 +6,5 @@ pub mod capture;
 pub mod collect;
 pub mod reassemble;
 
-/// 接收端模块实现（包含主循环入口）
-pub mod mod_impl;
+/// 接收端流水线引擎（capture → decode → aggregate → file）
+pub mod engine;
