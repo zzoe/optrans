@@ -253,6 +253,7 @@ fn run_capture_loop(
         no_frame_start = Instant::now();
 
         // 3. 预判：format_info 快速 CRC 校验
+        //    format info 在帧底部（最后渲染），CRC 通过 = 全帧完整 → 可安全解码
         let mut best_candidate: Option<usize> = None;
         for (ci, (loc, _)) in candidates.iter().enumerate() {
             match decode_format_info(&pixels, img_w, img_h, loc) {
@@ -279,8 +280,11 @@ fn run_capture_loop(
             }
         }
 
-        // 4. 解码（线程池：复用 worker，忙时自动排队）
-        if let Some(ci) = best_candidate {
+        // format info 未通过 → 帧不完整（底部未渲染完成），跳过继续截下一屏
+        let Some(ci) = best_candidate else { continue; };
+
+        // 4. 解码（线程池：帧完整，安全提交）
+        {
             let loc = candidates[ci].0.clone();
             let pixels_arc = Arc::new(pixels);
             let enc_mode = encoding_mode.clone();
