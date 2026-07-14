@@ -13,7 +13,7 @@ use std::sync::{
 };
 use std::thread;
 
-use log::{info, warn};
+use log::{debug, info, warn};
 
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::EncodingMode;
@@ -79,10 +79,21 @@ fn run_aggregator(
             Ok(frame) => {
                 match collector.ingest(frame) {
                     Ok(IngestResult::NewMeta(meta)) => {
-                        info!(
-                            "✅ 检测到发送端！文件: {} ({} bytes, {} 块)",
-                            meta.file_name, meta.file_size, meta.total_blocks
-                        );
+                        if meta.fec_enabled() {
+                            info!(
+                                "✅ 检测到发送端！文件: {} ({} bytes, {} 块, FEC k={} m={})",
+                                meta.file_name,
+                                meta.file_size,
+                                meta.total_blocks,
+                                meta.fec_k,
+                                meta.fec_m
+                            );
+                        } else {
+                            info!(
+                                "✅ 检测到发送端！文件: {} ({} bytes, {} 块)",
+                                meta.file_name, meta.file_size, meta.total_blocks
+                            );
+                        }
                     }
                     Ok(IngestResult::NewBlock(idx)) => {
                         let total = collector.meta().map(|m| m.total_blocks).unwrap_or(0);
@@ -99,19 +110,12 @@ fn run_aggregator(
                             }
                         );
                     }
+                    Ok(IngestResult::NewParity(g, p)) => {
+                        debug!("FEC 校验分片 组={} 序号={}", g, p);
+                    }
                     Ok(IngestResult::EotReceived) => {
                         info!("收到 EOT 信号");
-                        if collector.is_complete() {
-                            info!("所有数据块已收到，开始重组...");
-                            return flush_and_write(collector, output_path);
-                        } else {
-                            let missing = collector.missing_blocks();
-                            return Err(OptransError::FrameDecode(format!(
-                                "收到 EOT 但缺失 {} 块: {:?}，传输失败",
-                                missing.len(),
-                                missing
-                            )));
-                        }
+                        return finalize_transfer(collector, output_path);
                     }
                     Ok(IngestResult::Duplicate) => { /* skip */ }
                     Ok(IngestResult::Invalid) => { /* skip */ }
@@ -127,8 +131,50 @@ fn run_aggregator(
                         "未收到元数据帧，无法重组文件".into(),
                     ));
                 }
-                return flush_and_write(collector, output_path);
+                return finalize_transfer(collector, output_path);
             }
+        }
+    }
+}
+
+/// 收到 EOT 或通道关闭后，尝试 FEC 恢复并写文件
+fn finalize_transfer(
+    mut collector: FrameCollector,
+    output_path: Option<std::path::PathBuf>,
+) -> OptransResult<()> {
+    if collector.is_complete() {
+        info!("所有数据块已收到，开始重组...");
+        return flush_and_write(collector, output_path);
+    }
+
+    // 尝试 FEC 恢复
+    let missing = collector.missing_blocks();
+    info!(
+        "缺失 {} 块，尝试 FEC 恢复...（已收到 {} 校验分片）",
+        missing.len(),
+        collector.parity_received()
+    );
+
+    match collector.try_fec_recover() {
+        Ok(recovered) => {
+            if collector.is_complete() {
+                info!("✅ FEC 恢复成功，恢复 {} 块，开始重组...", recovered);
+                flush_and_write(collector, output_path)
+            } else {
+                let still_missing = collector.missing_blocks();
+                Err(OptransError::FrameDecode(format!(
+                    "FEC 恢复后仍缺失 {} 块: {:?}，传输失败",
+                    still_missing.len(),
+                    still_missing
+                )))
+            }
+        }
+        Err(e) => {
+            Err(OptransError::FrameDecode(format!(
+                "FEC 恢复失败: {}（缺失 {} 块）",
+                e,
+                missing.len()
+            )))
         }
     }
 }
@@ -220,12 +266,12 @@ fn run_capture_loop(
     }
     let loc = meta_loc.unwrap();
 
-    // ═══ Phase 2: 捕获数据帧 + EOT（纯转发，aggregator 负责计数/漏帧检测） ═══
-    // last_data_seq: 上一次截屏看到的 Data 帧序号（用于检测漏帧）
-    //   - meta(seq=0) 之后第一个数据帧 seq=1
+    // ═══ Phase 2: 捕获数据帧 + FEC 校验帧 + EOT ═══
+    // last_seq: 上一次截屏看到的非 Meta 帧序号（用于检测漏帧）
+    //   - meta(seq=0) 之后第一个帧 seq=1
     //   - 同一帧重复截到（seq 相同）→ 正常，跳过
     //   - seq > last + 1 → 中间有帧未截到 → 漏帧告警
-    let mut last_data_seq: Option<u16> = None;
+    let mut last_seq: Option<u16> = None;
     loop {
         if done.load(Ordering::SeqCst) { drop(tx); return Ok(()); }
 
@@ -240,9 +286,13 @@ fn run_capture_loop(
         };
 
         // 帧序号连续性检测（在 capture loop 中，不受线程池并发影响）
-        if info.frame_type == FrameType::Data || info.frame_type == FrameType::EOT {
+        // 对 Data、FecParity、EOT 帧均做检测
+        if info.frame_type == FrameType::Data
+            || info.frame_type == FrameType::FecParity
+            || info.frame_type == FrameType::EOT
+        {
             let seq = info.frame_sequence;
-            if let Some(last) = last_data_seq {
+            if let Some(last) = last_seq {
                 if seq == last {
                     // 同一帧重复截到，正常（sender 帧间隔内多次截屏）
                     continue;
@@ -257,7 +307,7 @@ fn run_capture_loop(
                 // seq == last + 1: 正常递增
                 // seq < last: 倒退（理论上不该发生），忽略
             }
-            last_data_seq = Some(seq);
+            last_seq = Some(seq);
         }
 
         match info.frame_type {
@@ -272,7 +322,7 @@ fn run_capture_loop(
                 });
                 break;
             }
-            FrameType::Data => {
+            FrameType::Data | FrameType::FecParity => {
                 let pixels_arc = Arc::new(pixels);
                 let enc = enc_mode.clone();
                 let tx_c = tx.clone();

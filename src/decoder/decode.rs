@@ -358,12 +358,45 @@ pub fn parse_meta_payload(payload: &[u8]) -> OptransResult<MetaPayload> {
             .try_into()
             .map_err(|_| OptransError::FrameDecode("总块数解析失败".to_string()))?,
     );
+    offset += 4;
+
+    // FEC 字段（v0.26+）：fec_k(2) + fec_m(2) + fec_groups(4) + fec_shard_size(4) = 12 字节
+    // 向后兼容：旧版无此字段，长度不足时 FEC 全为 0（未启用）
+    let (fec_k, fec_m, fec_groups, fec_shard_size) = if offset + 12 <= payload.len() {
+        let k = u16::from_le_bytes(
+            payload[offset..offset + 2]
+                .try_into()
+                .map_err(|_| OptransError::FrameDecode("fec_k 解析失败".to_string()))?,
+        );
+        let m = u16::from_le_bytes(
+            payload[offset + 2..offset + 4]
+                .try_into()
+                .map_err(|_| OptransError::FrameDecode("fec_m 解析失败".to_string()))?,
+        );
+        let groups = u32::from_le_bytes(
+            payload[offset + 4..offset + 8]
+                .try_into()
+                .map_err(|_| OptransError::FrameDecode("fec_groups 解析失败".to_string()))?,
+        );
+        let shard_size = u32::from_le_bytes(
+            payload[offset + 8..offset + 12]
+                .try_into()
+                .map_err(|_| OptransError::FrameDecode("fec_shard_size 解析失败".to_string()))?,
+        );
+        (k, m, groups, shard_size)
+    } else {
+        (0, 0, 0, 0)
+    };
 
     Ok(MetaPayload {
         file_name,
         file_size,
         sha256,
         total_blocks,
+        fec_k,
+        fec_m,
+        fec_groups,
+        fec_shard_size,
     })
 }
 
@@ -477,12 +510,38 @@ mod tests {
         payload.extend_from_slice(&12345u64.to_le_bytes());
         payload.extend_from_slice(&[0xAB; 32]);
         payload.extend_from_slice(&10u32.to_le_bytes());
+        // FEC 字段
+        payload.extend_from_slice(&128u16.to_le_bytes()); // fec_k
+        payload.extend_from_slice(&64u16.to_le_bytes());  // fec_m
+        payload.extend_from_slice(&1u32.to_le_bytes());   // fec_groups
+        payload.extend_from_slice(&32768u32.to_le_bytes()); // fec_shard_size
 
         let meta = parse_meta_payload(&payload).unwrap();
         assert_eq!(meta.file_name, "test.dat");
         assert_eq!(meta.file_size, 12345);
         assert_eq!(meta.sha256, [0xAB; 32]);
         assert_eq!(meta.total_blocks, 10);
+        assert_eq!(meta.fec_k, 128);
+        assert_eq!(meta.fec_m, 64);
+        assert_eq!(meta.fec_groups, 1);
+        assert_eq!(meta.fec_shard_size, 32768);
+        assert!(meta.fec_enabled());
+    }
+
+    #[test]
+    fn test_parse_meta_payload_legacy_no_fec() {
+        // 向后兼容：旧版元数据无 FEC 字段
+        let mut payload = Vec::new();
+        payload.push(4u8); // name_len
+        payload.extend_from_slice(b"test");
+        payload.extend_from_slice(&100u64.to_le_bytes());
+        payload.extend_from_slice(&[0xAB; 32]);
+        payload.extend_from_slice(&5u32.to_le_bytes());
+
+        let meta = parse_meta_payload(&payload).unwrap();
+        assert_eq!(meta.total_blocks, 5);
+        assert_eq!(meta.fec_k, 0);
+        assert!(!meta.fec_enabled());
     }
 
     #[test]

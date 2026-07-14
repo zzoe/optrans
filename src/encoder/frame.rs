@@ -6,7 +6,7 @@
 use crate::common::constants::MAX_FILE_NAME_LEN;
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::{
-    BlockData, FileManifest, FormatInfo, FrameType,
+    BlockData, FormatInfo, FrameType, MetaPayload,
 };
 use crate::encoder::reed_solomon::RsEncoder;
 
@@ -22,10 +22,11 @@ pub struct Frame {
 impl Frame {
     /// 构建元数据帧
     ///
-    /// 元数据帧载荷包含：文件名长度(1B) + 文件名(UTF-8) + 文件大小(8B LE) + SHA-256(32B) + 总块数(4B LE)
-    /// 元数据帧始终为 I 帧、二值模式。
-    pub fn new_metadata(manifest: &FileManifest, seq: u16) -> OptransResult<Frame> {
-        let file_name_bytes = manifest.file_name.as_bytes();
+    /// 载荷格式：name_len(1B) + name + file_size(8B LE) + sha256(32B) + total_blocks(4B LE)
+    ///          + fec_k(2B LE) + fec_m(2B LE) + fec_groups(4B LE) + fec_shard_size(4B LE)
+    /// 元数据帧始终为二值模式。
+    pub fn new_metadata(meta: &MetaPayload, seq: u16) -> OptransResult<Frame> {
+        let file_name_bytes = meta.file_name.as_bytes();
         if file_name_bytes.len() > MAX_FILE_NAME_LEN {
             return Err(OptransError::InvalidArgument(format!(
                 "文件名过长：{} 字节（最大 {} 字节）",
@@ -34,18 +35,22 @@ impl Frame {
             )));
         }
 
-        // 构建载荷：name_len(1B) + name + file_size(8B LE) + sha256(32B) + total_blocks(4B LE)
-        let payload_len = 1 + file_name_bytes.len() + 8 + 32 + 4;
+        // 载荷：name_len(1) + name + file_size(8) + sha256(32) + total_blocks(4) + FEC(12)
+        let payload_len = 1 + file_name_bytes.len() + 8 + 32 + 4 + 12;
         let mut payload = Vec::with_capacity(payload_len);
 
         payload.push(file_name_bytes.len() as u8);
         payload.extend_from_slice(file_name_bytes);
-        payload.extend_from_slice(&manifest.file_size.to_le_bytes());
-        payload.extend_from_slice(&manifest.sha256);
-        let total_blocks = manifest.blocks.len() as u32;
-        payload.extend_from_slice(&total_blocks.to_le_bytes());
+        payload.extend_from_slice(&meta.file_size.to_le_bytes());
+        payload.extend_from_slice(&meta.sha256);
+        payload.extend_from_slice(&meta.total_blocks.to_le_bytes());
+        // FEC 字段
+        payload.extend_from_slice(&meta.fec_k.to_le_bytes());
+        payload.extend_from_slice(&meta.fec_m.to_le_bytes());
+        payload.extend_from_slice(&meta.fec_groups.to_le_bytes());
+        payload.extend_from_slice(&meta.fec_shard_size.to_le_bytes());
 
-        let info = FormatInfo::new_meta(seq, total_blocks, payload.len() as u32);
+        let info = FormatInfo::new_meta(seq, meta.total_blocks, payload.len() as u32);
 
         let encoder = RsEncoder::new();
         let encoded_payload = encoder.encode(&payload)?;
@@ -125,49 +130,6 @@ impl Frame {
         Ok(Frame { format_info: info, encoded_payload })
     }
 
-    /// 构建元数据+数据合并帧（v0.10）
-    ///
-    /// 首条 entry 为元数据（block_index = META_BLOCK_INDEX = 0xFFFFFFFF），
-    /// 后续 entries 为正常数据块。用于小文件单帧传输。
-    pub fn new_merged_with_meta(
-        seq: u16,
-        total_blocks: u32,
-        encoding_mode_bit: u8,
-        meta_payload: &[u8],
-        blocks: &[&BlockData],
-    ) -> OptransResult<Frame> {
-        let meta_entry_len = 4 + 4 + meta_payload.len(); // index(4) + len(4) + data
-        let data_len: usize = blocks.iter().map(|b| 4 + 4 + b.data.len()).sum();
-        let payload_len = 2 + meta_entry_len + data_len; // 2B count
-
-        let mut payload = Vec::with_capacity(payload_len);
-        let count = 1u16 + blocks.len() as u16;
-        payload.extend_from_slice(&count.to_le_bytes());
-
-        // 元数据 entry: block_index = 0xFFFFFFFF
-        payload.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-        payload.extend_from_slice(&(meta_payload.len() as u32).to_le_bytes());
-        payload.extend_from_slice(meta_payload);
-
-        // 数据 entries
-        for block in blocks {
-            payload.extend_from_slice(&block.index.to_le_bytes());
-            let dlen = block.data.len() as u32;
-            payload.extend_from_slice(&dlen.to_le_bytes());
-            payload.extend_from_slice(&block.data);
-        }
-
-        let info = FormatInfo::new_data(
-            seq, 0, total_blocks,
-            payload.len() as u32, encoding_mode_bit,
-        );
-
-        let encoder = RsEncoder::new();
-        let encoded_payload = encoder.encode(&payload)?;
-
-        Ok(Frame { format_info: info, encoded_payload })
-    }
-
     /// 构建 EOT（传输结束）帧
     ///
     /// EOT 帧没有载荷数据。
@@ -175,6 +137,36 @@ impl Frame {
         let info = FormatInfo::new_eot(seq);
         let encoder = RsEncoder::new();
         let encoded_payload = encoder.encode(&[])?;
+
+        Ok(Frame {
+            format_info: info,
+            encoded_payload,
+        })
+    }
+
+    /// 构建 FEC 校验帧
+    ///
+    /// 载荷为单个校验分片的原始字节（不加 entry header）。
+    /// `block_index` 编码：高 16 位 = group_idx，低 16 位 = parity_idx
+    pub fn new_parity(
+        seq: u16,
+        group_idx: u16,
+        parity_idx: u16,
+        total_blocks: u32,
+        parity_data: &[u8],
+        encoding_mode_bit: u8,
+    ) -> OptransResult<Frame> {
+        let info = FormatInfo::new_parity(
+            seq,
+            group_idx,
+            parity_idx,
+            total_blocks,
+            parity_data.len() as u32,
+            encoding_mode_bit,
+        );
+
+        let encoder = RsEncoder::new();
+        let encoded_payload = encoder.encode(parity_data)?;
 
         Ok(Frame {
             format_info: info,
@@ -196,26 +188,25 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::constants::BLOCK_SIZE;
-    use std::path::PathBuf;
+    use crate::common::types::MetaPayload;
 
-    fn make_test_manifest() -> FileManifest {
-        FileManifest {
-            path: PathBuf::from("test.dat"),
+    fn make_test_meta() -> MetaPayload {
+        MetaPayload {
             file_name: "test.dat".to_string(),
             file_size: 4096,
             sha256: [0xAB; 32],
-            blocks: vec![BlockData {
-                index: 0,
-                data: vec![0x00; BLOCK_SIZE],
-            }],
+            total_blocks: 1,
+            fec_k: 0,
+            fec_m: 0,
+            fec_groups: 0,
+            fec_shard_size: 0,
         }
     }
 
     #[test]
     fn test_new_metadata_frame() {
-        let manifest = make_test_manifest();
-        let frame = Frame::new_metadata(&manifest, 0).unwrap();
+        let meta = make_test_meta();
+        let frame = Frame::new_metadata(&meta, 0).unwrap();
         assert_eq!(frame.format_info.frame_type, FrameType::Meta);
         assert_eq!(frame.format_info.frame_sequence, 0);
         assert_eq!(frame.format_info.total_blocks, 1);
@@ -247,20 +238,27 @@ mod tests {
     }
 
     #[test]
+    fn test_new_parity_frame() {
+        let parity_data = vec![0x77u8; 1024];
+        let frame = Frame::new_parity(5, 2, 7, 100, &parity_data, 1).unwrap();
+        assert_eq!(frame.format_info.frame_type, FrameType::FecParity);
+        assert_eq!(frame.format_info.frame_sequence, 5);
+        // block_index = (group=2) << 16 | (parity_idx=7) = 0x00020007
+        assert_eq!(frame.format_info.block_index, 0x00020007);
+        assert_eq!(frame.format_info.total_blocks, 100);
+        assert_eq!(frame.format_info.payload_bytes, 1024);
+        assert_eq!(frame.format_info.encoding_mode_bit, 1);
+    }
+
+    #[test]
     fn test_new_data_merged_large_block_preserves_len() {
         // Regression: block.data.len() > u16::MAX (65535) must not be truncated.
-        // 之前 data_len 编码为 u16，超过 65535 的块大小被静默截断，
-        // 导致接收端只读取部分数据 → SHA-256 校验失败。
         let big_data = vec![0xCDu8; 70000]; // > 65535
         let block = BlockData { index: 0, data: big_data.clone() };
         let blocks: Vec<&BlockData> = vec![&block];
         let frame = Frame::new_data_merged(&blocks, 1, 1, 1).unwrap();
-        // RS 解码后应得到原始 payload（含 2B count + 4B index + 4B len + data）
-        let encoder = RsEncoder::new();
-        let _ = encoder; // silence unused warning if any
         let decoded = crate::decoder::reed_solomon::rs_decode_data(&frame.encoded_payload).unwrap();
         assert_eq!(decoded.len(), 2 + 4 + 4 + 70000);
-        // 校验 data_len 字段（offset 6..10）等于 70000
         let data_len = u32::from_le_bytes(decoded[6..10].try_into().unwrap());
         assert_eq!(data_len as usize, 70000);
         // 校验数据内容完整

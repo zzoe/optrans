@@ -12,6 +12,9 @@ pub enum FrameType {
     Data = 1,
     /// 传输结束帧：空载荷，表示发送完成
     EOT = 2,
+    /// FEC 校验帧：携带块级 RS 纠删码的校验分片
+    /// block_index 字段编码：高 16 位 = group_idx，低 16 位 = parity_idx
+    FecParity = 3,
 }
 
 impl FrameType {
@@ -21,6 +24,7 @@ impl FrameType {
             0 => Some(FrameType::Meta),
             1 => Some(FrameType::Data),
             2 => Some(FrameType::EOT),
+            3 => Some(FrameType::FecParity),
             _ => None,
         }
     }
@@ -172,6 +176,36 @@ impl FormatInfo {
             encoding_mode_bit: 0,
         }
     }
+
+    /// 创建 FEC 校验帧的格式信息
+    ///
+    /// `block_index` 编码：高 16 位 = group_idx，低 16 位 = parity_idx
+    pub fn new_parity(
+        seq: u16,
+        group_idx: u16,
+        parity_idx: u16,
+        total_blocks: u32,
+        payload_bytes: u32,
+        encoding_mode_bit: u8,
+    ) -> Self {
+        let block_index = ((group_idx as u32) << 16) | (parity_idx as u32);
+        FormatInfo {
+            frame_type: FrameType::FecParity,
+            frame_sequence: seq,
+            block_index,
+            total_blocks,
+            payload_bytes,
+            encoding_mode_bit,
+        }
+    }
+}
+
+/// 从 FecParity 帧的 block_index 解出 (group_idx, parity_idx)
+pub fn decode_parity_block_index(block_index: u32) -> (u16, u16) {
+    (
+        (block_index >> 16) as u16,
+        (block_index & 0xFFFF) as u16,
+    )
 }
 
 /// 元数据帧载荷（RS 编码前的原始数据）
@@ -185,6 +219,21 @@ pub struct MetaPayload {
     pub sha256: [u8; 32],
     /// 总数据块数
     pub total_blocks: u32,
+    /// FEC 每组数据分片数（0 表示未启用 FEC）
+    pub fec_k: u16,
+    /// FEC 每组校验分片数（0 表示未启用 FEC）
+    pub fec_m: u16,
+    /// FEC 组数（0 表示未启用 FEC）
+    pub fec_groups: u32,
+    /// FEC 分片字节长度（所有数据/校验分片等长，仅最后一块数据补零）
+    pub fec_shard_size: u32,
+}
+
+impl MetaPayload {
+    /// 是否启用 FEC
+    pub fn fec_enabled(&self) -> bool {
+        self.fec_k > 0 && self.fec_m > 0
+    }
 }
 
 /// 单个文件数据块
@@ -192,7 +241,7 @@ pub struct MetaPayload {
 pub struct BlockData {
     /// 块索引，从 0 开始
     pub index: u32,
-    /// 块数据（最多 4096 字节）
+    /// 块数据（长度 ≤ block_size，block_size 由帧容量动态计算）
     pub data: Vec<u8>,
 }
 
@@ -267,6 +316,8 @@ pub enum IngestResult {
     NewMeta(MetaPayload),
     /// 新的数据块（块索引）
     NewBlock(u32),
+    /// 新的 FEC 校验分片（组号，组内校验序号）
+    NewParity(u16, u16),
     /// 收到 EOT 信号
     EotReceived,
     /// 重复帧（已见过的序号）

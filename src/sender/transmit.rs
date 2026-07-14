@@ -1,8 +1,9 @@
 //! 发送编排模块
 //!
-//! 发送主控逻辑：读取文件 → 块合并 → 帧构建 → 灰度渲染 → 循环显示 → EOT。
-//! v0.9: 多块合并发送，每帧填满 payload 容量。
-//! v0.19.3: render 线程异步预渲染，display loop 严格串行计时。
+//! 发送主控逻辑：读取文件 → 块级 FEC 编码 → 帧构建 → 灰度渲染 → 循环显示 → EOT。
+//!
+//! v0.26: 块级 FEC（前向纠错）。数据块分组后生成 RS 校验分片，
+//! 数据帧与校验帧交错发送，接收端收到任意 k 个分片即可恢复该组。
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -10,7 +11,10 @@ use std::thread;
 
 use crate::common::constants;
 use crate::common::error::{OptransError, OptransResult};
-use crate::common::types::{BlockData, GrayEncodingConfig};
+use crate::common::fec::{FecEncoder, fec_group_count};
+use crate::common::types::{
+    BlockData, FileManifest, GrayEncodingConfig, MetaPayload,
+};
 use crate::encoder::frame::Frame;
 use crate::encoder::render::render_frame_default;
 use crate::sender::window::SenderWindow;
@@ -123,24 +127,51 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
     let manifest =
         crate::sender::chunker::read_file_with_block_size(Path::new(&path), block_size)?;
 
+    let total_blocks = manifest.blocks.len() as u32;
+    let fec_k = constants::FEC_DATA_SHARDS as u16;
+    let fec_m = constants::FEC_PARITY_SHARDS as u16;
+    let fec_groups = fec_group_count(manifest.blocks.len());
+    // FEC 分片长度 = block_size（最后一块数据补零到此长度）
+    let fec_shard_size = block_size as u32;
+
     info!(
         "文件: {} ({} bytes, {} 块, 每块≤{}B)",
-        manifest.file_name,
-        manifest.file_size,
-        manifest.blocks.len(),
-        block_size
+        manifest.file_name, manifest.file_size, total_blocks, block_size
     );
     info!("SHA-256: {}", hex_str(&manifest.sha256));
+    info!(
+        "FEC: {} 组, k={} m={} (容错 {:.0}%), 分片长度={}B",
+        fec_groups,
+        fec_k,
+        fec_m,
+        fec_m as f64 / (fec_k + fec_m) as f64 * 100.0,
+        fec_shard_size
+    );
 
-    let total_blocks = manifest.blocks.len() as u32;
+    // 3. 块级 FEC 编码：数据块 → 等长分片 → 校验分片
+    let parity_shards = build_parity_shards(&manifest, block_size)?;
 
-    // 3. 预构建元数据帧和 EOT 帧（始终 I 帧、二值模式）
-    let meta_frame = Frame::new_metadata(&manifest, 0)?;
+    // 4. 构建 MetaPayload（含 FEC 参数）
+    let meta = MetaPayload {
+        file_name: manifest.file_name.clone(),
+        file_size: manifest.file_size,
+        sha256: manifest.sha256,
+        total_blocks,
+        fec_k,
+        fec_m,
+        fec_groups,
+        fec_shard_size,
+    };
 
-    let eot_seq = 1u16 + total_blocks as u16; // meta(seq=0) + data blocks
+    // 5. 预构建元数据帧和 EOT 帧
+    let meta_frame = Frame::new_metadata(&meta, 0)?;
+    // EOT seq = 1(meta) + 数据帧数 + 校验帧数
+    let total_data_frames = count_data_frames(&manifest, max_payload_per_frame);
+    let total_parity_frames = parity_shards.total_parity_count();
+    let eot_seq = 1u16 + total_data_frames as u16 + total_parity_frames as u16;
     let eot_frame = Frame::new_eot(eot_seq)?;
 
-    // 4. 创建全屏最大化窗口
+    // 6. 创建全屏最大化窗口
     let mut window =
         SenderWindow::create_sized(module_pixels, modules_w, modules_h, frame_margin)?;
 
@@ -152,173 +183,106 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
         modules_h * module_pixels,
         max_payload_per_frame
     );
-    info!("开始发送...");
+    info!(
+        "开始发送: {} 数据帧 + {} 校验帧 = {} 总帧数",
+        total_data_frames,
+        total_parity_frames,
+        total_data_frames + total_parity_frames
+    );
 
-    let mut global_seq: u16 = 0;
-
-    // 元数据 payload 大小
-    let meta_payload = {
-        let mut p = Vec::new();
-        p.push(manifest.file_name.len() as u8);
-        p.extend_from_slice(manifest.file_name.as_bytes());
-        p.extend_from_slice(&manifest.file_size.to_le_bytes());
-        p.extend_from_slice(&manifest.sha256);
-        p.extend_from_slice(&(manifest.blocks.len() as u32).to_le_bytes());
-        p
-    };
-    let meta_payload_len = meta_payload.len();
-
-    // 检查是否可以将元数据合并到第一个数据帧（小文件优化）
-    let can_merge_meta = total_blocks == 1
-        && 2 + 4 + 4 + meta_payload_len + 4 + 4 + manifest.blocks[0].data.len()
-            <= max_payload_per_frame;
-
-    // 单轮发送：不重传，靠单帧高可靠解码（参考二维码识别的容错思路：
-    // 数据块自带 RS 纠错，格式信息解码失败时接收端降级重试平移/变半径）
+    // ── 发送元数据帧（始终二值渲染） ──
+    if !window.process_messages() {
+        info!("用户中止发送");
+        return Ok(());
+    }
     {
+        let meta_gray_config = GrayEncodingConfig::new(2);
+        let pixels = render_frame_default(
+            &meta_frame,
+            module_pixels,
+            modules_w,
+            modules_h,
+            &meta_gray_config,
+            false,
+        );
+        window.update_bitmap(&pixels);
+        debug!("  [META] seq={}", meta_frame.sequence());
+
+        info!(
+            "□ 元数据帧已显示，{}ms 后开始发送...",
+            BOUNDARY_DWELL_MS
+        );
+        if !window.sleep_with_messages(BOUNDARY_DWELL_MS) {
+            info!("用户中止发送");
+            return Ok(());
+        }
+    }
+
+    // ── 阶段 1: 构建所有帧（数据帧 + 校验帧，交错排列） ──
+    let all_frames = build_all_frames_interleaved(
+        &manifest,
+        &parity_shards,
+        total_blocks,
+        encoding_mode_bit,
+        max_payload_per_frame,
+    )?;
+
+    let total_frames = all_frames.len();
+    info!("▶ 已构建 {} 帧（交错），启动渲染线程...", total_frames);
+
+    // 提前释放 manifest（含原始文件数据拷贝）
+    drop(manifest);
+
+    // ── 阶段 2: 渲染线程 (异步) + display loop (严格串行) ──
+    let (render_tx, render_rx) = mpsc::channel::<Vec<u8>>();
+
+    let render_gray = gray_config.clone();
+    thread::spawn(move || {
+        for frame in &all_frames {
+            let pixels = render_frame_default(
+                frame,
+                module_pixels,
+                modules_w,
+                modules_h,
+                &render_gray,
+                enable_heartbeat,
+            );
+            if render_tx.send(pixels).is_err() {
+                break;
+            }
+        }
+        // render_tx dropped → display loop 的 rx.recv() 返回 Err
+    });
+
+    // display loop: 严格串行，每帧 interval_ms
+    let mut last_frame_time = unsafe { crate::win32::ffi::GetTickCount() };
+    for (i, pixels) in render_rx.into_iter().enumerate() {
         if !window.process_messages() {
             info!("用户中止发送");
             return Ok(());
         }
 
-        if can_merge_meta {
-            // 小文件：元数据 + 数据合并到一个帧，直接进入数据发送
-            info!("▶ 小文件模式：元数据+数据合并为单帧，开始发送...");
-        } else {
-            // 先发送元数据帧（始终 I 帧、二值渲染）
-            {
-                if !window.process_messages() {
-                    info!("用户中止发送");
-                    return Ok(());
-                }
-                let meta_gray_config = GrayEncodingConfig::new(2); // 元数据帧始终二值
-                let pixels = render_frame_default(
-                    &meta_frame,
-                    module_pixels,
-                    modules_w,
-                    modules_h,
-                    &meta_gray_config,
-                    false,
-                );
-                window.update_bitmap(&pixels);
-                debug!("  [META] seq={}", meta_frame.sequence());
-                global_seq += 1;
-
-                // 元数据帧已显示，短暂驻留后开始发送数据
-                info!(
-                    "□ 确认帧已显示，{}ms 后开始发送...",
-                    BOUNDARY_DWELL_MS
-                );
-                if !window.sleep_with_messages(BOUNDARY_DWELL_MS) {
-                    info!("用户中止发送");
-                    return Ok(());
-                }
-                info!("▶ 开始发送数据帧");
-            }
+        // 诊断：记录帧间隔
+        let now = unsafe { crate::win32::ffi::GetTickCount() };
+        let actual_interval = now.wrapping_sub(last_frame_time);
+        if actual_interval > (interval_ms as u32) * 2 {
+            debug!(
+                "  [帧间隔] 第 {} 帧实际间隔 {}ms（期望 {}ms），可能丢帧！",
+                i + 1,
+                actual_interval,
+                interval_ms
+            );
         }
+        last_frame_time = now;
 
-        // ── 阶段 1: 收集所有数据帧 (Frame 构建，不渲染) ──
-        let mut block_iter = manifest.blocks.iter().peekable();
-        let mut frame_idx: usize = 0;
-        let mut data_frames: Vec<Frame> = Vec::new();
-
-        while block_iter.peek().is_some() || (can_merge_meta && frame_idx == 0) {
-            let mut merged_blocks: Vec<&BlockData> = Vec::new();
-            let mut accumulated = 2usize;
-
-            if can_merge_meta && frame_idx == 0 {
-                accumulated += 4 + 4 + meta_payload_len;
-            }
-
-            while let Some(block) = block_iter.peek() {
-                let entry_size = 4 + 4 + block.data.len();
-                if accumulated + entry_size > max_payload_per_frame {
-                    break;
-                }
-                accumulated += entry_size;
-                merged_blocks.push(block);
-                block_iter.next();
-            }
-
-            if merged_blocks.is_empty() && !(can_merge_meta && frame_idx == 0) {
-                break;
-            }
-
-            let frame = if can_merge_meta && frame_idx == 0 {
-                Frame::new_merged_with_meta(
-                    global_seq,
-                    total_blocks,
-                    encoding_mode_bit,
-                    &meta_payload,
-                    &merged_blocks,
-                )?
-            } else {
-                Frame::new_data_merged(&merged_blocks, global_seq, total_blocks, encoding_mode_bit)?
-            };
-
-            data_frames.push(frame);
-            frame_idx += 1;
-            global_seq += 1;
-        }
-
-        let total_frames = data_frames.len();
-        info!("▶ 已构建 {} 帧，启动渲染线程...", total_frames);
-
-        // v0.19.4: 提前释放 manifest（含原始文件数据拷贝），渲染阶段仅保留 RS 编码的帧数据
-        drop(manifest);
-        drop(meta_payload);
-
-        // ── 阶段 2: 渲染线程 (异步) + display loop (严格串行) ──
-        let (render_tx, render_rx) = mpsc::channel::<Vec<u8>>();
-
-        let render_gray = gray_config.clone();
-        thread::spawn(move || {
-            for frame in &data_frames {
-                let pixels = render_frame_default(
-                    frame,
-                    module_pixels,
-                    modules_w,
-                    modules_h,
-                    &render_gray,
-                    enable_heartbeat,
-                );
-                if render_tx.send(pixels).is_err() {
-                    break;
-                }
-            }
-            // render_tx dropped → display loop 的 rx.recv() 返回 Err
-        });
-
-        // display loop: 严格串行，每帧 interval_ms
-        let mut last_frame_time = unsafe { crate::win32::ffi::GetTickCount() };
-        for (i, pixels) in render_rx.into_iter().enumerate() {
-            if !window.process_messages() {
-                info!("用户中止发送");
-                return Ok(());
-            }
-
-            // 诊断：记录帧间隔（v0.19.4）
-            let now = unsafe { crate::win32::ffi::GetTickCount() };
-            let actual_interval = now.wrapping_sub(last_frame_time);
-            if actual_interval > (interval_ms as u32) * 2 {
-                debug!(
-                    "  [帧间隔] 第 {} 帧实际间隔 {}ms（期望 {}ms），可能丢帧！",
-                    i + 1,
-                    actual_interval,
-                    interval_ms
-                );
-            }
-            last_frame_time = now;
-
-            window.update_bitmap(&pixels);
-            if !window.sleep_with_messages(interval_ms) {
-                info!("用户中止发送");
-                return Ok(());
-            }
+        window.update_bitmap(&pixels);
+        if !window.sleep_with_messages(interval_ms) {
+            info!("用户中止发送");
+            return Ok(());
         }
     }
 
-    // 6. 发送 EOT 帧
+    // ── 发送 EOT 帧 ──
     info!("发送 EOT 信号...");
     if !window.process_messages() {
         info!("用户中止发送");
@@ -336,7 +300,7 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
     window.update_bitmap(&pixels);
     debug!("  [EOT] seq={}", eot_frame.sequence());
 
-    // 7. EOT 帧驻留，确保接收端有充足时间检测
+    // EOT 帧驻留，确保接收端有充足时间检测
     info!(
         "EOT 帧驻留 {}ms，等待接收端确认...",
         BOUNDARY_DWELL_MS
@@ -354,6 +318,148 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
     }
     info!("发送完成，窗口即将关闭");
 
-    // window 的 Drop 实现会自动调用 DestroyWindow 关闭窗口
     Ok(())
+}
+
+/// 计算数据块需要的帧数（多块合并）
+fn count_data_frames(manifest: &FileManifest, max_payload_per_frame: usize) -> usize {
+    let mut count = 0usize;
+    let mut accumulated = 2usize; // 2B count header
+    for block in &manifest.blocks {
+        let entry_size = 4 + 4 + block.data.len();
+        if accumulated + entry_size > max_payload_per_frame {
+            count += 1;
+            accumulated = 2 + entry_size;
+        } else {
+            accumulated += entry_size;
+        }
+    }
+    if accumulated > 2 {
+        count += 1;
+    }
+    count
+}
+
+/// FEC 校验分片集合：每组 m 个校验分片
+struct ParityShards {
+    /// 按 group 组织的校验分片：groups[g] = m 个校验分片
+    groups: Vec<Vec<Vec<u8>>>,
+}
+
+impl ParityShards {
+    /// 所有校验分片总数
+    fn total_parity_count(&self) -> usize {
+        self.groups.iter().map(|g| g.len()).sum()
+    }
+}
+
+/// 对文件数据块进行 FEC 编码，生成校验分片
+///
+/// 每组 k 个数据块（最后一组不足 k 个时补零分片），生成 m 个校验分片。
+fn build_parity_shards(
+    manifest: &FileManifest,
+    block_size: usize,
+) -> OptransResult<ParityShards> {
+    let k = constants::FEC_DATA_SHARDS;
+    let encoder = FecEncoder::new()?;
+
+    let total_blocks = manifest.blocks.len();
+    let num_groups = fec_group_count(total_blocks) as usize;
+    let mut groups: Vec<Vec<Vec<u8>>> = Vec::with_capacity(num_groups);
+
+    for g in 0..num_groups {
+        let start = g * k;
+        let end = std::cmp::min(start + k, total_blocks);
+
+        // 构造等长数据分片（补零到 block_size）
+        let mut data_shards: Vec<Vec<u8>> = Vec::with_capacity(k);
+        for i in 0..k {
+            if start + i < end {
+                let mut shard = manifest.blocks[start + i].data.clone();
+                shard.resize(block_size, 0u8);
+                data_shards.push(shard);
+            } else {
+                // 不足 k 个的组，用零分片补齐
+                data_shards.push(vec![0u8; block_size]);
+            }
+        }
+
+        let parity = encoder.encode(&data_shards)?;
+        groups.push(parity);
+    }
+
+    Ok(ParityShards { groups })
+}
+
+/// 构建所有帧（数据帧 + 校验帧），交错排列以分散丢帧风险
+///
+/// 交错策略：
+/// - 数据帧按原始块顺序连续发送（多块合并）
+/// - 校验帧按组轮转插入：组0分片0, 组1分片0, ..., 组0分片1, 组1分片1, ...
+///
+/// 这样单组内的校验帧在时间上分散，避免 Horizon 连续丢帧
+/// 导致整组校验帧全丢。FEC 容错能力确保任意 k 个分片即可恢复。
+fn build_all_frames_interleaved(
+    manifest: &FileManifest,
+    parity: &ParityShards,
+    total_blocks: u32,
+    encoding_mode_bit: u8,
+    max_payload_per_frame: usize,
+) -> OptransResult<Vec<Frame>> {
+    let m = constants::FEC_PARITY_SHARDS;
+
+    let mut result: Vec<Frame> = Vec::new();
+    let mut global_seq: u16 = 1; // meta=0，数据帧从 seq=1 开始
+
+    // 1. 构建数据帧（多块合并）
+    let mut block_iter = manifest.blocks.iter().peekable();
+    while block_iter.peek().is_some() {
+        let mut merged_blocks: Vec<&BlockData> = Vec::new();
+        let mut accumulated = 2usize;
+
+        while let Some(block) = block_iter.peek() {
+            let entry_size = 4 + 4 + block.data.len();
+            if accumulated + entry_size > max_payload_per_frame {
+                break;
+            }
+            accumulated += entry_size;
+            merged_blocks.push(block);
+            block_iter.next();
+        }
+
+        if merged_blocks.is_empty() {
+            break;
+        }
+
+        let frame = Frame::new_data_merged(
+            &merged_blocks,
+            global_seq,
+            total_blocks,
+            encoding_mode_bit,
+        )?;
+        result.push(frame);
+        global_seq = global_seq.wrapping_add(1);
+    }
+
+    // 2. 构建校验帧并按组轮转交错排列
+    // 交错策略：所有组的第 0 个校验帧先发，再第 1 个，...
+    // seq 按实际发送顺序分配，确保接收端漏帧检测（基于 seq 连续性）准确
+    for p_idx in 0..m {
+        for (g_idx, group_parity) in parity.groups.iter().enumerate() {
+            if p_idx < group_parity.len() {
+                let frame = Frame::new_parity(
+                    global_seq,
+                    g_idx as u16,
+                    p_idx as u16,
+                    total_blocks,
+                    &group_parity[p_idx],
+                    encoding_mode_bit,
+                )?;
+                result.push(frame);
+                global_seq = global_seq.wrapping_add(1);
+            }
+        }
+    }
+
+    Ok(result)
 }

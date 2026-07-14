@@ -16,15 +16,10 @@ pub const MODULES_PER_SIDE_DEFAULT: u32 = 200;
 
 /// 文件分块大小（字节）
 ///
-/// payload_bytes 字段为 20 bits，单块最大可达 1,048,575 字节。
-/// 取 32768 (32KB) 作为默认块大小：
-/// - payload_bytes = 4(block_index) + 32768 = 32772 ≤ 1,048,575 ✓
+/// payload_bytes 字段为 21 bits，单块最大可达 2,097,151 字节。
+/// 取 32768 (32KB) 作为默认块大小（`read_file` 使用）：
+/// - 实际发送时 block_size 由帧容量动态计算（`read_file_with_block_size`）
 /// - RS 编码：32772 字节 → 152 个 RS 块 (152×217=32984 ≥ 32772)，冗余率 17%
-/// - 标准 2560×1600 全屏 module_pixels=4 时单帧容量约 27KB（二值）或更大（灰度）
-///   32768 可能超过二值模式单帧容量，但灰度模式可容纳
-/// - 动态帧尺寸会自动调整窗口大小以容纳数据
-/// - 注意：小窗口场景（如 Horizon client 窗口较小时）单帧容量可能不足，
-///   动态帧尺寸计算会限制在屏幕容量内
 pub const BLOCK_SIZE: usize = 32768;
 
 /// RS 编码：数据码字数量
@@ -37,7 +32,7 @@ pub const RS_PARITY_LEN: usize = 38;
 pub const RS_TOTAL_LEN: usize = 255;
 
 /// 默认帧间隔（毫秒）
-pub const FRAME_INTERVAL_MS: u64 = 200;
+pub const FRAME_INTERVAL_MS: u64 = 100;
 
 /// 最大文件名长度（UTF-8 字节）
 pub const MAX_FILE_NAME_LEN: usize = 255;
@@ -79,3 +74,21 @@ pub const GRAY_LEVELS_DEFAULT: u32 = 16;
 
 /// 有效的灰度级数（2 的幂，bit 直映射）
 pub const VALID_GRAY_LEVELS: [u32; 4] = [2, 4, 8, 16];
+
+// ─── 块级 FEC（前向纠错）参数 ───
+//
+// 远程桌面（Horizon/Citrix）协议层会因带宽自适应、变化检测合并等机制丢帧，
+// sender 无法干预。采用块级 RS 纠删码做容错：每组 k 个数据块 + m 个校验块，
+// 接收端收到任意 k 个分片即可恢复该组全部数据块。
+//
+// 实测 Horizon 漏帧率约 28%，取 k=128 m=64（容错 33%）留充足余量。
+// RS(255,k) 上限 k+m ≤ 255，192 远低于上限，编译期校验。
+
+/// FEC 每组数据分片数
+pub const FEC_DATA_SHARDS: usize = 128;
+
+/// FEC 每组校验分片数
+pub const FEC_PARITY_SHARDS: usize = 64;
+
+/// FEC 每组总分片数
+pub const FEC_TOTAL_SHARDS: usize = FEC_DATA_SHARDS + FEC_PARITY_SHARDS;
