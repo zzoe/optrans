@@ -195,9 +195,6 @@ fn run_capture_loop(
     let mut locate_diag_printed = false;
     let mut loop_count: u64 = 0;
 
-    // 并发解码上限（避免线程爆炸）
-    let decode_in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
     loop {
         loop_count += 1;
         if done.load(Ordering::SeqCst) {
@@ -281,38 +278,29 @@ fn run_capture_loop(
             }
         }
 
-        // 4. 解码
+        // 4. 解码（线程池：每帧独立 spawn，sender 200ms+ 间隔保证线程数可控）
         if let Some(ci) = best_candidate {
             let loc = candidates[ci].0.clone();
             let pixels_arc = Arc::new(pixels);
             let enc_mode = encoding_mode.clone();
             let tx_clone = tx.clone();
             let locked_clone = Arc::clone(&locked);
-            let slots_clone = Arc::clone(&decode_in_flight);
             let is_first = locked.get().is_none();
 
-            // 限制并发 decode 线程数（最多 4）
-            if slots_clone.load(Ordering::Relaxed) < 4 {
-                slots_clone.fetch_add(1, Ordering::Relaxed);
-                thread::spawn(move || {
-                    match decode_frame(&pixels_arc, img_w, img_h, &loc, &enc_mode) {
-                        Ok(frame) => {
-                            if matches!(frame.frame_type, FrameType::Meta | FrameType::Data)
-                                && frame.payload.is_empty() { slots_clone.fetch_sub(1, Ordering::Relaxed); return; }
-                            if is_first && matches!(frame.frame_type, FrameType::Data) {
-                                let _ = locked_clone.set(loc.clone());
-                                info!("✓ 首个有效帧解码成功，已锁定位置");
-                            }
-                            let _ = tx_clone.send(frame);
-                            slots_clone.fetch_sub(1, Ordering::Relaxed);
+            thread::spawn(move || {
+                match decode_frame(&pixels_arc, img_w, img_h, &loc, &enc_mode) {
+                    Ok(frame) => {
+                        if matches!(frame.frame_type, FrameType::Meta | FrameType::Data)
+                            && frame.payload.is_empty() { return; }
+                        if is_first && matches!(frame.frame_type, FrameType::Data) {
+                            let _ = locked_clone.set(loc.clone());
+                            info!("✓ 首个有效帧解码成功，已锁定位置");
                         }
-                        Err(e) => {
-                            debug!("payload 解码失败: {}", e);
-                            slots_clone.fetch_sub(1, Ordering::Relaxed);
-                        }
+                        let _ = tx_clone.send(frame);
                     }
-                });
-            }
+                    Err(e) => { debug!("payload 解码失败: {}", e); }
+                }
+            });
         }
 
         // 时序
