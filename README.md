@@ -31,7 +31,7 @@ optrans test send --frame-margin 120
 | ----------------- | ------- | ------------------------------------- |
 | `--module-pixels` | 4       | 每模块像素数 (2-8 偶数)               |
 | `--interval-ms`   | 150/300 | 帧间隔毫秒                            |
-| `--gray-levels`   | 5/2     | 灰度级数 (2/4/5/8/16)，测试默认2      |
+| `--gray-levels`   | 16      | 灰度级数 (2/4/8/16)                   |
 | `--frame-margin`  | 20      | 帧边距像素（远程桌面建议 120）        |
 | `--no-diff`       | false   | 禁用 P 帧，全发 I 帧                  |
 | `--encoding-mode` | auto    | 接收端编码模式 (auto/binary/gray-N)   |

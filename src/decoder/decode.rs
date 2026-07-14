@@ -7,6 +7,7 @@
 
 use crate::common::crc::crc16_xmodem;
 use crate::common::error::{OptransError, OptransResult};
+use crate::common::rs_utils::rs_encoded_size;
 use crate::common::types::{
     DecodedFrame, DiffEntry, EncodingMode, FinderPattern, FormatInfo, FrameKind, FrameLocation,
     FrameType, GrayEncodingConfig, MetaPayload,
@@ -221,8 +222,7 @@ pub fn decode_payload(
     }
 
     let payload_bytes = info.payload_bytes as usize;
-    let num_rs_blocks = payload_bytes.div_ceil(crate::common::constants::RS_DATA_LEN);
-    let encoded_bytes = 4 + num_rs_blocks * crate::common::constants::RS_TOTAL_LEN;
+    let encoded_bytes = rs_encoded_size(payload_bytes);
 
     let encoded_bits = match encoding_mode {
         EncodingMode::Gray(levels) => calc_gray_module_count(encoded_bytes, *levels),
@@ -451,7 +451,7 @@ fn unpack_format_info(data: &[u8]) -> OptransResult<FormatInfo> {
     let frame_sequence = ((val >> 2) & 0xFFFF) as u16;
     let block_index = ((val >> 18) & 0xFFFF_FFFF) as u32;
     let total_blocks = ((val >> 50) & 0xFFFF_FFFF) as u32;
-    let payload_bytes = ((val >> 82) & 0xFFFFF) as u32; // 20 bits (v0.24: 原 16b)
+    let payload_bytes = ((val >> 82) & 0xFFFFF) as u32; // 20 bits
     let frame_kind_val = ((val >> 102) & 0x1) as u8;
     let encoding_mode_bit = ((val >> 103) & 0x1) as u8;
 
@@ -547,14 +547,14 @@ mod tests {
     }
 
     #[test]
-    fn test_unpack_format_info_payload_16bit() {
-        // v0.6: payload_bytes 扩展到 16 bits，测试边界值 65535
+    fn test_unpack_format_info_payload_20bit() {
+        // payload_bytes 为 20 bits，测试边界值 1,048,575 (2^20-1)
         let info = FormatInfo {
             frame_type: FrameType::Data,
             frame_sequence: 1,
             block_index: 0,
             total_blocks: 1,
-            payload_bytes: 65535,
+            payload_bytes: 1_048_575,
             frame_kind: FrameKind::I,
             encoding_mode_bit: 0,
         };
@@ -566,14 +566,14 @@ mod tests {
         val |= (info.block_index as u128) << 18;
         val |= (info.total_blocks as u128) << 50;
         val |= (info.payload_bytes as u128) << 82;
-        val |= (info.frame_kind as u128) << 98;
-        val |= (info.encoding_mode_bit as u128) << 99;
+        val |= (info.frame_kind as u128) << 102;
+        val |= (info.encoding_mode_bit as u128) << 103;
         for i in 0..13 {
             packed[i] = ((val >> (i * 8)) & 0xFF) as u8;
         }
 
         let unpacked = unpack_format_info(&packed).unwrap();
-        assert_eq!(unpacked.payload_bytes, 65535);
+        assert_eq!(unpacked.payload_bytes, 1_048_575);
     }
 
     #[test]

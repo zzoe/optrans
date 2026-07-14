@@ -52,9 +52,8 @@ fn frame_capacity_for_modules(
     modules_h: u32,
     gray_config: &GrayEncodingConfig,
 ) -> (u32, u32, usize) {
-    use crate::common::constants::{RS_DATA_LEN, RS_TOTAL_LEN};
+    use crate::common::rs_utils::rs_payload_capacity;
 
-    // 确保最小尺寸（至少能容纳格式信息区：2×(w-14) ≥ 360，所以 w ≥ 194）
     let min_w = 194u32;
     let modules_w = modules_w.max(min_w);
     let modules_h = modules_h.max(50u32);
@@ -74,13 +73,7 @@ fn frame_capacity_for_modules(
         _ => available / 8,
     };
 
-    let header = 4usize;
-    let max_payload = if max_rs_encoded <= header {
-        0
-    } else {
-        let num_rs_blocks = (max_rs_encoded - header) / RS_TOTAL_LEN;
-        num_rs_blocks * RS_DATA_LEN
-    };
+    let max_payload = rs_payload_capacity(max_rs_encoded);
 
     (modules_w, modules_h, max_payload)
 }
@@ -123,9 +116,9 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
         ));
     }
 
-    // 多块合并格式每块 overhead：2B count + (4B index + 2B len) × N
-    // 最少 1 块 → 8B overhead → block_size = max_payload - 8
-    let block_size = max_payload_per_frame.saturating_sub(8);
+    // 多块合并格式每块 overhead：2B count + (4B index + 4B len) × N
+    // 最少 1 块 → 10B overhead → block_size = max_payload - 10
+    let block_size = max_payload_per_frame.saturating_sub(10);
 
     // 2. 读取文件并分块
     let manifest =
@@ -178,7 +171,7 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
 
     // 检查是否可以将元数据合并到第一个数据帧（小文件优化）
     let can_merge_meta = total_blocks == 1
-        && 2 + 4 + 2 + meta_payload_len + 4 + 2 + manifest.blocks[0].data.len()
+        && 2 + 4 + 4 + meta_payload_len + 4 + 4 + manifest.blocks[0].data.len()
             <= max_payload_per_frame;
 
     // 单轮发送：不重传，靠单帧高可靠解码（参考二维码识别的容错思路：
@@ -236,11 +229,11 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
             let mut accumulated = 2usize;
 
             if can_merge_meta && frame_idx == 0 {
-                accumulated += 4 + 2 + meta_payload_len;
+                accumulated += 4 + 4 + meta_payload_len;
             }
 
             while let Some(block) = block_iter.peek() {
-                let entry_size = 4 + 2 + block.data.len();
+                let entry_size = 4 + 4 + block.data.len();
                 if accumulated + entry_size > max_payload_per_frame {
                     break;
                 }

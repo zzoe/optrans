@@ -3,8 +3,9 @@
 //! 将原始数据编码为带纠错码的数据块。
 //! 输出格式：`[4 bytes total_data_len LE] + [ceil(len/217) × 255 bytes RS blocks]`
 
-use crate::common::constants::{RS_DATA_LEN, RS_PARITY_LEN, RS_TOTAL_LEN};
+use crate::common::constants::{RS_DATA_LEN, RS_PARITY_LEN};
 use crate::common::error::OptransResult;
+use crate::common::rs_utils::rs_block_count;
 use reed_solomon::Encoder;
 
 /// RS(255,217) 编码器
@@ -34,16 +35,14 @@ impl RsEncoder {
     /// 编码后的数据，格式为 `[4 bytes total_len LE] + [RS blocks...]`
     pub fn encode(&self, data: &[u8]) -> OptransResult<Vec<u8>> {
         let total_len = data.len() as u32;
-        let num_blocks = data.len().div_ceil(RS_DATA_LEN);
+        let num_blocks = rs_block_count(data.len());
         if num_blocks == 0 {
-            // 空数据：仅返回长度头
             let mut output = Vec::with_capacity(4);
             output.extend_from_slice(&total_len.to_le_bytes());
             return Ok(output);
         }
 
-        // 计算输出大小：4 字节长度头 + 每块 255 字节
-        let output_size = 4 + num_blocks * RS_TOTAL_LEN;
+        let output_size = crate::common::rs_utils::rs_encoded_size(data.len());
         let mut output = Vec::with_capacity(output_size);
 
         // 写入总长度头（小端序）
@@ -84,6 +83,7 @@ pub fn rs_encode(data: &[u8]) -> OptransResult<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::constants::RS_TOTAL_LEN;
 
     #[test]
     fn test_rs_encode_empty() {

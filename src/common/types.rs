@@ -132,14 +132,14 @@ impl GrayEncodingConfig {
     }
 }
 
-/// 帧格式信息（97 bits 的逻辑表示）
+/// 帧格式信息（104 bits 的逻辑表示）
 ///
 /// 字段布局：
 /// - frame_type:     2 bits  (bit 0-1)
 /// - frame_sequence: 16 bits (bit 2-17)
 /// - block_index:    32 bits (bit 18-49)
 /// - total_blocks:   32 bits (bit 50-81)
-/// - payload_bytes:  20 bits (bit 82-101) ← v0.24: 原 16 bits 扩展到 20 bits
+/// - payload_bytes:  20 bits (bit 82-101)
 ///   (max 1,048,575，16 级灰度单帧可达 ~127KB)
 /// - frame_kind:     1 bit  (bit 102)
 /// - encoding_mode_bit: 1 bit (bit 103)
@@ -156,9 +156,9 @@ pub struct FormatInfo {
     pub total_blocks: u32,
     /// 载荷字节数（RS 编码前）
     pub payload_bytes: u32,
-    /// 帧种类：I 帧(0) 或 P 帧(1)；v0.1 兼容：恒为 I
+    /// 帧种类：I 帧(0) 或 P 帧(1)
     pub frame_kind: FrameKind,
-    /// 编码模式位：二值=0，灰度=1；v0.1 兼容：恒为 0
+    /// 编码模式位：二值=0，灰度=1
     pub encoding_mode_bit: u8,
 }
 
@@ -196,7 +196,7 @@ impl FormatInfo {
         }
     }
 
-    /// 创建数据帧的格式信息（v0.1 兼容：I 帧 + 二值模式）
+    /// 创建数据帧的格式信息（便捷构造器：I 帧 + 二值模式）
     pub fn new_data_v01(seq: u16, block_index: u32, total_blocks: u32, payload_bytes: u32) -> Self {
         Self::new_data(seq, block_index, total_blocks, payload_bytes, FrameKind::I, 0)
     }

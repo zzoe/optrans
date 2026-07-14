@@ -16,9 +16,9 @@ pub const MODULES_PER_SIDE_DEFAULT: u32 = 200;
 
 /// 文件分块大小（字节）
 ///
-/// v0.6: payload_bytes 字段扩展到 16 bits 后，单块最大可达 65535 字节。
+/// payload_bytes 字段为 20 bits，单块最大可达 1,048,575 字节。
 /// 取 32768 (32KB) 作为默认块大小：
-/// - payload_bytes = 4(block_index) + 32768 = 32772 ≤ 65535 ✓
+/// - payload_bytes = 4(block_index) + 32768 = 32772 ≤ 1,048,575 ✓
 /// - RS 编码：32772 字节 → 152 个 RS 块 (152×217=32984 ≥ 32772)，冗余率 17%
 /// - 标准 2560×1600 全屏 module_pixels=4 时单帧容量约 27KB（二值）或更大（灰度）
 ///   32768 可能超过二值模式单帧容量，但灰度模式可容纳
@@ -37,15 +37,12 @@ pub const RS_PARITY_LEN: usize = 38;
 pub const RS_TOTAL_LEN: usize = 255;
 
 /// 默认帧间隔（毫秒）
-///
-/// 16 级灰度每帧 payload 大（~50KB RS 编码），渲染需更多时间。
-/// 200ms 给渲染和 Horizon 压缩留足余量。
-pub const FRAME_INTERVAL_MS: u64 = 200;
+pub const FRAME_INTERVAL_MS: u64 = 100;
 
 /// 最大文件名长度（UTF-8 字节）
 pub const MAX_FILE_NAME_LEN: usize = 255;
 
-/// 格式信息打包字节数（97 bits → 13 bytes，最后一个字节高7位为0）
+/// 格式信息打包字节数（104 bits → 13 bytes）
 pub const FORMAT_INFO_BYTES: usize = 13;
 
 /// CRC-16 追加后的字节数

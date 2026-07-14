@@ -97,7 +97,7 @@ impl Frame {
     ///
     /// 将多个数据块打包到一个帧中，填满 payload 容量。
     /// 载荷格式：[count: u16 LE][entries...]
-    /// 每个 entry：[block_index: u32 LE][data_len: u16 LE][data: data_len bytes]
+    /// 每个 entry：[block_index: u32 LE][data_len: u32 LE][data: data_len bytes]
     pub fn new_data_merged(
         blocks: &[&BlockData],
         seq: u16,
@@ -105,7 +105,7 @@ impl Frame {
         encoding_mode_bit: u8,
     ) -> OptransResult<Frame> {
         let payload_len: usize = 2 + blocks.iter()
-            .map(|b| 4 + 2 + b.data.len())
+            .map(|b| 4 + 4 + b.data.len())
             .sum::<usize>();
 
         let mut payload = Vec::with_capacity(payload_len);
@@ -114,7 +114,7 @@ impl Frame {
 
         for block in blocks {
             payload.extend_from_slice(&block.index.to_le_bytes());
-            let data_len = block.data.len() as u16;
+            let data_len = block.data.len() as u32;
             payload.extend_from_slice(&data_len.to_le_bytes());
             payload.extend_from_slice(&block.data);
         }
@@ -142,8 +142,8 @@ impl Frame {
         meta_payload: &[u8],
         blocks: &[&BlockData],
     ) -> OptransResult<Frame> {
-        let meta_entry_len = 4 + 2 + meta_payload.len(); // index(4) + len(2) + data
-        let data_len: usize = blocks.iter().map(|b| 4 + 2 + b.data.len()).sum();
+        let meta_entry_len = 4 + 4 + meta_payload.len(); // index(4) + len(4) + data
+        let data_len: usize = blocks.iter().map(|b| 4 + 4 + b.data.len()).sum();
         let payload_len = 2 + meta_entry_len + data_len; // 2B count
 
         let mut payload = Vec::with_capacity(payload_len);
@@ -158,7 +158,7 @@ impl Frame {
         // 数据 entries
         for block in blocks {
             payload.extend_from_slice(&block.index.to_le_bytes());
-            let dlen = block.data.len() as u16;
+            let dlen = block.data.len() as u32;
             payload.extend_from_slice(&dlen.to_le_bytes());
             payload.extend_from_slice(&block.data);
         }
@@ -326,5 +326,26 @@ mod tests {
         // P 帧 payload: 2B(base) + 2B(count) + 2×3B(entries) = 10B
         // RS 编码后: 4B header + 255B = 259B
         assert_eq!(frame.encoded_payload.len(), 4 + crate::common::constants::RS_TOTAL_LEN);
+    }
+
+    #[test]
+    fn test_new_data_merged_large_block_preserves_len() {
+        // Regression: block.data.len() > u16::MAX (65535) must not be truncated.
+        // 之前 data_len 编码为 u16，超过 65535 的块大小被静默截断，
+        // 导致接收端只读取部分数据 → SHA-256 校验失败。
+        let big_data = vec![0xCDu8; 70000]; // > 65535
+        let block = BlockData { index: 0, data: big_data.clone() };
+        let blocks: Vec<&BlockData> = vec![&block];
+        let frame = Frame::new_data_merged(&blocks, 1, 1, 1).unwrap();
+        // RS 解码后应得到原始 payload（含 2B count + 4B index + 4B len + data）
+        let encoder = RsEncoder::new();
+        let _ = encoder; // silence unused warning if any
+        let decoded = crate::decoder::reed_solomon::rs_decode_data(&frame.encoded_payload).unwrap();
+        assert_eq!(decoded.len(), 2 + 4 + 4 + 70000);
+        // 校验 data_len 字段（offset 6..10）等于 70000
+        let data_len = u32::from_le_bytes(decoded[6..10].try_into().unwrap());
+        assert_eq!(data_len as usize, 70000);
+        // 校验数据内容完整
+        assert_eq!(&decoded[10..], &big_data[..]);
     }
 }

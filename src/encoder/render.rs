@@ -172,7 +172,7 @@ fn encode_format_info_bits(info: &crate::common::types::FormatInfo, n_w: u32) ->
     let max_repetitions = format_area_modules / copy_bits; // 整数除，向下取整
     let repetitions = max_repetitions.min(5).max(1);
 
-    // 1. 打包 97 bits → 13 bytes
+    // 1. 打包 104 bits → 13 bytes
     let mut packed = vec![0u8; FORMAT_INFO_BYTES];
     pack_format_info(info, &mut packed);
 
@@ -201,14 +201,14 @@ fn encode_format_info_bits(info: &crate::common::types::FormatInfo, n_w: u32) ->
     bits
 }
 
-/// 将 FormatInfo 打包为 13 字节（100 bits）
+/// 将 FormatInfo 打包为 13 字节（104 bits）
 ///
-/// 位布局（v0.6：payload_bytes 从 13 bits 扩展到 16 bits）：
+/// 位布局：
 /// - bits 0-1:    frame_type (2b)
 /// - bits 2-17:   frame_sequence (16b)
 /// - bits 18-49:  block_index (32b)
 /// - bits 50-81:  total_blocks (32b)
-/// - bits 82-101: payload_bytes (20b) ← v0.24: 原 16b 扩展到 20b
+/// - bits 82-101: payload_bytes (20b)
 /// - bit  102:    frame_kind (1b)
 /// - bit  103:    encoding_mode_bit (1b)
 /// 总计：104 bits → 13 bytes
@@ -218,8 +218,8 @@ fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
     let bi = info.block_index as u128;
     let tb = info.total_blocks as u128;
     let pb = info.payload_bytes as u128;
-    let fk = info.frame_kind as u128; // bit 98
-    let emb = info.encoding_mode_bit as u128; // bit 99
+    let fk = info.frame_kind as u128; // bit 102
+    let emb = info.encoding_mode_bit as u128; // bit 103
 
     let mut val: u128 = 0;
     val |= ft; // bits 0-1
@@ -230,7 +230,7 @@ fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
     val |= fk << 102; // bit 102: frame_kind
     val |= emb << 103; // bit 103: encoding_mode_bit
 
-    // 100 bits → 13 bytes（小端序写入，剩余 4 bits 为 0）
+    // 104 bits → 13 bytes（小端序写入）
     for i in 0..13 {
         buf[i] = ((val >> (i * 8)) & 0xFF) as u8;
     }
@@ -431,9 +431,9 @@ mod tests {
         assert_eq!(((val >> 50) & 0xFFFF_FFFF) as u32, 500);
         // v0.24: payload_bytes 扩展到 20 bits
         assert_eq!(((val >> 82) & 0xFFFFF) as u32, 2000);
-        // v0.6: frame_kind=I(0) at bit 98, encoding_mode_bit=0 at bit 99
-        assert_eq!(((val >> 98) & 0x1) as u8, 0);
-        assert_eq!(((val >> 99) & 0x1) as u8, 0);
+        // frame_kind=I(0) at bit 102, encoding_mode_bit=0 at bit 103
+        assert_eq!(((val >> 102) & 0x1) as u8, 0);
+        assert_eq!(((val >> 103) & 0x1) as u8, 0);
     }
 
     #[test]

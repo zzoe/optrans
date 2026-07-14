@@ -457,7 +457,7 @@ mod tests {
         // 测试统一的 decode_gray_n 接口
         let data: Vec<u8> = vec![0xAB, 0xCD, 0x12, 0x34];
 
-        for levels in [2u32, 4, 5, 8, 16] {
+        for levels in [2u32, 4, 8, 16] {
             let config = crate::common::types::GrayEncodingConfig::new(levels);
             let (gray_values, original_len) =
                 crate::encoder::render::encode_gray_n(&data, &config);

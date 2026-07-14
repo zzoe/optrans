@@ -5,8 +5,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::common::constants::{RS_DATA_LEN, RS_TOTAL_LEN};
 use crate::common::error::{OptransError, OptransResult};
+use crate::common::rs_utils::rs_encoded_size;
 use crate::common::types::{
     DecodedFrame, DiffEntry, EncodingMode, FrameKind, FrameType, GrayEncodingConfig, IngestResult,
     MetaPayload,
@@ -139,16 +139,16 @@ impl FrameCollector {
         const META_BLOCK_INDEX: u32 = 0xFFFF_FFFF;
 
         for _ in 0..count {
-            if offset + 6 > payload.len() {
+            if offset + 8 > payload.len() {
                 return None;
             }
             let block_index = u32::from_le_bytes(
                 payload[offset..offset+4].try_into().ok()?
             );
-            let data_len = u16::from_le_bytes(
-                payload[offset+4..offset+6].try_into().ok()?
+            let data_len = u32::from_le_bytes(
+                payload[offset+4..offset+8].try_into().ok()?
             ) as usize;
-            offset += 6;
+            offset += 8;
             if offset + data_len > payload.len() {
                 return None;
             }
@@ -216,15 +216,12 @@ impl FrameCollector {
             _ => 2,
         };
 
-        // 计算 RS 编码后的字节数
-        let num_rs_blocks = i_payload_bytes.div_ceil(RS_DATA_LEN);
-        let encoded_bytes = 4 + num_rs_blocks * RS_TOTAL_LEN;
+        let encoded_bytes = rs_encoded_size(i_payload_bytes);
 
         // 计算需要的灰度模块数
         let needed_modules = match gray_levels {
             2 => encoded_bytes * 8,
             4 => encoded_bytes * 4,
-            5 => encoded_bytes.div_ceil(2) * 7,
             8 => (encoded_bytes * 8).div_ceil(3),
             16 => encoded_bytes * 2,
             _ => encoded_bytes * 8,
