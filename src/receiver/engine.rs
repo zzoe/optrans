@@ -304,9 +304,9 @@ fn run_capture_loop(
                     Ok(frame) => {
                         if matches!(frame.frame_type, FrameType::Meta | FrameType::Data)
                             && frame.payload.is_empty() { return; }
-                        if is_first && matches!(frame.frame_type, FrameType::Data) {
+                        if is_first {
                             let _ = locked_clone.set(loc);
-                            info!("✓ 首个有效帧解码成功，已锁定位置");
+                            info!("✓ 已锁定帧位置（跳过全屏扫描）");
                         }
                         let _ = tx_clone.send(frame);
                     }
