@@ -186,8 +186,7 @@ fn encode_format_info_bits(info: &crate::common::types::FormatInfo, n_w: u32) ->
 /// - bits 2-17:   frame_sequence (16b)
 /// - bits 18-49:  block_index (32b)
 /// - bits 50-81:  total_blocks (32b)
-/// - bits 82-101: payload_bytes (20b)
-/// - bit  102:    reserved (1b, 恒为 0)
+/// - bits 82-102: payload_bytes (21b)
 /// - bit  103:    encoding_mode_bit (1b)
 /// 总计：104 bits → 13 bytes
 fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
@@ -203,8 +202,7 @@ fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
     val |= seq << 2; // bits 2-17
     val |= bi << 18; // bits 18-49
     val |= tb << 50; // bits 50-81
-    val |= pb << 82; // bits 82-101 (20 bits)
-    // bit 102: reserved (0)
+    val |= pb << 82; // bits 82-102 (21 bits)
     val |= emb << 103; // bit 103: encoding_mode_bit
 
     // 104 bits → 13 bytes（小端序写入）
@@ -404,10 +402,9 @@ mod tests {
         assert_eq!(((val >> 2) & 0xFFFF) as u16, 42);
         assert_eq!(((val >> 18) & 0xFFFF_FFFF) as u32, 100);
         assert_eq!(((val >> 50) & 0xFFFF_FFFF) as u32, 500);
-        // v0.24: payload_bytes 扩展到 20 bits
-        assert_eq!(((val >> 82) & 0xFFFFF) as u32, 2000);
-        // bit 102 reserved (0), encoding_mode_bit=0 at bit 103
-        assert_eq!(((val >> 102) & 0x1) as u8, 0);
+        // payload_bytes 21 bits
+        assert_eq!(((val >> 82) & 0x1F_FFFF) as u32, 2000);
+        // encoding_mode_bit=0 at bit 103
         assert_eq!(((val >> 103) & 0x1) as u8, 0);
     }
 

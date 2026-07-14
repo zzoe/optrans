@@ -105,9 +105,8 @@ impl GrayEncodingConfig {
 /// - frame_sequence: 16 bits (bit 2-17)
 /// - block_index:    32 bits (bit 18-49)
 /// - total_blocks:   32 bits (bit 50-81)
-/// - payload_bytes:  20 bits (bit 82-101)
-///   (max 1,048,575，16 级灰度单帧可达 ~127KB)
-/// - reserved:       1 bit   (bit 102, 恒为 0)
+/// - payload_bytes:  21 bits (bit 82-102)
+///   (max 2,097,151，16 级灰度单帧可达 ~256KB)
 /// - encoding_mode_bit: 1 bit (bit 103)
 /// 总计：104 bits（13 bytes）
 #[derive(Debug, Clone)]

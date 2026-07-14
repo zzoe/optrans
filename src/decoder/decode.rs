@@ -385,8 +385,7 @@ fn unpack_format_info(data: &[u8]) -> OptransResult<FormatInfo> {
     let frame_sequence = ((val >> 2) & 0xFFFF) as u16;
     let block_index = ((val >> 18) & 0xFFFF_FFFF) as u32;
     let total_blocks = ((val >> 50) & 0xFFFF_FFFF) as u32;
-    let payload_bytes = ((val >> 82) & 0xFFFFF) as u32; // 20 bits
-    // bit 102: reserved（忽略）
+    let payload_bytes = ((val >> 82) & 0x1F_FFFF) as u32; // 21 bits
     let encoding_mode_bit = ((val >> 103) & 0x1) as u8;
 
     let frame_type = FrameType::from_u8(frame_type_raw).ok_or_else(|| {
@@ -442,14 +441,14 @@ mod tests {
     }
 
     #[test]
-    fn test_unpack_format_info_payload_20bit() {
-        // payload_bytes 为 20 bits，测试边界值 1,048,575 (2^20-1)
+    fn test_unpack_format_info_payload_21bit() {
+        // payload_bytes 为 21 bits，测试边界值 2,097,151 (2^21-1)
         let info = FormatInfo {
             frame_type: FrameType::Data,
             frame_sequence: 1,
             block_index: 0,
             total_blocks: 1,
-            payload_bytes: 1_048_575,
+            payload_bytes: 2_097_151,
             encoding_mode_bit: 0,
         };
 
@@ -466,7 +465,7 @@ mod tests {
         }
 
         let unpacked = unpack_format_info(&packed).unwrap();
-        assert_eq!(unpacked.payload_bytes, 1_048_575);
+        assert_eq!(unpacked.payload_bytes, 2_097_151);
     }
 
     #[test]
