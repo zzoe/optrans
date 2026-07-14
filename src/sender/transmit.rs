@@ -6,7 +6,6 @@
 //! 数据帧与校验帧交错发送，接收端收到任意 k 个分片即可恢复该组。
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::thread;
 
 use crate::common::constants;
@@ -165,10 +164,12 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
 
     // 5. 预构建元数据帧和 EOT 帧
     let meta_frame = Frame::new_metadata(&meta, 0)?;
-    // EOT seq = 1(meta) + 数据帧数 + 校验帧数
+    // EOT seq = 1(meta) + 数据帧数 + 校验帧数（wrapping 与 build_all_frames_interleaved 一致）
     let total_data_frames = count_data_frames(&manifest, max_payload_per_frame);
     let total_parity_frames = parity_shards.total_parity_count();
-    let eot_seq = 1u16 + total_data_frames as u16 + total_parity_frames as u16;
+    let eot_seq = 1u16
+        .wrapping_add(total_data_frames as u16)
+        .wrapping_add(total_parity_frames as u16);
     let eot_frame = Frame::new_eot(eot_seq)?;
 
     // 6. 创建全屏最大化窗口
@@ -234,7 +235,9 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
     drop(manifest);
 
     // ── 阶段 2: 渲染线程 (异步) + display loop (严格串行) ──
-    let (render_tx, render_rx) = mpsc::channel::<Vec<u8>>();
+    // 有界 channel（容量 2）：防止 display loop 变慢时渲染线程堆积像素缓冲区导致 OOM。
+    // 容量 2 保证渲染线程在 display loop 处理当前帧时能并行渲染下一帧，同时背压阻止堆积。
+    let (render_tx, render_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
 
     let render_gray = gray_config.clone();
     thread::spawn(move || {
@@ -367,11 +370,13 @@ fn build_parity_shards(
     let num_groups = fec_group_count(total_blocks) as usize;
     let mut groups: Vec<Vec<Vec<u8>>> = Vec::with_capacity(num_groups);
 
+    // 复用的零分片（不足 k 个的组用零补齐，避免重复分配）
+    let zero_shard = vec![0u8; block_size];
+
     for g in 0..num_groups {
         let start = g * k;
         let end = std::cmp::min(start + k, total_blocks);
 
-        // 构造等长数据分片（补零到 block_size）
         let mut data_shards: Vec<Vec<u8>> = Vec::with_capacity(k);
         for i in 0..k {
             if start + i < end {
@@ -379,8 +384,7 @@ fn build_parity_shards(
                 shard.resize(block_size, 0u8);
                 data_shards.push(shard);
             } else {
-                // 不足 k 个的组，用零分片补齐
-                data_shards.push(vec![0u8; block_size]);
+                data_shards.push(zero_shard.clone());
             }
         }
 
