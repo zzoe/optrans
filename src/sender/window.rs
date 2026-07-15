@@ -426,41 +426,26 @@ impl SenderWindow {
         true
     }
 
-    /// 休眠指定毫秒数同时处理消息
+    /// 在超时时间内处理消息并等待
     ///
-    /// v0.19.4: 用 `MsgWaitForMultipleObjects` 替代 `Sleep(10)` 轮询。
-    /// 线程在无消息时真正挂起直到超时到期，而非每 10ms 空转唤醒。
-    /// - 零 CPU 占用（对比之前每帧 ~15 次 `Sleep` 唤醒 + `PeekMessage`）
-    /// - 精确超时（对比 `Sleep(10)` 在默认 15.6ms 定时器分辨率下的显著超调）
+    /// 使用 `MsgWaitForMultipleObjects` 阻塞等待，线程在无消息时真正挂起，零 CPU 占用。
+    /// 消息到达时立即唤醒处理，确保 UI 响应性。
     ///
     /// 返回 `true` 如果应该继续运行，`false` 如果收到了退出消息。
-    pub fn sleep_with_messages(&self, ms: u64) -> bool {
-        let start = unsafe { ffi::GetTickCount() };
+    pub fn wait_with_message_pump(&self, ms: u64) -> bool {
         loop {
-            // 先处理已有消息
             if !self.process_messages() {
                 return false;
             }
-            let elapsed = unsafe { ffi::GetTickCount() } - start;
-            if elapsed >= ms as u32 {
-                break;
-            }
-            let remaining = (ms as u32).saturating_sub(elapsed);
-            if remaining == 0 {
-                break;
-            }
-            // 阻塞等待：消息到达或超时，线程挂起零 CPU
             let ret = unsafe {
                 ffi::MsgWaitForMultipleObjects(
                     0,
                     std::ptr::null(),
                     0,
-                    remaining,
+                    ms as u32,
                     ffi::QS_ALLINPUT,
                 )
             };
-            // WAIT_OBJECT_0 → 消息到达，继续循环处理
-            // WAIT_TIMEOUT → 超时，退出
             if ret != ffi::WAIT_OBJECT_0 {
                 break;
             }

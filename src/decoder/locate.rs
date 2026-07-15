@@ -5,11 +5,6 @@
 //! v0.5 新增：`locate_by_corners` — 从屏幕三个已知角落直接定位 finder pattern，
 //! 不再扫描全屏。原始 `locate_frame` 保留作为降级方案。
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use log::debug;
-
 use crate::common::types::{FinderPattern, FrameLocation};
 
 /// locate_frame 的诊断统计信息
@@ -19,27 +14,6 @@ pub struct LocateDiagnostics {
     pub candidates_found: usize,
     /// 垂直验证通过的候选点数量
     pub candidates_verified: usize,
-}
-
-/// 诊断日志时间戳（毫秒），用于限制每 2 秒最多输出一次
-static LAST_DIAG_MS: AtomicU64 = AtomicU64::new(0);
-
-/// 返回当前系统时间的毫秒表示
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// 频率限制诊断输出：每 2 秒最多一次
-fn diag_ratelimited(msg: &str) {
-    let now = now_ms();
-    let last = LAST_DIAG_MS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= 2000 {
-        LAST_DIAG_MS.store(now, Ordering::Relaxed);
-        debug!("{}", msg);
-    }
 }
 
 // ─── v0.5: 角落定位（推荐） ───
@@ -99,10 +73,6 @@ pub fn locate_by_corners(
 
     // 合理性检查
     if !(25..=1000).contains(&modules_w) || !(25..=1000).contains(&modules_h) {
-        diag_ratelimited(&format!(
-            "角落定位: modules 尺寸异常 ({}w×{}h)，跳过",
-            modules_w, modules_h
-        ));
         return None;
     }
 
@@ -284,15 +254,8 @@ pub fn locate_frame(pixels: &[u8], width: i32, height: i32) -> Option<FrameLocat
 
     // 第一步：扫描水平行，找 1:1:3:1:1 比例
     let candidates = find_finder_candidates(pixels, w, h);
-    let candidate_count = candidates.len();
 
     if candidates.len() < 3 {
-        if candidate_count > 0 {
-            diag_ratelimited(&format!(
-                "未找到足够的 Finder 候选点(找到 {} 个，需要 ≥3)",
-                candidate_count
-            ));
-        }
         return None;
     }
 
@@ -301,15 +264,6 @@ pub fn locate_frame(pixels: &[u8], width: i32, height: i32) -> Option<FrameLocat
         .into_iter()
         .filter(|fp| verify_finder_vertical(pixels, w, h, fp))
         .collect();
-    let verified_count = verified.len();
-
-    // 如果找到了候选但未通过垂直验证，输出诊断
-    if candidate_count >= 3 && verified_count < 3 {
-        diag_ratelimited(&format!(
-            "候选点未通过垂直验证(候选{}个, 通过{}个, 需要≥3)",
-            candidate_count, verified_count
-        ));
-    }
 
     if verified.len() < 3 {
         return None;
@@ -318,14 +272,6 @@ pub fn locate_frame(pixels: &[u8], width: i32, height: i32) -> Option<FrameLocat
     // 第三步：从验证过的候选中找到所有构成直角三角形的 finder pattern
     // 返回按像素面积降序排列的候选列表，取第一个（面积最大）
     let results = find_three_corners(&verified);
-
-    if results.is_empty() {
-        // 最终未能找到 3 个 corner 时，输出诊断
-        diag_ratelimited(&format!(
-            "验证通过但未能构成有效三角形(候选{}个, 验证通过{}个)",
-            candidate_count, verified_count
-        ));
-    }
 
     results.into_iter().next()
 }
@@ -669,25 +615,6 @@ fn find_three_corners(candidates: &[FinderCandidate]) -> Vec<FrameLocation> {
         search_triangles(cluster, &mut all_results);
     }
 
-    // 跨组诊断（限频）
-    if !all_results.is_empty() {
-        let frame_like_count = all_results.iter()
-            .filter(|(loc, _)| {
-                // v0.15: 放宽帧型范围，覆盖 FRAME_MARGIN_PX=120 的 580×340 及原始 640×400
-                loc.modules_w >= 550 && loc.modules_w <= 710
-                    && loc.modules_h >= 300 && loc.modules_h <= 460
-            })
-            .count();
-        let best = all_results.iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        if let Some((_, best_area)) = best {
-            diag_ratelimited(&format!(
-                "find_3c: {}群×{}候选, 三角组{}个, 640×400型{}个(best area={:.0})",
-                clusters.len(), n, all_results.len(), frame_like_count, best_area
-            ));
-        }
-    }
-
     // 排序：帧型候选始终排在前面（同类内按像素面积降序），
     // 确保真帧优先被 decode 尝试，不被面积更大的假帧抢位。
     // 剩下的按像素面积降序。
@@ -976,20 +903,6 @@ pub fn locate_frame_all_with_diag(
     if verified.len() < 3 {
         return Vec::new();
     }
-
-    // 诊断：module_size 分布（限频输出，确认真帧 finder 是否被检测到）
-    diag_ratelimited(&{
-        let mut buckets = [0usize; 9]; // [0,1), [1,2), ..., [8,9), [9+)
-        for v in &verified {
-            let idx = (v.module_size as usize).min(8);
-            buckets[idx] += 1;
-        }
-        format!(
-            "finder ms分布: [0-1):{} [1-2):{} [2-3):{} [3-4):{} [4-5):{} [5-6):{} [6-7):{} [7-8):{} [8+):{}",
-            buckets[0], buckets[1], buckets[2], buckets[3],
-            buckets[4], buckets[5], buckets[6], buckets[7], buckets[8],
-        )
-    });
 
     let diag = LocateDiagnostics {
         candidates_found: candidate_count,

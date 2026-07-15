@@ -11,9 +11,7 @@ use std::thread;
 use crate::common::constants;
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::fec::{FecEncoder, fec_group_count};
-use crate::common::types::{
-    BlockData, FileManifest, GrayEncodingConfig, MetaPayload,
-};
+use crate::common::types::{BlockData, FileManifest, GrayEncodingConfig, MetaPayload};
 use crate::encoder::frame::Frame;
 use crate::encoder::render::render_frame_default;
 use crate::sender::window::SenderWindow;
@@ -123,8 +121,7 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
     let block_size = max_payload_per_frame.saturating_sub(10);
 
     // 2. 读取文件并分块
-    let manifest =
-        crate::sender::chunker::read_file_with_block_size(Path::new(&path), block_size)?;
+    let manifest = crate::sender::chunker::read_file_with_block_size(Path::new(&path), block_size)?;
 
     let total_blocks = manifest.blocks.len() as u32;
     let fec_k = constants::FEC_DATA_SHARDS as u16;
@@ -173,8 +170,7 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
     let eot_frame = Frame::new_eot(eot_seq)?;
 
     // 6. 创建全屏最大化窗口
-    let mut window =
-        SenderWindow::create_sized(module_pixels, modules_w, modules_h, frame_margin)?;
+    let mut window = SenderWindow::create_sized(module_pixels, modules_w, modules_h, frame_margin)?;
 
     info!(
         "帧尺寸: {}w×{}h modules ({}×{}px, max_payload={}B)",
@@ -209,11 +205,8 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
         window.update_bitmap(&pixels);
         debug!("  [META] seq={}", meta_frame.sequence());
 
-        info!(
-            "□ 元数据帧已显示，{}ms 后开始发送...",
-            BOUNDARY_DWELL_MS
-        );
-        if !window.sleep_with_messages(BOUNDARY_DWELL_MS) {
+        info!("□ 元数据帧已显示，{}ms 后开始发送...", BOUNDARY_DWELL_MS);
+        if !window.wait_with_message_pump(BOUNDARY_DWELL_MS) {
             info!("用户中止发送");
             return Ok(());
         }
@@ -258,28 +251,14 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
     });
 
     // display loop: 严格串行，每帧 interval_ms
-    let mut last_frame_time = unsafe { crate::win32::ffi::GetTickCount() };
-    for (i, pixels) in render_rx.into_iter().enumerate() {
+    for pixels in render_rx.into_iter() {
         if !window.process_messages() {
             info!("用户中止发送");
             return Ok(());
         }
 
-        // 诊断：记录帧间隔
-        let now = unsafe { crate::win32::ffi::GetTickCount() };
-        let actual_interval = now.wrapping_sub(last_frame_time);
-        if actual_interval > (interval_ms as u32) * 2 {
-            debug!(
-                "  [帧间隔] 第 {} 帧实际间隔 {}ms（期望 {}ms），可能丢帧！",
-                i + 1,
-                actual_interval,
-                interval_ms
-            );
-        }
-        last_frame_time = now;
-
         window.update_bitmap(&pixels);
-        if !window.sleep_with_messages(interval_ms) {
+        if !window.wait_with_message_pump(interval_ms) {
             info!("用户中止发送");
             return Ok(());
         }
@@ -304,21 +283,8 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
     debug!("  [EOT] seq={}", eot_frame.sequence());
 
     // EOT 帧驻留，确保接收端有充足时间检测
-    info!(
-        "EOT 帧驻留 {}ms，等待接收端确认...",
-        BOUNDARY_DWELL_MS
-    );
-    let dwell_start = unsafe { crate::win32::ffi::GetTickCount() };
-    loop {
-        if !window.process_messages() {
-            break;
-        }
-        if (unsafe { crate::win32::ffi::GetTickCount() } - dwell_start) >= BOUNDARY_DWELL_MS as u32
-        {
-            break;
-        }
-        unsafe { crate::win32::ffi::Sleep(50) };
-    }
+    info!("EOT 帧驻留 {}ms，等待接收端确认...", BOUNDARY_DWELL_MS);
+    window.wait_with_message_pump(BOUNDARY_DWELL_MS);
     info!("发送完成，窗口即将关闭");
 
     Ok(())
@@ -359,10 +325,7 @@ impl ParityShards {
 /// 对文件数据块进行 FEC 编码，生成校验分片
 ///
 /// 每组 k 个数据块（最后一组不足 k 个时补零分片），生成 m 个校验分片。
-fn build_parity_shards(
-    manifest: &FileManifest,
-    block_size: usize,
-) -> OptransResult<ParityShards> {
+fn build_parity_shards(manifest: &FileManifest, block_size: usize) -> OptransResult<ParityShards> {
     let k = constants::FEC_DATA_SHARDS;
     let encoder = FecEncoder::new()?;
 
@@ -435,12 +398,8 @@ fn build_all_frames_interleaved(
             break;
         }
 
-        let frame = Frame::new_data_merged(
-            &merged_blocks,
-            global_seq,
-            total_blocks,
-            encoding_mode_bit,
-        )?;
+        let frame =
+            Frame::new_data_merged(&merged_blocks, global_seq, total_blocks, encoding_mode_bit)?;
         result.push(frame);
         global_seq = global_seq.wrapping_add(1);
     }

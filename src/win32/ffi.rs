@@ -288,9 +288,6 @@ unsafe extern "system" {
 
     /// 休眠指定毫秒数
     pub fn Sleep(dwMilliseconds: DWORD);
-
-    /// 获取当前滴答计数（毫秒）
-    pub fn GetTickCount() -> DWORD;
 }
 
 // ============================================================================
