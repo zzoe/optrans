@@ -55,7 +55,7 @@ fn frame_capacity_for_modules(
     modules_h: u32,
     gray_config: &GrayEncodingConfig,
 ) -> (u32, u32, usize) {
-    use crate::common::rs_utils::rs_payload_capacity;
+    use crate::common::reed_solomon_utils::rs_payload_capacity;
 
     let min_w = 194u32;
     let modules_w = modules_w.max(min_w);

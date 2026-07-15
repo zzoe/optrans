@@ -1,185 +1,281 @@
-# optrans 架构文档 v0.19
+# optrans 架构文档
 
-## 模块结构
+## 概述
+
+optrans 是一个基于屏幕视觉编码的文件传输工具。发送端将文件编码为全屏灰度帧序列，接收端通过截屏解码还原文件。适用于隔离网络间的单向文件传输场景（如远程桌面环境）。
+
+## 技术栈
+
+- **语言**: Rust 2024 Edition
+- **纠错码**: RS(255,217) 帧内纠错 + RS(192,128) 块级 FEC
+- **平台**: Windows（Win32 GDI）
+- **并发**: 多线程流水线，无异步运行时
+
+## 目录结构
 
 ```
 src/
-├── main.rs              # 入口，CLI 分派
-├── cli.rs               # 命令行定义 + 参数结构体
-├── common/
-│   ├── constants.rs     # 配置常量
-│   ├── types.rs         # 核心类型定义
-│   ├── error.rs         # 错误类型
-│   ├── crc.rs           # CRC-16 XMODEM
-│   └── mask.rs          # 位级 XOR 掩码
-├── encoder/
-│   ├── frame.rs         # 帧构建 (Meta/Data/EOT)
-│   ├── render.rs        # 帧渲染 (像素→位图)
-│   └── reed_solomon.rs  # RS(255,217) 编码
-├── decoder/
-│   ├── decode.rs        # 格式信息解码 + 完整帧解码
-│   ├── locate.rs        # finder pattern 定位 + 三角搜索
-│   ├── extract.rs       # 仿射变换 + 模块值提取
-│   └── reed_solomon.rs  # RS(255,217) 解码
-├── sender/
-│   ├── transmit.rs      # 发送编排 (分块→编码→循环显示)
-│   ├── window.rs        # Win32 全屏窗口
-│   └── chunker.rs       # 文件读取 + 分块
-├── receiver/
-│   ├── mod_impl.rs      # 接收主循环 (v0.19 流水线)
-│   ├── capture.rs       # GDI 全屏截屏
-│   ├── collect.rs       # 帧收集器 (去重)
-│   └── reassemble.rs    # 文件重组 + SHA-256 校验
-├── test_mode.rs         # 测试命令实现
-└── win32/
-    ├── ffi.rs           # Win32 FFI 绑定
-    └── helpers.rs       # Win32 辅助函数
+├── main.rs              # CLI 入口
+├── cli.rs               # 命令行参数解析（clap derive）
+├── lib.rs               # 库入口，导出公共 API
+├── common/              # 公共模块（类型、常量、工具）
+│   ├── constants.rs     # 全局常量（模块像素数、灰度级数、FEC 参数等）
+│   ├── types.rs         # 共享数据类型（帧类型、格式信息、元数据、数据块等）
+│   ├── error.rs         # 统一错误类型 OptransError
+│   ├── fec.rs           # 块级 FEC 编解码（RS(192,128) 纠删码）
+│   ├── crc.rs           # CRC-16/XMODEM 校验
+│   ├── mask.rs          # 位级 XOR 数据掩码
+│   ├── reed_solomon_utils.rs  # RS(255,217) 编码辅助工具（块数计算、容量计算）
+├── encoder/             # 编码器（帧构建与渲染）
+│   ├── pattern.rs       # Finder Pattern 生成与格式信息区标记
+│   ├── reed_solomon.rs  # RS(255,217) 帧内编码
+│   ├── frame.rs         # 帧组装（元数据帧、数据帧、EOT 帧、FEC 校验帧）
+│   └── render.rs        # 帧到 RGBA 像素缓冲区渲染（灰度编码）
+├── decoder/             # 解码器（截屏处理与帧解码）
+│   ├── locate.rs        # 帧定位（Finder Pattern 检测与仿射变换）
+│   ├── extract.rs       # 模块提取（二值/灰度采样）
+│   ├── reed_solomon.rs  # RS(255,217) 帧内解码
+│   └── decode.rs        # 帧解码（格式信息 + 载荷）
+├── sender/              # 发送端（文件读取与显示）
+│   ├── chunker.rs       # 文件读取、SHA-256 计算、分块
+│   ├── transmit.rs      # 发送编排（FEC 编码、帧构建、异步渲染）
+│   └── window.rs        # Win32 全屏窗口与 GDI 渲染
+├── receiver/            # 接收端（截屏与文件重组）
+│   ├── capture.rs       # Win32 全屏截屏
+│   ├── engine.rs        # 接收流水线引擎（capture → decode → aggregator）
+│   ├── collect.rs       # 帧收集器（去重、分类存储、FEC 恢复）
+│   └── reassemble.rs    # 文件组装器（排序拼接、SHA-256 校验、写文件）
+└── win32/               # Win32 平台相关
+    ├── ffi.rs           # Win32 API 绑定（窗口、GDI、截屏）
+    └── helpers.rs       # Win32 辅助函数（字符串转换、错误处理）
 ```
 
-## 发送流程
+## 模块职责说明
 
-```
-1. read_file(path) → FileManifest { blocks[], sha256, file_name, file_size }
-2. calculate_frame_capacity() → modules_w, modules_h, max_payload
-3. chunk data (block_size = max_payload - 8)
-4. create META frame → RS encode → render → display
-5. loop blocks:
-   a. Frame::new_data_merged([&block], seq, total) → Frame
-   b. RS encode → XOR mask → gray encode → render → update_bitmap
-   c. sleep(interval_ms)
-6. Frame::new_eot() → display
-```
+### common 模块
 
-### 帧构建 (Frame)
+| 文件           | 职责                                                                     |
+| -------------- | ------------------------------------------------------------------------ |
+| `constants.rs` | 集中管理所有可调参数（模块像素数、灰度级数、帧间隔、FEC 参数等）         |
+| `types.rs`     | 定义跨模块共享的数据结构（帧类型、格式信息、元数据、数据块、编码模式等） |
+| `error.rs`     | 统一错误类型 `OptransError`，覆盖所有可能的错误场景                      |
+| `fec.rs`       | 块级前向纠错，使用 RS(192,128) 纠删码，每组 128 数据块 + 64 校验块       |
+| `crc.rs`       | CRC-16/XMODEM 校验函数，用于格式信息的完整性验证                         |
+| `mask.rs`      | 位级 XOR 掩码，用于数据混淆，提高模块值分布的均匀性                      |
+| `rs_utils.rs`  | RS 编码辅助工具，包括块数计算、容量计算、多块合并格式处理                |
 
-```
-Data frame payload:
-  [2B count] [4B block_index] [2B data_len] [... data ...]
-  ↓
-  RS(255,217) encode: [4B total_len] [ceil(payload/217) × 255B]
-  ↓
-  XOR mask: 每字节异或位置相关的伪随机值
-  ↓
-  Gray encode: 每模块 n 比特 → 模块灰度值
-```
+### encoder 模块
 
-### 格式信息 (15 bytes)
+| 文件              | 职责                                                            |
+| ----------------- | --------------------------------------------------------------- |
+| `pattern.rs`      | 生成三个 Finder Pattern（7×7 QR-like 定位图案），标记格式信息区 |
+| `reed_solomon.rs` | RS(255,217) 帧内编码，217 数据码字 + 38 校验码字                |
+| `frame.rs`        | 帧组装，支持元数据帧、数据帧（多块合并）、EOT 帧、FEC 校验帧    |
+| `render.rs`       | 将帧渲染为 RGBA 像素缓冲区，支持 2/4/8/16 级灰度编码            |
 
-```
-bits:       [0..15] [16..47] [48..55] [56..63] [64..79] [80..95]
-fields:     unused  SHA-32   reserved   total_blocks frame_seq encoding_mode
-bits:       [96]    [97]
-fields:     merge_ext frame_type
-```
+### decoder 模块
 
-- 13B 数据 + 2B CRC-16
-- N 路重复 (N = min(5, floor(format_area / 120)))
-- 接收端 N 路多数投票 → CRC 校验 → 解包
+| 文件              | 职责                                                       |
+| ----------------- | ---------------------------------------------------------- |
+| `locate.rs`       | 帧定位，通过三个 Finder Pattern 计算帧角坐标和仿射变换参数 |
+| `extract.rs`      | 模块提取，从像素坐标映射到模块坐标，支持二值和灰度采样     |
+| `reed_solomon.rs` | RS(255,217) 帧内解码，可纠正单帧内最多 19 个字节错误       |
+| `decode.rs`       | 帧解码，包括格式信息解码（多数投票 + CRC 校验）和载荷解码  |
 
-### 数据掩码
+### sender 模块
 
-```rust
-fn mask_byte_at(index: usize) -> u8 {
-    // LCG 伪随机序列，零开销，确定性
-    (index.wrapping_mul(0x9E37_79B9).wrapping_add(0x9E37_79B9) >> 24) as u8
-}
-```
+| 文件          | 职责                                                    |
+| ------------- | ------------------------------------------------------- |
+| `chunker.rs`  | 文件读取、SHA-256 计算、按帧容量分块                    |
+| `transmit.rs` | 发送编排，包括块级 FEC 编码、帧构建、异步渲染、串行显示 |
+| `window.rs`   | Win32 无边框全屏窗口，GDI 位图渲染                      |
 
-## 接收流程 (v0.19 流水线)
+### receiver 模块
 
-```
-run_receive(args):
-  1. 创建 mpsc::channel<DecodedFrame>()
-  2. spawn aggregator 线程 (持有 rx)
-  3. run_capture_loop (主线程, 持有 tx)
+| 文件            | 职责                                                  |
+| --------------- | ----------------------------------------------------- |
+| `capture.rs`    | Win32 GDI BitBlt 全屏截屏，支持三级回退策略           |
+| `engine.rs`     | 接收流水线引擎，协调 capture、decode、aggregator 线程 |
+| `collect.rs`    | 帧收集器，去重、分类存储、FEC 恢复                    |
+| `reassemble.rs` | 文件组装器，按块索引排序拼接、SHA-256 校验、写文件    |
 
-capture_loop:
-  loop:
-    capture_full_screen() → (pixels, w, h)
-    
-    if locked_loc = OnceLock.get():
-      candidates = [locked_loc]
-    else:
-      candidates = locate_frame_all_with_diag(pixels, w, h)
-      if empty: heartbeat, continue
-    
-    for each candidate:
-      info = decode_format_info(pixels, loc)  # 快速 (~1ms)
-      if EOT:
-        tx.send(EOT_frame)
-        drop(tx)
-        return
-      if valid:
-        spawn decode_thread(loc, pixels, tx.clone(), Arc::clone(&OnceLock))
-    
-    # 不等待 decode 结果，立即下一轮 capture
+### win32 模块
 
-decode_thread:
-  frame = decode_frame(pixels, loc)  # 完整解码 (~7ms)
-  if success && !payload_empty:
-    if OnceLock 未设置:  # 首次成功 = 锁定帧位置
-      OnceLock.set(loc)
-    tx.send(frame)
-
-aggregator_thread:
-  collector = FrameCollector::new()
-  loop rx.recv():
-    match collector.ingest(frame):
-      NewMeta → 打印文件信息
-      NewBlock → 打印进度
-      EOT → is_complete? flush_file : Err
-      Duplicate/Invalid → skip
-  # rx close → flush_file
-```
-
-### 三角搜索 (locate)
-
-```
-1. find_finder_candidates(pixels) → 横向扫描 1:1:3:1:1
-2. verify_finder_vertical(pixels, fp) → 垂直验证 + 边缘检测
-   - 若 finder 下方存在黑边 (FRAME_MARGIN > 0 特征) → 跳过验证
-3. merge_nearby_candidates() → 去重合并
-4. cluster_by_module_size() → 按 ms 分组
-5. search_triangles(cluster) → O(n³)
-   - 每簇最多 200 三角组早退
-   - TR/BL 约束: |dy|/|dx_bl| < 5~10 模块
-6. 排序: 帧型优先 → 像素面积降序
-```
-
-### 帧锁定 (OnceLock)
-
-首次 decode 成功后，`FrameLocation` 写入 `Arc<OnceLock<FrameLocation>>`。
-后续 capture 循环直接用缓存坐标，跳过全屏扫描 (~0ms locate)。
+| 文件         | 职责                                             |
+| ------------ | ------------------------------------------------ |
+| `ffi.rs`     | Win32 API 绑定，不依赖外部 Windows crate         |
+| `helpers.rs` | Win32 辅助函数（字符串转换、错误处理、HDC 检查） |
 
 ## 数据流
 
+### 发送端
+
 ```
-Sender                           Screen              Receiver
-┌──────────┐                   ┌──────┐             ┌──────────────┐
-│ file.bin │                   │ GDI  │             │ GDI capture  │
-│    ↓     │                   │window│             │    ↓         │
-│ chunker  │ → RS → mask →    │ 帧  │  ───→       │ locate       │
-│    ↓     │   render → GDI    │图案 │  光路       │    ↓         │
-│  frames  │                   └──────┘             │ format_info  │
-│  [0..n]  │                                       │    ↓         │
-│    ↓     │                                       │ spawn decode │
-│  EOT     │                                       │    ↓         │
-└──────────┘                                       │ aggregator   │
-                                                   │    ↓         │
-                                                   │ flush file   │
-                                                   └──────────────┘
+文件 → chunker.read_file_with_block_size()
+       ├── 读取文件内容
+       ├── 计算 SHA-256
+       └── 按帧容量分块 → Vec<BlockData>
+
+→ transmit.run_send()
+       ├── fec.encode_groups() — 块级 FEC 编码
+       │   └── 每组 128 数据块 + 64 校验块
+       ├── frame.new_metadata_frame() — 构建元数据帧
+       ├── frame.new_data_frame() — 构建数据帧（多块合并）
+       ├── frame.new_parity_frame() — 构建 FEC 校验帧
+       └── frame.new_eot_frame() — 构建 EOT 帧
+
+→ render.render_frame()
+       ├── pattern 生成 Finder Pattern
+       ├── 格式信息编码（含 CRC）
+       ├── 灰度数据矩阵渲染
+       └── 心跳注入
+
+→ window 显示循环
+       └── 异步渲染线程 → 有界 channel → 串行显示
 ```
 
-## 关键设计决策
+### 接收端
 
-| 决策 | 理由 |
-|------|------|
-| RS(255,217) | 每 255B 块纠错 19B，抗屏幕噪声 |
-| XOR 掩码 | 打破重复数据模式，避免 DC 偏置影响视频压缩 |
-| 三角搜索早退 | O(n³) → 200上限，避免 479³ = 109M 迭代 |
-| 帧锁定 (OnceLock) | 首帧后复用坐标，从 ~50ms→0ms |
-| 线程池 vs 协程 | CPU 密集 (RS/仿射)，std::thread 更高效 |
-| capture 快速预判 | decode_format_info ~1ms，capture 不阻塞 |
-| decode 线程设锁 | 避免 CRC 碰撞假阳性 (1/65536) |
-| unbounded channel | capture 不等待 decode，吞吐优先 |
-| EOT 立即退出 | sender 不会再发数据，不等不重试 |
+```
+capture.capture_full_screen() → (pixels, width, height)
+
+→ engine.run_receive()
+       ├── Phase 1: 等待 Meta 帧
+       │   ├── locate.locate_frame_all_with_diag() — 全屏扫描
+       │   ├── decode.decode_format_info() — 提取格式信息
+       │   └── decode.decode_frame() — 完整解码
+       │       ├── extract.extract_data_modules() — 提取数据模块
+       │       └── reed_solomon.rs_decode_data() — RS 解码
+       │
+       ├── Phase 2: 锁定位置后捕获数据帧
+       │   ├── decode_format_info() — 快速预判（去重）
+       │   └── threadpool 并行 decode_frame()
+       │
+       └── aggregator (run_aggregator)
+           ├── collect.ingest() — 去重、分类存储
+           ├── collect.try_fec_recover() — FEC 恢复
+           └── reassemble.finalize_to_file() — 文件重组与校验
+```
+
+## 帧格式
+
+### 帧布局
+
+```
+┌────────────────────────────┐
+│  Finder Patterns (3×7×7)   │
+│  TL ──────────────── TR    │
+│  │                         │
+│  Format Info (顶2行)       │  ← CRC16 + 多数投票
+│  │                         │
+│  Data Modules              │  ← RS(255,217) + 灰度编码
+│  │                         │
+│  BL                        │
+└────────────────────────────┘
+```
+
+### 帧类型
+
+| 类型        | 值  | 说明                                              |
+| ----------- | --- | ------------------------------------------------- |
+| `Meta`      | 0   | 元数据帧：文件名、大小、SHA-256、总块数、FEC 参数 |
+| `Data`      | 1   | 数据帧：文件数据块（支持多块合并）                |
+| `EOT`       | 2   | 传输结束帧：空载荷                                |
+| `FecParity` | 3   | FEC 校验帧：块级 RS 纠删码校验分片                |
+
+### 格式信息（104 bits）
+
+| 字段                | 位数 | 说明                       |
+| ------------------- | ---- | -------------------------- |
+| `frame_type`        | 2    | 帧类型                     |
+| `frame_sequence`    | 16   | 帧序号（去重）             |
+| `block_index`       | 32   | 数据块索引                 |
+| `total_blocks`      | 32   | 总数据块数                 |
+| `payload_bytes`     | 21   | 载荷字节数                 |
+| `encoding_mode_bit` | 1    | 编码模式（0=二值，1=灰度） |
+
+### 元数据帧载荷
+
+| 字段             | 长度 | 说明                     |
+| ---------------- | ---- | ------------------------ |
+| `name_len`       | 1B   | 文件名长度               |
+| `file_name`      | N B  | 文件名（UTF-8）          |
+| `file_size`      | 8B   | 文件大小（LE）           |
+| `sha256`         | 32B  | 文件哈希值               |
+| `total_blocks`   | 4B   | 总数据块数（LE）         |
+| `fec_k`          | 2B   | FEC 每组数据分片数（LE） |
+| `fec_m`          | 2B   | FEC 每组校验分片数（LE） |
+| `fec_groups`     | 4B   | FEC 组数（LE）           |
+| `fec_shard_size` | 4B   | FEC 分片长度（LE）       |
+
+### 数据帧载荷（多块合并）
+
+| 字段             | 长度   | 说明           |
+| ---------------- | ------ | -------------- |
+| `count`          | 2B     | 块数量（LE）   |
+| `block_index[N]` | 4B × N | 块索引（LE）   |
+| `data_len[N]`    | 4B × N | 数据长度（LE） |
+| `data[N]`        | 变长   | 块数据         |
+
+## 关键特性
+
+### RS(255,217) 帧内纠错
+
+- 每帧数据经过 RS(255,217) 编码
+- 217 数据码字 + 38 校验码字
+- 可纠正单帧内最多 19 个字节错误
+
+### 块级 FEC
+
+- RS(192,128) 纠删码
+- 每组 128 数据分片 + 64 校验分片
+- 容错率 33%，收到任意 128 个分片即可恢复
+
+### 灰度编码
+
+| 灰度级数 | Bits/Module | 说明              |
+| -------- | ----------- | ----------------- |
+| 2        | 1           | 二值模式          |
+| 4        | 2           | 4 级灰度          |
+| 8        | 3           | 8 级灰度          |
+| 16       | 4           | 16 级灰度（默认） |
+
+### 格式信息 N 路多数投票
+
+- 根据帧宽动态计算重复次数（最多 5×）
+- 多数投票 + CRC 校验，抵抗远程桌面视频压缩噪声
+- CRC 失败时尝试平移 ±1 像素和不同采样半径
+
+### 异步渲染 + 串行显示
+
+- 渲染线程通过有界 channel（容量 2）发送像素
+- 显示循环严格串行输出，防止画面撕裂
+- 背压机制：渲染线程阻塞直到 channel 有空闲
+
+## 性能特性
+
+- **发送端**: 异步渲染 + 串行显示，避免渲染积压
+- **接收端**: 流水线架构，capture 全速运行，decode 使用线程池并行处理
+- **内存**: 每帧像素通过 Arc 共享，避免大内存拷贝
+- **帧率**: 发送端固定帧间隔（默认 100ms），接收端全速截屏
+
+## 错误处理
+
+- **格式信息错误**: CRC 校验失败 → 尝试平移和不同采样半径 → 最终返回错误
+- **帧解码错误**: RS 解码失败 → 返回错误，不影响其他帧
+- **漏帧检测**: 帧序号不连续 → 警告日志，依赖 FEC 恢复
+- **文件完整性**: SHA-256 校验，不匹配则拒绝写入
+
+## 可配置参数
+
+所有参数位于 `src/common/constants.rs`：
+
+| 参数                       | 默认值 | 说明                      |
+| -------------------------- | ------ | ------------------------- |
+| `MODULE_PIXELS_DEFAULT`    | 4      | 每模块像素数（2-8，偶数） |
+| `MODULES_PER_SIDE_DEFAULT` | 200    | 默认每边模块数            |
+| `FRAME_INTERVAL_MS`        | 100    | 帧间隔毫秒                |
+| `GRAY_LEVELS_DEFAULT`      | 16     | 灰度级数                  |
+| `FRAME_MARGIN_PX_DEFAULT`  | 20     | 帧边距像素                |
+| `FEC_DATA_SHARDS`          | 128    | FEC 每组数据分片数        |
+| `FEC_PARITY_SHARDS`        | 64     | FEC 每组校验分片数        |

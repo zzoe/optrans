@@ -51,8 +51,8 @@ pub const SRCCOPY: u32 = 0x00CC0020;
 
 /// 发送端编码图案四周的空白边距（像素）。
 ///
-/// 默认 20px：提供少量边缘分离，避免 finder 紧贴屏幕边缘时因亚像素
-/// 抖动导致的边界效应。远程桌面场景（Horizon/Citrix）需通过 --frame-margin 增大。
+/// 默认 20px：提供边缘分离，帮助接收端定位时区分屏幕边缘与帧边界。
+/// 接收端 `locate_by_corners` 使用相同值计算 finder pattern 的预期位置。
 pub const FRAME_MARGIN_PX_DEFAULT: u32 = 20;
 
 // ─── 心跳参数 ───

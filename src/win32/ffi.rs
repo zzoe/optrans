@@ -72,23 +72,16 @@ pub const NULL: isize = 0;
 // 窗口样式
 pub const WS_POPUP: DWORD = 0x80000000;
 pub const WS_VISIBLE: DWORD = 0x10000000;
-pub const WS_SYSMENU: DWORD = 0x00080000;
 pub const WS_EX_TOPMOST: DWORD = 0x00000008;
 
 // 窗口消息
 pub const WM_PAINT: UINT = 0x000F;
 pub const WM_CLOSE: UINT = 0x0010;
 pub const WM_DESTROY: UINT = 0x0002;
-pub const WM_KEYDOWN: UINT = 0x0100;
 pub const WM_QUIT: UINT = 0x0012;
-pub const WM_CREATE: UINT = 0x0001;
-pub const WM_SIZE: UINT = 0x0005;
 pub const WM_ERASEBKGND: UINT = 0x0014;
 pub const WM_SETCURSOR: UINT = 0x0020;
 pub const WM_WINDOWPOSCHANGING: UINT = 0x0046;
-
-// 虚拟键码
-pub const VK_ESCAPE: i32 = 0x1B;
 
 // ShowWindow 命令
 pub const SW_SHOW: i32 = 5;

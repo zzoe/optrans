@@ -2,12 +2,14 @@
 //!
 //! 解析 CLI 参数并分派到发送端或接收端逻辑。
 
+use chrono::Local;
 use log::info;
 use optrans::cli::{self, Command};
 use optrans::common::constants;
 use optrans::common::error::OptransResult;
-use optrans::common::types::{validate_module_pixels, EncodingMode};
+use optrans::common::types::validate_module_pixels;
 use optrans::win32::ffi;
+use std::io::Write;
 
 /// 声明进程 DPI 感知，使 GetSystemMetrics 返回物理像素而非逻辑像素。
 fn enable_dpi_awareness() {
@@ -15,7 +17,20 @@ fn enable_dpi_awareness() {
 }
 
 fn main() -> OptransResult<()> {
-    pretty_env_logger::init_timed();
+    pretty_env_logger::formatted_timed_builder()
+        .filter_level(log::LevelFilter::Info)
+        .format(|buf, record| {
+            let ts = Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z");
+            writeln!(
+                buf,
+                " {} {:>5} {} > {}",
+                ts,
+                record.level(),
+                record.target(),
+                record.args()
+            )
+        })
+        .init();
     enable_dpi_awareness();
     let cmd = cli::parse_command();
 
@@ -33,15 +48,13 @@ fn main() -> OptransResult<()> {
         }
         Command::Receive { output } => {
             validate_module_pixels(constants::MODULE_PIXELS_DEFAULT)?;
-            let encoding_mode = EncodingMode::Auto;
             info!("接收模式");
             match &output {
                 Some(p) => info!("  输出: {:?}", p),
                 None => info!("  输出: <从发送端元数据解析>"),
             }
             info!("  模块像素: {}", constants::MODULE_PIXELS_DEFAULT);
-            info!("  编码模式: {:?}", encoding_mode);
-            optrans::receiver::engine::run_receive(output, encoding_mode)
+            optrans::receiver::engine::run_receive(output)
         }
     }
 }

@@ -101,8 +101,3 @@ pub fn check_hdc(hdc: ffi::HDC) -> crate::common::error::OptransResult<ffi::HDC>
     }
     Ok(hdc)
 }
-
-/// 将 RGB 值转换为 COLORREF（0x00BBGGRR 格式）
-pub fn rgb_to_colorref(r: u8, g: u8, b: u8) -> ffi::COLORREF {
-    (r as ffi::COLORREF) | ((g as ffi::COLORREF) << 8) | ((b as ffi::COLORREF) << 16)
-}

@@ -43,9 +43,7 @@ pub fn read_file_with_block_size(path: &Path, block_size: usize) -> OptransResul
         .file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| {
-            OptransError::InvalidArgument(format!("无法获取文件名: {:?}", path))
-        })?;
+        .ok_or_else(|| OptransError::InvalidArgument(format!("无法获取文件名: {:?}", path)))?;
 
     // 读取文件内容
     let data = fs::read(path)?;
@@ -68,12 +66,6 @@ pub fn read_file_with_block_size(path: &Path, block_size: usize) -> OptransResul
         sha256,
         blocks,
     })
-}
-
-/// 将数据按固定大小分块（使用默认 BLOCK_SIZE）
-#[allow(dead_code)]
-fn chunk_data(data: &[u8]) -> Vec<BlockData> {
-    chunk_data_with_size(data, BLOCK_SIZE)
 }
 
 /// 将数据按指定大小分块
@@ -154,14 +146,14 @@ mod tests {
 
     #[test]
     fn test_chunk_data_empty() {
-        let blocks = chunk_data(&[]);
+        let blocks = chunk_data_with_size(&[], BLOCK_SIZE);
         assert!(blocks.is_empty());
     }
 
     #[test]
     fn test_chunk_data_exact_block() {
         let data = vec![0u8; BLOCK_SIZE];
-        let blocks = chunk_data(&data);
+        let blocks = chunk_data_with_size(&data, BLOCK_SIZE);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].data.len(), BLOCK_SIZE);
     }

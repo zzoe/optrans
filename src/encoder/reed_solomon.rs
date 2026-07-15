@@ -5,7 +5,7 @@
 
 use crate::common::constants::{RS_DATA_LEN, RS_PARITY_LEN};
 use crate::common::error::OptransResult;
-use crate::common::rs_utils::rs_block_count;
+use crate::common::reed_solomon_utils::rs_block_count;
 use reed_solomon::Encoder;
 
 /// RS(255,217) 编码器
@@ -42,7 +42,7 @@ impl RsEncoder {
             return Ok(output);
         }
 
-        let output_size = crate::common::rs_utils::rs_encoded_size(data.len());
+        let output_size = crate::common::reed_solomon_utils::rs_encoded_size(data.len());
         let mut output = Vec::with_capacity(output_size);
 
         // 写入总长度头（小端序）

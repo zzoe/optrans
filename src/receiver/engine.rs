@@ -13,11 +13,10 @@ use std::sync::{
 };
 use std::thread;
 
-use log::{debug, info, warn};
+use log::{info, warn};
 
 use crate::common::error::{OptransError, OptransResult};
-use crate::common::types::EncodingMode;
-use crate::common::types::{DecodedFrame, FrameLocation, FrameType, IngestResult};
+use crate::common::types::{DecodedFrame, EncodingMode, FrameLocation, FrameType, IngestResult};
 use crate::decoder::decode::{decode_format_info, decode_frame};
 use crate::decoder::locate::locate_frame_all_with_diag;
 use crate::receiver::capture::capture_full_screen;
@@ -25,14 +24,10 @@ use crate::receiver::collect::FrameCollector;
 use crate::receiver::reassemble::FileAssembler;
 
 /// 执行接收操作的主入口（v0.19: 流水线架构）
-pub fn run_receive(
-    output: Option<std::path::PathBuf>,
-    encoding_mode: EncodingMode,
-) -> OptransResult<()> {
+pub fn run_receive(output: Option<std::path::PathBuf>) -> OptransResult<()> {
     info!("开始接收...");
     info!("截屏模式: 全屏（Ctrl+C 退出）");
     info!("定位模式: 全屏扫描 → 帧锁定");
-    info!("编码模式: {:?}", encoding_mode);
     info!("流水线: capture → decode线程池 → aggregator");
     info!("正在扫描屏幕，等待发送端信号...");
 
@@ -52,7 +47,7 @@ pub fn run_receive(
     });
 
     // ── capture 循环 ──
-    let result = run_capture_loop(tx, &encoding_mode, &done);
+    let result = run_capture_loop(tx, &done);
 
     // ── 等 aggregator 结束 ──
     match aggregator.join() {
@@ -111,7 +106,7 @@ fn run_aggregator(
                         );
                     }
                     Ok(IngestResult::NewParity(g, p)) => {
-                        debug!("FEC 校验分片 组={} 序号={}", g, p);
+                        info!("FEC 校验分片 组={} 序号={}", g, p);
                     }
                     Ok(IngestResult::EotReceived) => {
                         info!("收到 EOT 信号");
@@ -169,13 +164,11 @@ fn finalize_transfer(
                 )))
             }
         }
-        Err(e) => {
-            Err(OptransError::FrameDecode(format!(
-                "FEC 恢复失败: {}（缺失 {} 块）",
-                e,
-                missing.len()
-            )))
-        }
+        Err(e) => Err(OptransError::FrameDecode(format!(
+            "FEC 恢复失败: {}（缺失 {} 块）",
+            e,
+            missing.len()
+        ))),
     }
 }
 
@@ -225,32 +218,41 @@ fn flush_and_write(
 
 fn run_capture_loop(
     tx: mpsc::Sender<DecodedFrame>,
-    encoding_mode: &EncodingMode,
     done: &AtomicBool,
 ) -> OptransResult<()> {
     let pool = threadpool::ThreadPool::new(2);
-    let enc_mode = encoding_mode.clone();
 
     // ═══ Phase 1: 等待 Meta 帧 → 锁定位置 ═══
     let mut meta_loc: Option<FrameLocation> = None;
     loop {
-        if done.load(Ordering::SeqCst) { drop(tx); return Ok(()); }
+        if done.load(Ordering::SeqCst) {
+            drop(tx);
+            return Ok(());
+        }
 
         let (pixels, img_w, img_h) = match capture_full_screen() {
             Ok(r) => r,
-            Err(e) => { warn!("截屏失败: {}，重试...", e); continue; }
+            Err(e) => {
+                warn!("截屏失败: {}，重试...", e);
+                continue;
+            }
         };
 
         let candidates = locate_frame_all_with_diag(&pixels, img_w, img_h);
-        if candidates.is_empty() { continue; }
+        if candidates.is_empty() {
+            continue;
+        }
 
         let pixels_arc = Arc::new(pixels);
         let mut found = false;
         for (loc, _) in &candidates {
             if let Ok(info) = decode_format_info(&pixels_arc, img_w, img_h, loc) {
-                if info.frame_type != FrameType::Meta { continue; }
-                if let Ok(frame) = decode_frame(&pixels_arc, img_w, img_h, loc, &enc_mode) {
+                if info.frame_type != FrameType::Meta {
+                    continue;
+                }
+                if let Ok(frame) = decode_frame(&pixels_arc, img_w, img_h, loc, &EncodingMode::Auto) {
                     if !frame.payload.is_empty() {
+                        info!("编码模式: {:?}", frame.encoding_mode);
                         let _ = tx.send(frame);
                         meta_loc = Some(loc.clone());
                         found = true;
@@ -273,11 +275,17 @@ fn run_capture_loop(
     //   - seq > last + 1 → 中间有帧未截到 → 漏帧告警
     let mut last_seq: Option<u16> = None;
     loop {
-        if done.load(Ordering::SeqCst) { drop(tx); return Ok(()); }
+        if done.load(Ordering::SeqCst) {
+            drop(tx);
+            return Ok(());
+        }
 
         let (pixels, img_w, img_h) = match capture_full_screen() {
             Ok(r) => r,
-            Err(e) => { warn!("截屏失败: {}，重试...", e); continue; }
+            Err(e) => {
+                warn!("截屏失败: {}，重试...", e);
+                continue;
+            }
         };
 
         let info = match decode_format_info(&pixels, img_w, img_h, &loc) {
@@ -301,7 +309,9 @@ fn run_capture_loop(
                     let missed = last.wrapping_add(1);
                     warn!(
                         "⚠ 漏帧检测: 期望 seq={}，实际截到 seq={}（跳过 {} 帧）",
-                        missed, seq, seq.wrapping_sub(missed)
+                        missed,
+                        seq,
+                        seq.wrapping_sub(missed)
                     );
                 }
                 // seq == last + 1: 正常递增
@@ -316,7 +326,8 @@ fn run_capture_loop(
                 let _ = tx.send(DecodedFrame {
                     frame_type: FrameType::EOT,
                     frame_sequence: info.frame_sequence,
-                    block_index: 0, total_blocks: 0,
+                    block_index: 0,
+                    total_blocks: 0,
                     payload: Vec::new(),
                     encoding_mode: EncodingMode::Binary,
                 });
@@ -324,11 +335,10 @@ fn run_capture_loop(
             }
             FrameType::Data | FrameType::FecParity => {
                 let pixels_arc = Arc::new(pixels);
-                let enc = enc_mode.clone();
                 let tx_c = tx.clone();
                 let lloc = loc.clone();
                 pool.execute(move || {
-                    if let Ok(frame) = decode_frame(&pixels_arc, img_w, img_h, &lloc, &enc) {
+                    if let Ok(frame) = decode_frame(&pixels_arc, img_w, img_h, &lloc, &EncodingMode::Auto) {
                         if !frame.payload.is_empty() {
                             let _ = tx_c.send(frame);
                         }

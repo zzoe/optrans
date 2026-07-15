@@ -43,8 +43,7 @@ pub enum EncodingMode {
     Gray(u32),
 }
 
-impl EncodingMode {
-}
+
 
 // ─── 灰度编码配置 ───
 

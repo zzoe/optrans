@@ -317,7 +317,8 @@ pub fn inject_heartbeat(
         for px in 0..size {
             let x = start_x + px;
             let y = start_y + py;
-            if x < img_width && y < img_width {
+            let img_height = pixels.len() / (img_width * RGBA_CHANNELS);
+            if x < img_width && y < img_height {
                 let idx = (y * img_width + x) * RGBA_CHANNELS;
                 if idx + 3 < pixels.len() {
                     pixels[idx] = hb_gray;

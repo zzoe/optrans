@@ -5,7 +5,7 @@
 
 use crate::common::constants::{RS_DATA_LEN, RS_PARITY_LEN, RS_TOTAL_LEN};
 use crate::common::error::{OptransError, OptransResult};
-use crate::common::rs_utils::rs_block_count;
+use crate::common::reed_solomon_utils::rs_block_count;
 use reed_solomon::Decoder;
 
 /// RS(255,217) 解码器

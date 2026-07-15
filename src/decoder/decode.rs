@@ -6,7 +6,7 @@
 
 use crate::common::crc::crc16_xmodem;
 use crate::common::error::{OptransError, OptransResult};
-use crate::common::rs_utils::rs_encoded_size;
+use crate::common::reed_solomon_utils::rs_encoded_size;
 use crate::common::types::{
     DecodedFrame, EncodingMode, FinderPattern, FormatInfo, FrameLocation,
     FrameType, GrayEncodingConfig, MetaPayload,
