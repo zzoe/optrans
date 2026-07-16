@@ -63,58 +63,58 @@ pub type WNDPROC = Option<
 // ============================================================================
 
 /// 通用布尔值
-pub const FALSE: BOOL = 0;
-pub const TRUE: BOOL = 1;
+pub(crate) const FALSE: BOOL = 0;
+pub(crate) const TRUE: BOOL = 1;
 
 /// NULL 句柄/指针
-pub const NULL: isize = 0;
+pub(crate) const NULL: isize = 0;
 
 // 窗口样式
-pub const WS_POPUP: DWORD = 0x80000000;
-pub const WS_VISIBLE: DWORD = 0x10000000;
-pub const WS_EX_TOPMOST: DWORD = 0x00000008;
+pub(crate) const WS_POPUP: DWORD = 0x80000000;
+pub(crate) const WS_VISIBLE: DWORD = 0x10000000;
+pub(crate) const WS_EX_TOPMOST: DWORD = 0x00000008;
 
 // 窗口消息
-pub const WM_PAINT: UINT = 0x000F;
-pub const WM_CLOSE: UINT = 0x0010;
-pub const WM_DESTROY: UINT = 0x0002;
-pub const WM_QUIT: UINT = 0x0012;
-pub const WM_ERASEBKGND: UINT = 0x0014;
-pub const WM_SETCURSOR: UINT = 0x0020;
-pub const WM_WINDOWPOSCHANGING: UINT = 0x0046;
+pub(crate) const WM_PAINT: UINT = 0x000F;
+pub(crate) const WM_CLOSE: UINT = 0x0010;
+pub(crate) const WM_DESTROY: UINT = 0x0002;
+pub(crate) const WM_QUIT: UINT = 0x0012;
+pub(crate) const WM_ERASEBKGND: UINT = 0x0014;
+pub(crate) const WM_SETCURSOR: UINT = 0x0020;
+pub(crate) const WM_WINDOWPOSCHANGING: UINT = 0x0046;
 
 // ShowWindow 命令
-pub const SW_SHOW: i32 = 5;
-pub const SW_HIDE: i32 = 0;
+pub(crate) const SW_SHOW: i32 = 5;
+pub(crate) const SW_HIDE: i32 = 0;
 
 // 窗口定位
-pub const HWND_TOPMOST: HWND = -1;
-pub const SWP_NOMOVE: UINT = 0x0002;
-pub const SWP_NOSIZE: UINT = 0x0001;
-pub const SWP_SHOWWINDOW: UINT = 0x0040;
-pub const SWP_NOZORDER: UINT = 0x0004;
+pub(crate) const HWND_TOPMOST: HWND = -1;
+pub(crate) const SWP_NOMOVE: UINT = 0x0002;
+pub(crate) const SWP_NOSIZE: UINT = 0x0001;
+pub(crate) const SWP_SHOWWINDOW: UINT = 0x0040;
+pub(crate) const SWP_NOZORDER: UINT = 0x0004;
 
 // 系统指标
-pub const SM_CXSCREEN: i32 = 0;
-pub const SM_CYSCREEN: i32 = 1;
+pub(crate) const SM_CXSCREEN: i32 = 0;
+pub(crate) const SM_CYSCREEN: i32 = 1;
 
 // 位图相关
-pub const BI_RGB: DWORD = 0;
-pub const DIB_RGB_COLORS: UINT = 0;
+pub(crate) const BI_RGB: DWORD = 0;
+pub(crate) const DIB_RGB_COLORS: UINT = 0;
 
 // 窗口类样式
-pub const CS_HREDRAW: UINT = 0x0002;
-pub const CS_VREDRAW: UINT = 0x0001;
-pub const CS_OWNDC: UINT = 0x0020;
+pub(crate) const CS_HREDRAW: UINT = 0x0002;
+pub(crate) const CS_VREDRAW: UINT = 0x0001;
+pub(crate) const CS_OWNDC: UINT = 0x0020;
 
 // PeekMessage 标志
-pub const PM_REMOVE: UINT = 0x0001;
+pub(crate) const PM_REMOVE: UINT = 0x0001;
 
 // MsgWaitForMultipleObjects 返回值
-pub const WAIT_OBJECT_0: DWORD = 0;
+pub(crate) const WAIT_OBJECT_0: DWORD = 0;
 
 // MsgWaitForMultipleObjects 唤醒掩码：任意消息类型
-pub const QS_ALLINPUT: UINT = 0x04FF;
+pub(crate) const QS_ALLINPUT: UINT = 0x04FF;
 
 // ============================================================================
 // 结构体
@@ -519,13 +519,13 @@ unsafe extern "system" {
 // 格式化消息常量
 // ============================================================================
 
-pub const FORMAT_MESSAGE_ALLOCATE_BUFFER: DWORD = 0x00000100;
-pub const FORMAT_MESSAGE_FROM_SYSTEM: DWORD = 0x00001000;
-pub const FORMAT_MESSAGE_IGNORE_INSERTS: DWORD = 0x00000200;
-pub const LANG_NEUTRAL: DWORD = 0x00;
-pub const SUBLANG_DEFAULT: DWORD = 0x01;
+pub(crate) const FORMAT_MESSAGE_ALLOCATE_BUFFER: DWORD = 0x00000100;
+pub(crate) const FORMAT_MESSAGE_FROM_SYSTEM: DWORD = 0x00001000;
+pub(crate) const FORMAT_MESSAGE_IGNORE_INSERTS: DWORD = 0x00000200;
+pub(crate) const LANG_NEUTRAL: DWORD = 0x00;
+pub(crate) const SUBLANG_DEFAULT: DWORD = 0x01;
 
 /// 组合语言 ID
-pub const fn MAKELANGID(primary: DWORD, sub: DWORD) -> DWORD {
+pub(crate) const fn MAKELANGID(primary: DWORD, sub: DWORD) -> DWORD {
     (sub << 10) | primary
 }

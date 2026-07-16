@@ -3,14 +3,30 @@
 //! 将 Frame 渲染为 RGBA 像素缓冲区，用于窗口显示。
 //! v0.5: 支持长方形帧，render_frame 接受 (modules_w, modules_h) 双维度参数。
 
-use crate::common::constants::{
-    HEARTBEAT_BASE_GRAY, HEARTBEAT_DELTA, HEARTBEAT_PIXEL_SIZE,
-    RGBA_CHANNELS,
-};
+use crate::common::constants::RGBA_CHANNELS;
 use crate::common::crc::crc16_xmodem;
 use crate::common::types::GrayEncodingConfig;
 use crate::encoder::frame::Frame;
 use crate::encoder::pattern::{generate_finder_pattern, is_finder_module, is_format_module};
+
+/// 格式信息打包字节数（104 bits → 13 bytes）
+const FORMAT_INFO_BYTES: usize = 13;
+
+/// CRC-16 追加后的字节数
+const FORMAT_INFO_WITH_CRC: usize = 15;
+
+/// 默认每边模块数（仅测试用）
+#[cfg(test)]
+const MODULES_PER_SIDE_DEFAULT: u32 = 200;
+
+/// 心跳像素块尺寸
+const HEARTBEAT_PIXEL_SIZE: u32 = 2;
+
+/// 心跳变化幅度
+const HEARTBEAT_DELTA: u8 = 1;
+
+/// 心跳基准灰度值
+const HEARTBEAT_BASE_GRAY: u8 = 128;
 
 /// 将帧渲染为 RGBA 像素缓冲区
 ///
@@ -138,11 +154,6 @@ fn format_module_index(col: usize, row: usize, n_w: usize, n_h: usize) -> usize 
 /// v0.13: 动态重复次数。当格式信息区 ≥600 模块时使用 5× 重复（更抗视频压缩噪声），
 /// 否则使用 3× 重复（兼容窄帧）。
 fn encode_format_info_bits(info: &crate::common::types::FormatInfo, n_w: u32) -> Vec<u8> {
-    use crate::common::constants::{
-        FORMAT_INFO_BYTES,
-        FORMAT_INFO_WITH_CRC,
-    };
-
     // 动态计算重复次数：每份拷贝 120 bits (15 bytes × 8)，n 份 = 120*n
     // 格式信息区 = 2 × (n_w - 14) 模块
     let format_area_modules = 2 * (n_w as usize - 14);
@@ -386,7 +397,6 @@ pub fn render_frame_default(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::constants::MODULES_PER_SIDE_DEFAULT;
     use crate::common::types::{FormatInfo, FrameType};
 
     #[test]

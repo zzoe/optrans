@@ -3,12 +3,14 @@
 //! 组装元数据帧、数据帧和 EOT（传输结束）帧。
 //! 每帧包含格式信息（FormatInfo）和 RS 编码后的载荷数据。
 
-use crate::common::constants::MAX_FILE_NAME_LEN;
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::{
     BlockData, FormatInfo, FrameType, MetaPayload,
 };
 use crate::encoder::reed_solomon::RsEncoder;
+
+/// 最大文件名长度（UTF-8 字节）
+const MAX_FILE_NAME_LEN: usize = 255;
 
 /// 构建完成的帧（含格式信息 + RS 编码后的数据）
 #[derive(Debug, Clone)]

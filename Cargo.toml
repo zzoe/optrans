@@ -1,6 +1,6 @@
 [package]
 name = "optrans"
-version = "0.26.0"
+version = "0.26.1"
 edition = "2024"
 description = "无网络文件传输：通过屏幕视觉编码在隔离网络间单向传递文件"
 

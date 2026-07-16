@@ -5,7 +5,9 @@
 //! v0.5: 支持长方形帧 / v0.21: 统一单像素采样（2/4/8/16 级全支持）
 
 use crate::common::types::{EncodingMode, FrameLocation};
-use crate::common::constants::SAMPLE_RADIUS_BINARY;
+
+/// 二值模式采样半径（3×3，radius=1）
+const SAMPLE_RADIUS_BINARY: i32 = 1;
 
 // ═══════════════════════════════════════════════════════════════════
 //  仿射变换预计算（v0.19.4 优化）

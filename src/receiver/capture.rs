@@ -9,12 +9,14 @@
 //! 2. `GetDC(NULL)` — 经典屏幕 DC，微软 RDP 下稳定
 //! 3. `GetDC(NULL)` + `CAPTUREBLT` — 含分层窗口（实验性）
 
-use crate::common::constants::SRCCOPY;
 use crate::common::error::{OptransError, OptransResult};
 use crate::win32::ffi;
 use crate::win32::helpers::{check_hdc, last_error};
 
 use log::warn;
+
+/// BitBlt 光栅操作码：SRCCOPY（直接拷贝）
+const SRCCOPY: u32 = 0x00CC0020;
 
 /// CAPTUREBLT 光栅操作：BitBlt 时包含所有通过分层窗口覆盖的内容
 const CAPTUREBLT: u32 = 0x40000000;

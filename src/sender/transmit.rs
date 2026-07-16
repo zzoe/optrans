@@ -21,6 +21,9 @@ use log::{debug, info, warn};
 /// 首帧 / 末帧驻留时间（ms）
 const BOUNDARY_DWELL_MS: u64 = 100;
 
+/// 有效的灰度级数（2 的幂，bit 直映射）
+const VALID_GRAY_LEVELS: [u32; 4] = [2, 4, 8, 16];
+
 /// 将字节数组格式化为十六进制字符串
 fn hex_str(data: &[u8]) -> String {
     data.iter()
@@ -88,7 +91,7 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
     let enable_heartbeat = true;
 
     // 验证灰度级数
-    let valid_levels = crate::common::constants::VALID_GRAY_LEVELS;
+    let valid_levels = VALID_GRAY_LEVELS;
     if !valid_levels.contains(&gray_levels) {
         warn!(
             "警告: 灰度级数 {} 不在推荐范围 {:?}，继续使用",

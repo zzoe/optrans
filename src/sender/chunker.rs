@@ -7,9 +7,11 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use crate::common::constants::BLOCK_SIZE;
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::{BlockData, FileManifest};
+
+/// 默认文件分块大小（字节）
+const BLOCK_SIZE: usize = 32768;
 
 /// 读取文件并生成 FileManifest（使用默认 BLOCK_SIZE）
 pub fn read_file(path: &Path) -> OptransResult<FileManifest> {

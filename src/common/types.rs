@@ -325,9 +325,14 @@ pub enum IngestResult {
     Invalid,
 }
 
+/// 最小模块像素数
+const MODULE_PIXELS_MIN: u32 = 2;
+
+/// 最大模块像素数
+const MODULE_PIXELS_MAX: u32 = 8;
+
 /// 验证模块像素参数是否合法
 pub fn validate_module_pixels(pixels: u32) -> crate::common::error::OptransResult<()> {
-    use crate::common::constants::{MODULE_PIXELS_MAX, MODULE_PIXELS_MIN};
     if !(MODULE_PIXELS_MIN..=MODULE_PIXELS_MAX).contains(&pixels) || !pixels.is_multiple_of(2) {
         return Err(crate::common::error::OptransError::InvalidArgument(format!(
             "模块像素数必须在 {}-{} 之间且为偶数，当前值: {}",
