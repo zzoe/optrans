@@ -101,3 +101,43 @@ pub fn check_hdc(hdc: ffi::HDC) -> crate::common::error::OptransResult<ffi::HDC>
     }
     Ok(hdc)
 }
+
+/// RAII 守卫：在存活期间阻止系统睡眠、熄屏与锁屏。
+///
+/// 通过 `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)`
+/// 告知系统当前线程需要显示器保持开启。`Drop` 时清除标志，恢复系统默认电源策略。
+///
+/// 用途：发送端显示循环期间，避免屏保/锁屏打断帧序列导致接收端拍不到帧。
+/// 防锁屏是尽力而为——失败时仅记录日志，不阻止调用方继续运行。
+pub struct DisplayGuard {
+    /// 是否仍需在 Drop 时恢复（成功设置后为 true）
+    active: bool,
+}
+
+impl DisplayGuard {
+    /// 创建守卫并请求保持显示。
+    pub fn new() -> Self {
+        let flags = ffi::ES_CONTINUOUS | ffi::ES_SYSTEM_REQUIRED | ffi::ES_DISPLAY_REQUIRED;
+        let prev = unsafe { ffi::SetThreadExecutionState(flags) };
+        if prev == 0 {
+            log::warn!("SetThreadExecutionState 失败，无法阻止系统锁屏");
+        }
+        Self { active: prev != 0 }
+    }
+}
+
+impl Default for DisplayGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for DisplayGuard {
+    fn drop(&mut self) {
+        if self.active {
+            // ES_CONTINUOUS 单独使用清除其他标志，恢复系统默认行为
+            unsafe { ffi::SetThreadExecutionState(ffi::ES_CONTINUOUS) };
+            self.active = false;
+        }
+    }
+}

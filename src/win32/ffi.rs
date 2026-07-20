@@ -116,6 +116,16 @@ pub(crate) const WAIT_OBJECT_0: DWORD = 0;
 // MsgWaitForMultipleObjects 唤醒掩码：任意消息类型
 pub(crate) const QS_ALLINPUT: UINT = 0x04FF;
 
+// SetThreadExecutionState 标志
+/// 持续生效：状态保持到下次调用清除
+pub(crate) const ES_CONTINUOUS: DWORD = 0x80000000;
+
+/// 阻止系统睡眠
+pub(crate) const ES_SYSTEM_REQUIRED: DWORD = 0x00000001;
+
+/// 阻止显示器关闭与锁屏
+pub(crate) const ES_DISPLAY_REQUIRED: DWORD = 0x00000002;
+
 // ============================================================================
 // 结构体
 // ============================================================================
@@ -288,6 +298,11 @@ unsafe extern "system" {
 
     /// 休眠指定毫秒数
     pub fn Sleep(dwMilliseconds: DWORD);
+
+    /// 设置线程执行状态（阻止系统睡眠/熄屏/锁屏）
+    ///
+    /// 返回上一个执行状态（非 0 表示成功，0 表示失败）。
+    pub fn SetThreadExecutionState(esFlags: DWORD) -> DWORD;
 }
 
 // ============================================================================

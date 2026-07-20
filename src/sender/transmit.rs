@@ -15,6 +15,7 @@ use crate::common::types::{BlockData, FileManifest, GrayEncodingConfig, MetaPayl
 use crate::encoder::frame::Frame;
 use crate::encoder::render::render_frame_default;
 use crate::sender::window::SenderWindow;
+use crate::win32::helpers::DisplayGuard;
 
 use log::{debug, info, warn};
 
@@ -108,6 +109,9 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
         "灰度配置: {} 级, 编码模式位={}",
         gray_levels, encoding_mode_bit
     );
+
+    // 阻止系统在传输期间睡眠/熄屏/锁屏（RAII，函数返回时自动恢复）
+    let _display_guard = DisplayGuard::new();
 
     // 1. 根据屏幕尺寸计算每帧最大容量
     let (modules_w, modules_h, max_payload_per_frame) =
