@@ -1,0 +1,123 @@
+# 构建流水线：Windows（win7 / win8+）与 macOS
+#
+# - windows-win8plus: x86_64-pc-windows-msvc（Tier 1，最低 Windows 8.1/10 基线）
+# - windows-win7:     x86_64-win7-windows-msvc（Tier 3，无预编译 std，
+#                     用 nightly + build-std 现场编译标准库）
+# - macos:            aarch64/x86_64 双架构构建（接收端；发送端仅 Windows）
+#
+# 触发：push / PR 到 master，或手动运行。
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Windows 8.1/10+：x86_64-pc-windows-msvc
+  windows-win8plus:
+    name: Windows (win8+) x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 构建 (release)
+        run: cargo build --locked --release
+
+      - name: 测试
+        run: cargo test --locked
+
+      - name: 打包产物
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/optrans.exe dist/optrans-win8plus-x86_64.exe
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: optrans-windows-win8plus-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  # Windows 7：x86_64-win7-windows-msvc（Tier 3，nightly + build-std）
+  windows-win7:
+    name: Windows (win7) x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust (nightly + rust-src)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: x86_64-win7-windows-msvc
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 构建 (release, build-std)
+        # Tier 3 目标无预编译 std，-Zbuild-std 现场编译 core/alloc/std
+        run: cargo build --locked --release -Zbuild-std --target x86_64-win7-windows-msvc
+
+      - name: 打包产物
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/x86_64-win7-windows-msvc/release/optrans.exe dist/optrans-win7-x86_64.exe
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: optrans-windows-win7-x86_64
+          path: dist/
+          if-no-files-found: error
+
+  # macOS：接收端（截屏/定位/解码/重组），双架构
+  macos:
+    name: macOS (aarch64 + x86_64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: 缓存 cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: 测试 (host aarch64)
+        run: cargo test --locked
+
+      - name: 构建 aarch64 (release)
+        run: cargo build --locked --release --target aarch64-apple-darwin
+
+      - name: 构建 x86_64 (release)
+        run: cargo build --locked --release --target x86_64-apple-darwin
+
+      - name: 打包产物
+        run: |
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/optrans dist/optrans-macos-aarch64
+          cp target/x86_64-apple-darwin/release/optrans dist/optrans-macos-x86_64
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: optrans-macos
+          path: dist/
+          if-no-files-found: error
