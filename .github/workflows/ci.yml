@@ -61,10 +61,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: 安装 Rust (nightly + rust-src)
+        # Tier 3 目标无预编译 std，rustup target add 会失败；
+        # build-std 由 rust-src 现场编译标准库，无需预装 target
         uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
-          targets: x86_64-win7-windows-msvc
 
       - name: 缓存 cargo
         uses: Swatinem/rust-cache@v2
