@@ -16,6 +16,9 @@ log = "*"
 pretty_env_logger = "*"
 threadpool = "*"
 
+[dev-dependencies]
+png = "*"
+
 [profile.release]
 opt-level = 3
 lto = true

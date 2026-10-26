@@ -30,6 +30,18 @@ impl RsDecoder {
     /// # 返回
     /// 解码后的原始数据
     pub fn decode(&self, encoded: &[u8]) -> OptransResult<Vec<u8>> {
+        self.decode_inner(encoded, false)
+    }
+
+    /// 严格模式解码：任一 RS 块纠错失败即返回错误
+    ///
+    /// 用于几何精修裁决（v0.29）：采样网格错位时中部数据行的 RS 块必然
+    /// 大面积纠错失败，严格模式把这种失败显式暴露出来作为裁决信号。
+    pub fn decode_strict(&self, encoded: &[u8]) -> OptransResult<Vec<u8>> {
+        self.decode_inner(encoded, true)
+    }
+
+    fn decode_inner(&self, encoded: &[u8], strict: bool) -> OptransResult<Vec<u8>> {
         if encoded.len() < 4 {
             return Err(OptransError::RsDecode(
                 "编码数据太短，无法读取长度头".to_string(),
@@ -82,6 +94,12 @@ impl RsDecoder {
             let corrected = match self.decoder.correct(block, None) {
                 Ok(buffer) => buffer,
                 Err(_) => {
+                    if strict {
+                        return Err(OptransError::RsDecode(format!(
+                            "RS 块 {} 纠错失败（共 {} 块）",
+                            block_idx, num_blocks
+                        )));
+                    }
                     // 纠错失败，使用原始数据（可能部分损坏）
                     // 提取前 217 字节作为数据
                     let data_len = std::cmp::min(RS_DATA_LEN, total_len - block_idx * RS_DATA_LEN);

@@ -17,9 +17,12 @@ use log::{info, warn};
 
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::{DecodedFrame, EncodingMode, FrameLocation, FrameType, IngestResult};
-use crate::decoder::decode::{decode_format_info, decode_frame};
-use crate::decoder::locate::locate_frame_all_with_diag;
-use crate::receiver::capture::capture_full_screen;
+use crate::decoder::decode::{
+    decode_format_info, decode_format_info_with_geometry, decode_frame, refine_frame_geometry,
+    MIN_REFINE_PAYLOAD,
+};
+use crate::decoder::locate::{locate_frame_all_with_diag, LocateDiagnostics};
+use crate::receiver::capture::{self, capture_full_screen, capture_virtual_desktop};
 use crate::receiver::collect::FrameCollector;
 use crate::receiver::reassemble::FileAssembler;
 
@@ -216,6 +219,50 @@ fn flush_and_write(
 //  Capture 循环 — 截屏 + 快速预判 + 线程池 decode
 // ═══════════════════════════════════════════════════════════════════
 
+/// 截屏并定位帧候选。
+///
+/// 优先主显示器（快）；主屏无候选且存在多显示器时，回退扫描整个虚拟桌面
+/// （发送端帧可能在副屏显示，如远程桌面窗口拖到副屏全屏）。
+fn scan_frame() -> Option<(Vec<u8>, i32, i32, Vec<(FrameLocation, LocateDiagnostics)>, bool)> {
+    if let Ok((pixels, w, h)) = capture_full_screen() {
+        let cands = locate_frame_all_with_diag(&pixels, w, h);
+        if !cands.is_empty() {
+            return Some((pixels, w, h, cands, false));
+        }
+        if capture::has_multiple_monitors() {
+            if let Ok((vp, vw, vh)) = capture_virtual_desktop() {
+                let cands = locate_frame_all_with_diag(&vp, vw, vh);
+                if !cands.is_empty() {
+                    return Some((vp, vw, vh, cands, true));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 长时间未检测到发送端信号时输出诊断提示（节流：每 10 秒一次）
+fn warn_no_signal(start: std::time::Instant, last_warn: &mut Option<std::time::Instant>) {
+    let elapsed = start.elapsed();
+    if elapsed.as_secs() < 10 {
+        return;
+    }
+    let should_warn = match last_warn {
+        Some(t) => t.elapsed().as_secs() >= 10,
+        None => true,
+    };
+    if !should_warn {
+        return;
+    }
+    *last_warn = Some(std::time::Instant::now());
+    warn!(
+        "已等待 {}s 未检测到发送端信号。请确认: ① 发送端窗口可见且未被遮挡; \
+         ② 多显示器环境下发送端帧所在屏幕在接收端可见; \
+         ③ 远程桌面窗口缩放比例未导致图案严重失真",
+        elapsed.as_secs()
+    );
+}
+
 fn run_capture_loop(
     tx: mpsc::Sender<DecodedFrame>,
     done: &AtomicBool,
@@ -224,40 +271,53 @@ fn run_capture_loop(
 
     // ═══ Phase 1: 等待 Meta 帧 → 锁定位置 ═══
     let mut meta_loc: Option<FrameLocation> = None;
+    let mut use_virtual_desktop = false;
+    let scan_start = std::time::Instant::now();
+    let mut last_warn: Option<std::time::Instant> = None;
     loop {
         if done.load(Ordering::SeqCst) {
             drop(tx);
             return Ok(());
         }
 
-        let (pixels, img_w, img_h) = match capture_full_screen() {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("截屏失败: {}，重试...", e);
-                continue;
-            }
-        };
-
-        let candidates = locate_frame_all_with_diag(&pixels, img_w, img_h);
-        if candidates.is_empty() {
+        let Some((pixels, img_w, img_h, candidates, is_virtual)) = scan_frame() else {
+            warn_no_signal(scan_start, &mut last_warn);
             continue;
-        }
+        };
 
         let pixels_arc = Arc::new(pixels);
         let mut found = false;
         for (loc, _) in &candidates {
-            if let Ok(info) = decode_format_info(&pixels_arc, img_w, img_h, loc) {
-                if info.frame_type != FrameType::Meta {
-                    continue;
-                }
-                if let Ok(frame) = decode_frame(&pixels_arc, img_w, img_h, loc, &EncodingMode::Auto) {
-                    if !frame.payload.is_empty() {
-                        info!("编码模式: {:?}", frame.encoding_mode);
-                        let _ = tx.send(frame);
-                        meta_loc = Some(loc.clone());
-                        found = true;
-                        break;
+            // 二维几何精修（v0.30）：小模块量化误差会让定位出的
+            // modules_w/modules_h 漂移 ±15 模块，格式 CRC 全部失败；
+            // 以格式信息 CRC 为裁决信号搜索正确几何，Meta 小载荷帧也能锁定。
+            let Some((info, refined_loc)) =
+                decode_format_info_with_geometry(&pixels_arc, img_w, img_h, loc)
+            else {
+                continue;
+            };
+            if info.frame_type != FrameType::Meta {
+                continue;
+            }
+            if let Ok(frame) = decode_frame(&pixels_arc, img_w, img_h, &refined_loc, &EncodingMode::Auto) {
+                if !frame.payload.is_empty() {
+                    if refined_loc.modules_w != loc.modules_w
+                        || refined_loc.modules_h != loc.modules_h
+                    {
+                        info!(
+                            "几何精修: {}x{} → {}x{}（模块尺寸量化误差修正）",
+                            loc.modules_w,
+                            loc.modules_h,
+                            refined_loc.modules_w,
+                            refined_loc.modules_h
+                        );
                     }
+                    info!("编码模式: {:?}", frame.encoding_mode);
+                    let _ = tx.send(frame);
+                    meta_loc = Some(refined_loc);
+                    use_virtual_desktop = is_virtual;
+                    found = true;
+                    break;
                 }
             }
         }
@@ -266,7 +326,10 @@ fn run_capture_loop(
             break;
         }
     }
-    let loc = meta_loc.unwrap();
+    let mut loc = meta_loc.unwrap();
+    if use_virtual_desktop {
+        info!("发送端帧位于非主显示器，切换为虚拟桌面截屏");
+    }
 
     // ═══ Phase 2: 捕获数据帧 + FEC 校验帧 + EOT ═══
     // last_seq: 上一次截屏看到的非 Meta 帧序号（用于检测漏帧）
@@ -274,13 +337,21 @@ fn run_capture_loop(
     //   - 同一帧重复截到（seq 相同）→ 正常，跳过
     //   - seq > last + 1 → 中间有帧未截到 → 漏帧告警
     let mut last_seq: Option<u16> = None;
+    // 几何精修只做一次：格式信息锚定帧底部，其 CRC 对 modules_h 量化误差
+    // 几乎不敏感，定位出的 modules_h 可能偏 ±10+ 模块；首个大载荷数据帧
+    // 用严格 RS 解码裁决修正，后续所有帧复用正确位置。
+    let mut geometry_refined = false;
     loop {
         if done.load(Ordering::SeqCst) {
             drop(tx);
             return Ok(());
         }
 
-        let (pixels, img_w, img_h) = match capture_full_screen() {
+        let (pixels, img_w, img_h) = match if use_virtual_desktop {
+            capture_virtual_desktop()
+        } else {
+            capture_full_screen()
+        } {
             Ok(r) => r,
             Err(e) => {
                 warn!("截屏失败: {}，重试...", e);
@@ -334,6 +405,25 @@ fn run_capture_loop(
                 break;
             }
             FrameType::Data | FrameType::FecParity => {
+                // 首个大载荷数据帧：几何精修（一次性修正 modules_h）
+                // 小载荷帧采样漂移不足，无法裁决，跳过并保留精修机会
+                if !geometry_refined
+                    && info.frame_type == FrameType::Data
+                    && info.payload_bytes >= MIN_REFINE_PAYLOAD
+                {
+                    geometry_refined = true;
+                    if let Some(refined) = refine_frame_geometry(
+                        &pixels, img_w, img_h, &loc, &info, &EncodingMode::Auto,
+                    ) {
+                        if refined.modules_h != loc.modules_h {
+                            info!(
+                                "几何精修: modules_h {} → {}（非整数缩放修正）",
+                                loc.modules_h, refined.modules_h
+                            );
+                            loc = refined;
+                        }
+                    }
+                }
                 let pixels_arc = Arc::new(pixels);
                 let tx_c = tx.clone();
                 let lloc = loc.clone();

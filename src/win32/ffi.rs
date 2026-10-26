@@ -97,6 +97,10 @@ pub(crate) const SWP_NOZORDER: UINT = 0x0004;
 // 系统指标
 pub(crate) const SM_CXSCREEN: i32 = 0;
 pub(crate) const SM_CYSCREEN: i32 = 1;
+pub(crate) const SM_XVIRTUALSCREEN: i32 = 76;
+pub(crate) const SM_YVIRTUALSCREEN: i32 = 77;
+pub(crate) const SM_CXVIRTUALSCREEN: i32 = 78;
+pub(crate) const SM_CYVIRTUALSCREEN: i32 = 79;
 
 // 位图相关
 pub(crate) const BI_RGB: DWORD = 0;

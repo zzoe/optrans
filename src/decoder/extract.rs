@@ -30,18 +30,32 @@ struct AffineTransform {
 }
 
 impl AffineTransform {
-    /// v0.20: 强制使用约定的 module_pixels，不依赖 locate 推算的模块尺寸。
-    /// locate 可能匹配到虚假 finder（桌面噪点），推算的 modules_w / dst_dx 不可靠。
+    /// v0.28: 模块尺寸从三个 finder 角的实际跨度推算（支持分数级缩放）。
+    ///
+    /// 捕获端可能对发送端图案做非整数缩放（典型场景：Horizon 窗口把远程桌面
+    /// 缩放到客户区，如 4px 模块 → 3.2px）。旧实现强制整数 module_pixels，
+    /// 采样网格跨整帧累积误差（600+ 模块 × 0.2px ≈ 120px），格式信息区必然
+    /// 采到空白区导致解码失败。
+    ///
+    /// modules_w/h 由 locate 的几何约束确定为整数（可靠），跨度 ÷ 模块数即得
+    /// 真实（可能为分数的）模块尺寸；倾斜分量仍由 finder 差值推算。
     fn from_location(loc: &FrameLocation, module_pixels: u32) -> Self {
         let mp = module_pixels as f64;
         let src_dx = (loc.modules_w as f64 - 7.0).max(1.0);
         let src_dy = (loc.modules_h as f64 - 7.0).max(1.0);
 
-        // 主方向固定为 module_pixels，仅从 finder Y/X 差推算倾斜
-        let dst_dx_x = mp;
+        // 主方向取 finder 实际跨度（分数级），异常时回退约定 module_pixels
+        let mut dst_dx_x = (loc.tr.center_x - loc.tl.center_x) / src_dx;
+        if !dst_dx_x.is_finite() || dst_dx_x <= 0.0 {
+            dst_dx_x = mp;
+        }
+        let mut dst_dy_y = (loc.bl.center_y - loc.tl.center_y) / src_dy;
+        if !dst_dy_y.is_finite() || dst_dy_y <= 0.0 {
+            dst_dy_y = mp;
+        }
+        // 倾斜分量由 finder Y/X 差推算
         let dst_dx_y = (loc.tr.center_y - loc.tl.center_y) / src_dx;
         let dst_dy_x = (loc.bl.center_x - loc.tl.center_x) / src_dy;
-        let dst_dy_y = mp;
 
         // 预计算偏移，避免每个模块都做 (mx - 3.5) 运算
         let base_x = loc.tl.center_x - dst_dx_x * 3.5 - dst_dy_x * 3.5;

@@ -63,13 +63,14 @@ pub fn locate_by_corners(
     let bl_corner_y = capture_h - 7 * m - margin;
     let bl = find_finder_at_corner(pixels, w, h, margin, bl_corner_y, m, search_radius)?;
 
-    // 从角落 finder 位置推算模块尺寸
+    // 从角落 finder 位置推算模块尺寸（水平/垂直分开，支持非均匀缩放）
     let avg_module_size = (tl.2 + tr.2 + bl.2) / 3.0;
+    let avg_v_module_size = (tl.3 + tr.3 + bl.3) / 3.0;
 
     // modules_w: TL→TR 的水平距离 / module_size + 7 (finder 自身宽度)
     let modules_w = ((tr.0 - tl.0) / avg_module_size).round() as u32 + 7;
-    // modules_h: TL→BL 的垂直距离 / module_size + 7
-    let modules_h = ((bl.1 - tl.1) / avg_module_size).round() as u32 + 7;
+    // modules_h: TL→BL 的垂直距离 / 垂直 module_size + 7
+    let modules_h = ((bl.1 - tl.1) / avg_v_module_size).round() as u32 + 7;
 
     // 合理性检查
     if !(25..=1000).contains(&modules_w) || !(25..=1000).contains(&modules_h) {
@@ -109,7 +110,10 @@ pub fn locate_by_corners(
 /// - `search_radius`: 搜索半径（像素）
 ///
 /// # 返回
-/// `Some((center_x, center_y, module_size))` 如果找到，否则 `None`
+/// `Some((center_x, center_y, module_size, v_module_size, v_module_size_alt))`
+/// 如果找到，否则 `None`。`module_size` 为水平方向模块尺寸；
+/// `v_module_size` / `v_module_size_alt` 为垂直方向模块尺寸的两种估计
+/// （非整数缩放下单一估计有量化偏差，两种估计生成备选候选由 CRC 裁决）。
 fn find_finder_at_corner(
     pixels: &[u8],
     w: usize,
@@ -118,7 +122,7 @@ fn find_finder_at_corner(
     corner_y: i32,
     m: i32,
     search_radius: i32,
-) -> Option<(f64, f64, f64)> {
+) -> Option<(f64, f64, f64, f64, f64)> {
     // Finder pattern 中心预期位置：corner + 3.5 模块
     let expected_cx = corner_x as f64 + 3.5 * m as f64;
     let expected_cy = corner_y as f64 + 3.5 * m as f64;
@@ -171,13 +175,12 @@ fn find_finder_at_corner(
 
                         // 验证找到的中心是否接近预期位置
                         if (center_x - expected_cx).abs() < (search_radius + 5 * m) as f64 {
-                            // 垂直验证
-                            let vfy = verify_finder_vertical_at(
+                            // 垂直验证（同时测量垂直模块尺寸）
+                            if let Some((v_ms, v_ms_alt)) = verify_finder_vertical_at(
                                 pixels, w, h,
                                 center_x, scan_y as f64,
-                            );
-                            if vfy {
-                                return Some((center_x, scan_y as f64, module_size));
+                            ) {
+                                return Some((center_x, scan_y as f64, module_size, v_ms, v_ms_alt));
                             }
                         }
                     }
@@ -203,18 +206,21 @@ fn find_finder_at_corner(
 ///
 /// 在 cx 附近 ±4 像素（约 1 模块）的多列上扫描，
 /// 因为 finder 中心列全黑，必须偏移 1 模块才能看到 1:1:3:1:1 pattern。
+///
+/// 返回 `Some((垂直模块尺寸, 备选垂直模块尺寸))` 如果验证通过
+/// （用于非均匀缩放下估算 modules_h），否则 `None`。
 fn verify_finder_vertical_at(
     pixels: &[u8],
     w: usize,
     h: usize,
     cx: f64,
     cy: f64,
-) -> bool {
+) -> Option<(f64, f64)> {
     let cx_i = cx as i32;
     let cy_i = cy as i32;
 
     if cx_i < 4 || cx_i >= w as i32 - 4 {
-        return false;
+        return None;
     }
 
     // 以候选点为中心，上下各扩展 20 像素（覆盖 finder pattern 7 模块高度）
@@ -224,12 +230,12 @@ fn verify_finder_vertical_at(
     // 在 cx 附近 ±4 像素（约 1 模块）范围内扫描多列
     for dx in [-4i32, -2, 0, 2, 4] {
         let x_idx = ((cx_i + dx) as usize) * 4;
-        if check_vertical_pattern(pixels, w, x_idx, y_start, y_end) {
-            return true;
+        if let Some(v_ms) = check_vertical_pattern_sized(pixels, w, x_idx, y_start, y_end) {
+            return Some(v_ms);
         }
     }
 
-    false
+    None
 }
 
 // ─── 原有全屏扫描定位（保留作为降级方案） ───
@@ -262,7 +268,13 @@ pub fn locate_frame(pixels: &[u8], width: i32, height: i32) -> Option<FrameLocat
     // 第二步：垂直方向交叉验证每个候选
     let verified: Vec<FinderCandidate> = candidates
         .into_iter()
-        .filter(|fp| verify_finder_vertical(pixels, w, h, fp))
+        .filter_map(|mut fp| {
+            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt)| {
+                fp.v_module_size = v_ms;
+                fp.v_module_size_alt = v_ms_alt;
+                fp
+            })
+        })
         .collect();
 
     if verified.len() < 3 {
@@ -281,7 +293,14 @@ pub fn locate_frame(pixels: &[u8], width: i32, height: i32) -> Option<FrameLocat
 struct FinderCandidate {
     center_x: f64,
     center_y: f64,
+    /// 水平方向模块尺寸（由水平 1:1:3:1:1 段估计）
     module_size: f64,
+    /// 垂直方向模块尺寸（由垂直验证测量；水平扫描阶段暂等于 module_size，
+    /// 垂直验证通过后被真实测量值替换，用于非均匀缩放下估算 modules_h）
+    v_module_size: f64,
+    /// 备选垂直模块尺寸（另一种估计；非整数缩放下单一估计有量化偏差，
+    /// 备选值生成第二候选，由格式信息 CRC 裁决）
+    v_module_size_alt: f64,
 }
 
 /// 将像素值转为灰度（用于黑白判断）
@@ -336,6 +355,8 @@ fn find_finder_candidates(pixels: &[u8], w: usize, h: usize) -> Vec<FinderCandid
                             center_x,
                             center_y,
                             module_size,
+                            v_module_size: module_size,
+                            v_module_size_alt: module_size,
                         });
                     }
                     // 滑动窗口：移除第一段
@@ -368,6 +389,8 @@ fn find_finder_candidates(pixels: &[u8], w: usize, h: usize) -> Vec<FinderCandid
                 center_x,
                 center_y,
                 module_size,
+                v_module_size: module_size,
+                v_module_size_alt: module_size,
             });
         }
     }
@@ -422,18 +445,20 @@ fn check_finder_ratio(counts: &[i32; 5]) -> bool {
 /// 在候选中心 x 附近 ±1 模块的多列上做垂直扫描，
 /// 寻找 1:1:3:1:1 比例。任一列匹配即通过。
 /// 注意：finder pattern 中心列全是黑色，必须扫描偏移 1 模块的列才能看到 pattern。
+///
+/// 返回 `Some((垂直模块尺寸, 备选垂直模块尺寸))` 如果验证通过，否则 `None`。
 fn verify_finder_vertical(
     pixels: &[u8],
     w: usize,
     h: usize,
     fp: &FinderCandidate,
-) -> bool {
+) -> Option<(f64, f64)> {
     let cx = fp.center_x as i32;
     let cy = fp.center_y as i32;
     let ms = fp.module_size as i32;
 
     if cx < ms || cx >= w as i32 - ms {
-        return false;
+        return None;
     }
 
     // 以候选点为中心，上下各扩展 5 个模块
@@ -442,12 +467,27 @@ fn verify_finder_vertical(
     let y_end = (cy + half_span).min(h as i32 - 1) as usize;
 
     if y_end <= y_start {
-        return false;
+        return None;
     }
 
-    // v0.15: 检测 finder 下方是否存在大量黑边（FRAME_MARGIN_PX > 0 特征）。
-    // 黑边与 finder 边框合并会截断垂直扫描的 5 段 pattern。
-    // 仅在实际检测到黑边时跳过验证，避免误伤无 margin 场景。
+    // 优先尝试垂直扫描：滑动窗口对 finder 与 margin 黑边合并天然鲁棒
+    // （端段被拉长但中间 3 段仍保持 1:3:1，mid/5 估计不受污染）。
+    // 非整数缩放下必须测量真实垂直模块尺寸，不能轻易回退水平值，
+    // 否则 modules_h 估算偏差会导致数据采样网格错位。
+    //
+    // 在中心 x 附近 ±1 模块范围内的若干列上尝试垂直扫描
+    // finder 中心列全黑，必须扫描偏移约 1 模块的列（col 2 或 col 4）
+    let step = (ms / 2).max(1);
+    for dx in (-ms..=ms).step_by(step as usize) {
+        let x_idx = ((cx + dx) as usize) * 4;
+        if let Some(pair) = check_vertical_pattern_sized(pixels, w, x_idx, y_start, y_end) {
+            return Some(pair);
+        }
+    }
+
+    // v0.15: 扫描失败时的降级——检测 finder 下方是否存在大量黑边
+    // （FRAME_MARGIN_PX > 0 特征）。黑边可能截断扫描窗口内的 5 段 pattern，
+    // 此时垂直尺寸无法测量，回退水平尺寸。
     let below_check_y = (cy + half_span + 2).min(h as i32 - 2) as usize;
     if below_check_y < h {
         let check_idx = below_check_y * w * 4 + (cx as usize).min(w - 1) * 4;
@@ -463,38 +503,35 @@ fn verify_finder_vertical(
                 }
             }
             if all_black {
-                return true; // margin detected, skip verification
+                return Some((fp.module_size, fp.module_size));
             }
         }
     }
 
-    // 在中心 x 附近 ±1 模块范围内的若干列上尝试垂直扫描
-    // finder 中心列全黑，必须扫描偏移约 1 模块的列（col 2 或 col 4）
-    let step = (ms / 2).max(1);
-    for dx in (-ms..=ms).step_by(step as usize) {
-        let x_idx = ((cx + dx) as usize) * 4;
-        if check_vertical_pattern(pixels, w, x_idx, y_start, y_end) {
-            return true;
-        }
-    }
-
-    false
+    None
 }
 
-/// 在指定列上做垂直 1:1:3:1:1 pattern 扫描
-fn check_vertical_pattern(
+/// 在指定列上做垂直 1:1:3:1:1 pattern 扫描，返回垂直模块尺寸
+///
+/// 返回 `(mid_ms, total_ms)` 两种估计：
+/// - `mid_ms`: 内部 3 段总和 / 5（与水平方向 check_finder_ratio 一致）
+/// - `total_ms`: 全部 5 段总和 / 7（跨 7 模块平均，非整数缩放下量化误差更小）
+///
+/// 非整数缩放下单一估计可能量化偏差 ~4%（如 3.86→4.0），导致 modules_h
+/// 估算错 10+ 模块；两种估计生成备选候选，由格式信息 CRC 裁决。
+fn check_vertical_pattern_sized(
     pixels: &[u8],
     w: usize,
     x_idx: usize,
     y_start: usize,
     y_end: usize,
-) -> bool {
+) -> Option<(f64, f64)> {
     let mut state_count = [0i32; 5];
     let mut state_idx = 0usize;
 
     let init_idx = y_start * w * 4 + x_idx;
     if init_idx + 2 >= pixels.len() {
-        return false;
+        return None;
     }
     let init_lum = pixel_luminance(pixels, init_idx);
     let mut current_state = if init_lum < 128 { 1u8 } else { 0u8 };
@@ -513,7 +550,7 @@ fn check_vertical_pattern(
         } else {
             if state_idx == 4 {
                 if check_finder_ratio(&state_count) {
-                    return true;
+                    return Some(sized_estimates(&state_count));
                 }
                 for i in 0..4 {
                     state_count[i] = state_count[i + 1];
@@ -529,7 +566,19 @@ fn check_vertical_pattern(
         }
     }
 
-    state_idx == 4 && check_finder_ratio(&state_count)
+    if state_idx == 4 && check_finder_ratio(&state_count) {
+        Some(sized_estimates(&state_count))
+    } else {
+        None
+    }
+}
+
+/// 从 5 段状态计数计算两种垂直模块尺寸估计
+#[inline]
+fn sized_estimates(state_count: &[i32; 5]) -> (f64, f64) {
+    let mid_sum = (state_count[1] + state_count[2] + state_count[3]) as f64;
+    let total_sum = state_count.iter().sum::<i32>() as f64;
+    (mid_sum / 5.0, total_sum / 7.0)
 }
 
 /// 合并位置过近的候选点
@@ -553,6 +602,8 @@ fn merge_nearby_candidates(
         let mut sum_x = candidates[i].center_x;
         let mut sum_y = candidates[i].center_y;
         let mut sum_ms = candidates[i].module_size;
+        let mut sum_vms = candidates[i].v_module_size;
+        let mut sum_vms_alt = candidates[i].v_module_size_alt;
         let mut count = 1;
 
         for j in (i + 1)..candidates.len() {
@@ -567,6 +618,8 @@ fn merge_nearby_candidates(
                 sum_x += candidates[j].center_x;
                 sum_y += candidates[j].center_y;
                 sum_ms += candidates[j].module_size;
+                sum_vms += candidates[j].v_module_size;
+                sum_vms_alt += candidates[j].v_module_size_alt;
                 count += 1;
                 used[j] = true;
             }
@@ -576,6 +629,8 @@ fn merge_nearby_candidates(
             center_x: sum_x / count as f64,
             center_y: sum_y / count as f64,
             module_size: sum_ms / count as f64,
+            v_module_size: sum_vms / count as f64,
+            v_module_size_alt: sum_vms_alt / count as f64,
         });
     }
 
@@ -777,48 +832,72 @@ fn search_triangles(
                     continue;
                 }
 
-                // --- 估算 modules_w 和 modules_h（支持长方形帧） ---
+                // --- 估算 modules_w 和 modules_h（支持长方形帧 / 非均匀缩放） ---
+                // 水平跨度用水平模块尺寸，垂直跨度用垂直模块尺寸
                 let modules_w = (d_top / avg_m).round() as u32 + 7;
-                let modules_h = (d_left / avg_m).round() as u32 + 7;
-                if !(25..=1000).contains(&modules_w) || !(25..=1000).contains(&modules_h) {
+                if !(25..=1000).contains(&modules_w) {
                     continue;
                 }
-                let modules_per_side = modules_w.max(modules_h);
 
                 // --- 通过所有约束，记录此三角组 ---
                 let pixel_area = d_top * d_left;
 
-                let tl_fp = FinderPattern {
-                    center_x: tl_cand.center_x,
-                    center_y: tl_cand.center_y,
-                    module_size: tl_cand.module_size,
-                };
-                let tr_fp = FinderPattern {
-                    center_x: tr_cand.center_x,
-                    center_y: tr_cand.center_y,
-                    module_size: tr_cand.module_size,
-                };
-                let bl_fp = FinderPattern {
-                    center_x: bl_cand.center_x,
-                    center_y: bl_cand.center_y,
-                    module_size: bl_cand.module_size,
-                };
+                // 非整数缩放下垂直模块尺寸的单一估计有量化偏差（如 3.86→4.0），
+                // 会导致 modules_h 估算错 10+ 模块。两种估计各生成一个候选，
+                // 由格式信息 CRC 裁决哪个正确。
+                let avg_vm = (tl_cand.v_module_size
+                    + tr_cand.v_module_size
+                    + bl_cand.v_module_size)
+                    / 3.0;
+                let avg_vm_alt = (tl_cand.v_module_size_alt
+                    + tr_cand.v_module_size_alt
+                    + bl_cand.v_module_size_alt)
+                    / 3.0;
+                let vm_candidates: [f64; 2] = [avg_vm, avg_vm_alt];
 
-                results.push((
-                    FrameLocation {
-                        tl: tl_fp,
-                        tr: tr_fp,
-                        bl: bl_fp,
-                        modules_per_side,
-                        modules_w,
-                        modules_h,
-                        module_pixels: tl_cand.module_size.round() as u32,
-                    },
-                    pixel_area,
-                ));
-                // v0.17: 早停防止大簇 O(n³) 膨胀
-                if results.len() - start_count >= MAX_PER_CLUSTER {
-                    return;
+                for (vi, vm) in vm_candidates.iter().enumerate() {
+                    // 备选估计与主估计几乎相同时跳过（避免重复候选）
+                    if vi == 1 && (avg_vm_alt - avg_vm).abs() < 0.05 {
+                        break;
+                    }
+                    let modules_h = (d_left / vm).round() as u32 + 7;
+                    if !(25..=1000).contains(&modules_h) {
+                        continue;
+                    }
+                    let modules_per_side = modules_w.max(modules_h);
+
+                    let tl_fp = FinderPattern {
+                        center_x: tl_cand.center_x,
+                        center_y: tl_cand.center_y,
+                        module_size: tl_cand.module_size,
+                    };
+                    let tr_fp = FinderPattern {
+                        center_x: tr_cand.center_x,
+                        center_y: tr_cand.center_y,
+                        module_size: tr_cand.module_size,
+                    };
+                    let bl_fp = FinderPattern {
+                        center_x: bl_cand.center_x,
+                        center_y: bl_cand.center_y,
+                        module_size: bl_cand.module_size,
+                    };
+
+                    results.push((
+                        FrameLocation {
+                            tl: tl_fp,
+                            tr: tr_fp,
+                            bl: bl_fp,
+                            modules_per_side,
+                            modules_w,
+                            modules_h,
+                            module_pixels: tl_cand.module_size.round() as u32,
+                        },
+                        pixel_area,
+                    ));
+                    // v0.17: 早停防止大簇 O(n³) 膨胀
+                    if results.len() - start_count >= MAX_PER_CLUSTER {
+                        return;
+                    }
                 }
             }
         }
@@ -850,7 +929,13 @@ pub fn locate_frame_with_diag(
 
     let verified: Vec<FinderCandidate> = candidates
         .into_iter()
-        .filter(|fp| verify_finder_vertical(pixels, w, h, fp))
+        .filter_map(|mut fp| {
+            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt)| {
+                fp.v_module_size = v_ms;
+                fp.v_module_size_alt = v_ms_alt;
+                fp
+            })
+        })
         .collect();
     let verified_count = verified.len();
 
@@ -896,7 +981,13 @@ pub fn locate_frame_all_with_diag(
 
     let verified: Vec<FinderCandidate> = candidates
         .into_iter()
-        .filter(|fp| verify_finder_vertical(pixels, w, h, fp))
+        .filter_map(|mut fp| {
+            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt)| {
+                fp.v_module_size = v_ms;
+                fp.v_module_size_alt = v_ms_alt;
+                fp
+            })
+        })
         .collect();
     let verified_count = verified.len();
 
@@ -935,7 +1026,13 @@ pub fn locate_frame_all(
 
     let verified: Vec<FinderCandidate> = candidates
         .into_iter()
-        .filter(|fp| verify_finder_vertical(pixels, w, h, fp))
+        .filter_map(|mut fp| {
+            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt)| {
+                fp.v_module_size = v_ms;
+                fp.v_module_size_alt = v_ms_alt;
+                fp
+            })
+        })
         .collect();
 
     if verified.len() < 3 {

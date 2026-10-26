@@ -143,3 +143,30 @@ pub fn capture_full_screen() -> OptransResult<(Vec<u8>, i32, i32)> {
     let (pixels, w, h, _method) = capture_screen(0, 0, screen_w, screen_h)?;
     Ok((pixels, w, h))
 }
+
+/// 虚拟桌面是否与主显示器不同（多显示器环境）
+pub fn has_multiple_monitors() -> bool {
+    let sw = unsafe { ffi::GetSystemMetrics(ffi::SM_CXSCREEN) };
+    let sh = unsafe { ffi::GetSystemMetrics(ffi::SM_CYSCREEN) };
+    let vw = unsafe { ffi::GetSystemMetrics(ffi::SM_CXVIRTUALSCREEN) };
+    let vh = unsafe { ffi::GetSystemMetrics(ffi::SM_CYVIRTUALSCREEN) };
+    (vw, vh) != (sw, sh)
+}
+
+/// 截取整个虚拟桌面（所有显示器拼接区域）。
+///
+/// 多显示器环境下发送端帧可能显示在非主显示器上（典型场景：远程桌面窗口
+/// 被拖到副屏全屏），仅截主屏会永远扫不到信号。虚拟桌面坐标以
+/// (SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN) 为原点。
+pub fn capture_virtual_desktop() -> OptransResult<(Vec<u8>, i32, i32)> {
+    let x = unsafe { ffi::GetSystemMetrics(ffi::SM_XVIRTUALSCREEN) };
+    let y = unsafe { ffi::GetSystemMetrics(ffi::SM_YVIRTUALSCREEN) };
+    let w = unsafe { ffi::GetSystemMetrics(ffi::SM_CXVIRTUALSCREEN) };
+    let h = unsafe { ffi::GetSystemMetrics(ffi::SM_CYVIRTUALSCREEN) };
+    if w <= 0 || h <= 0 {
+        return Err(OptransError::Win32(format!(
+            "GetSystemMetrics 返回无效虚拟桌面尺寸: {}×{}", w, h)));
+    }
+    let (pixels, pw, ph, _method) = capture_screen(x, y, w, h)?;
+    Ok((pixels, pw, ph))
+}

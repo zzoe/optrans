@@ -12,7 +12,7 @@ use crate::common::types::{
     FrameType, GrayEncodingConfig, MetaPayload,
 };
 use crate::decoder::extract;
-use crate::decoder::reed_solomon::rs_decode_data;
+use crate::decoder::reed_solomon::RsDecoder;
 
 /// 从截屏中解码格式信息
 ///
@@ -203,7 +203,125 @@ fn calc_gray_module_count(byte_count: usize, levels: u32) -> usize {
     }
 }
 
+/// 几何搜索半径绝对上限（模块数），防止极端情况搜索失控
+const MAX_GEOMETRY_DELTA_CAP: i32 = 120;
+
+/// 自适应几何搜索半径（模块数）
+///
+/// 误差来源：finder 中间 3 段（5 模块）的游程边界在整数像素位置，
+/// 非整数缩放下总长度存在 ±1px 量化误差，模块尺寸相对误差 ≈ 1/(5×m)，
+/// 跨整个跨度累积：Δmodules ≈ span_modules/(5×m)。模块越小误差越大：
+/// - m=3.3px → 实测 ±15 模块（1.png：真值 758 估成 743）
+/// - m=2.0px（检测下界）→ 最坏可达 ±75 模块
+///
+/// 因此搜索半径随模块尺寸缩小而增大，并留安全余量；
+/// 上限由 MAX_GEOMETRY_DELTA_CAP 约束。
+fn geometry_search_delta(modules: u32, module_size: f64) -> i32 {
+    let m = module_size.max(2.0);
+    let span_modules = modules.saturating_sub(7) as f64;
+    let est = (span_modules * 0.2 / m).ceil() as i32 + 10;
+    est.min(MAX_GEOMETRY_DELTA_CAP)
+}
+
+/// 格式 CRC 裁决的 modules_w 几何精修入口
+///
+/// 先按原始几何解码；失败时按 |Δ| 从小到大搜索 modules_w，返回首个通过
+/// 格式信息 CRC 的 (FormatInfo, 修正后位置)。
+///
+/// 只搜 modules_w 不搜 modules_h 的原因：格式信息区锚定在帧底部两行，
+/// 其物理采样位置由 TL/BL finder 跨度决定，对 modules_h 几乎不敏感
+/// （多个 modules_h 候选都能通过 CRC，无法裁决）；对 modules_w 敏感
+/// （modules_w 决定格式区模块行距，错误值使行尾采到 TR finder 黑区）。
+/// modules_h 误差由首个大载荷数据帧上的严格 RS 解码精修裁决
+/// （见 `refine_frame_geometry`）。
+///
+/// 假阳性概率：单候选 CRC 误过 ≈ 1/65536，且解包后帧类型必须合法，
+/// 搜索范围 60 个候选，实际误报可忽略。
+pub fn decode_format_info_with_geometry(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+) -> Option<(FormatInfo, FrameLocation)> {
+    if let Ok(info) = decode_format_info(pixels, img_width, img_height, loc) {
+        return Some((info, loc.clone()));
+    }
+    // 过小候选不可能是真帧（真实传输帧 ≥100 模块宽），无精修价值
+    if loc.modules_w < 100 {
+        return None;
+    }
+    let max_delta = geometry_search_delta(loc.modules_w, loc.tl.module_size);
+    for delta in 1..=max_delta {
+        for sign in [1i32, -1] {
+            let cand_w = loc.modules_w as i32 + sign * delta;
+            if !(25..=1000).contains(&cand_w) {
+                continue;
+            }
+            let cand = with_geometry(loc, cand_w as u32, loc.modules_h);
+            if let Ok(info) = decode_format_info_fast(pixels, img_width, img_height, &cand) {
+                return Some((info, cand));
+            }
+        }
+    }
+    None
+}
+
+/// 廉价格式信息解码（无降级重试），供几何搜索批量裁决使用
+fn decode_format_info_fast(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+) -> OptransResult<FormatInfo> {
+    let raw_bits =
+        extract::extract_format_modules_with_radius(pixels, img_width, img_height, loc, 1);
+    let (repetitions, min_bits) = format_info_params(loc.modules_w);
+    if raw_bits.len() < min_bits {
+        return Err(OptransError::InvalidFormatInfo(format!(
+            "格式信息比特不足: 需要 {} bits，实际 {} bits",
+            min_bits,
+            raw_bits.len()
+        )));
+    }
+    vote_and_check(&raw_bits, repetitions)
+}
+
+/// 构造替换 modules_w / modules_h 的 FrameLocation
+fn with_geometry(loc: &FrameLocation, modules_w: u32, modules_h: u32) -> FrameLocation {
+    FrameLocation {
+        tl: FinderPattern {
+            center_x: loc.tl.center_x,
+            center_y: loc.tl.center_y,
+            module_size: loc.tl.module_size,
+        },
+        tr: FinderPattern {
+            center_x: loc.tr.center_x,
+            center_y: loc.tr.center_y,
+            module_size: loc.tr.module_size,
+        },
+        bl: FinderPattern {
+            center_x: loc.bl.center_x,
+            center_y: loc.bl.center_y,
+            module_size: loc.bl.module_size,
+        },
+        modules_per_side: modules_w.max(modules_h),
+        modules_w,
+        modules_h,
+        module_pixels: loc.module_pixels,
+    }
+}
+
+/// 触发几何精修的最小载荷字节数
+///
+/// modules_h 错误导致的采样漂移随行数线性累积，载荷必须覆盖足够多的行
+/// 才能让 RS 严格解码暴露错位；小载荷帧顶部漂移小，无法作为裁决信号。
+pub const MIN_REFINE_PAYLOAD: u32 = 8192;
+
 /// 解码帧的数据载荷
+///
+/// v0.29: 先严格解码（任一 RS 块纠错失败即失败）；失败时做 modules_h
+/// 几何搜索——格式信息区锚定在帧底部，其 CRC 对 modules_h 误差几乎不敏感，
+/// 唯一可靠的裁决信号是中部数据行的 RS 纠错成败。搜索仍失败则回退宽容解码。
 pub fn decode_payload(
     pixels: &[u8],
     img_width: i32,
@@ -211,6 +329,131 @@ pub fn decode_payload(
     loc: &FrameLocation,
     info: &FormatInfo,
     encoding_mode: &EncodingMode,
+) -> OptransResult<Vec<u8>> {
+    if info.payload_bytes == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Auto 必须先解析为实际模式（采样位数由灰度级数决定）
+    let actual_mode = match encoding_mode {
+        EncodingMode::Auto => detect_encoding_mode(info),
+        other => other.clone(),
+    };
+
+    // 1. 原始位置严格解码（正常路径，无额外开销）
+    if let Ok(v) = decode_payload_at(pixels, img_width, img_height, loc, info, &actual_mode, true)
+    {
+        return Ok(v);
+    }
+
+    // 2. 几何搜索修正 modules_h 量化误差
+    if let Some((_, payload)) =
+        search_refined_geometry(pixels, img_width, img_height, loc, info, &actual_mode)
+    {
+        return Ok(payload);
+    }
+
+    // 3. 回退宽容解码（保持旧行为：部分损坏也尽量返回数据）
+    decode_payload_at(pixels, img_width, img_height, loc, info, &actual_mode, false)
+}
+
+/// 几何精修（引擎侧入口）：返回修正后的 FrameLocation
+///
+/// Meta 锁定后由接收引擎在首个大载荷数据帧上调用一次，修正 modules_h 后
+/// 后续所有帧复用正确位置，避免每帧重复搜索。
+/// 载荷过小（裁决信号不足）或搜索失败时返回 None。
+pub fn refine_frame_geometry(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+    info: &FormatInfo,
+    encoding_mode: &EncodingMode,
+) -> Option<FrameLocation> {
+    if info.payload_bytes < MIN_REFINE_PAYLOAD {
+        return None;
+    }
+    let actual_mode = match encoding_mode {
+        EncodingMode::Auto => detect_encoding_mode(info),
+        other => other.clone(),
+    };
+    // 原始位置已正确
+    if decode_payload_at(pixels, img_width, img_height, loc, info, &actual_mode, true).is_ok() {
+        return Some(loc.clone());
+    }
+    search_refined_geometry(pixels, img_width, img_height, loc, info, &actual_mode)
+        .map(|(loc, _)| loc)
+}
+
+/// modules_h 几何搜索：由小到大尝试 ±1..=MAX_REFINE_DELTA 偏移
+///
+/// 每个候选先过格式信息 CRC（廉价过滤），再做严格载荷解码裁决。
+/// 候选需同时通过两者才可信——假阳性概率可忽略。
+fn search_refined_geometry(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+    info: &FormatInfo,
+    encoding_mode: &EncodingMode,
+) -> Option<(FrameLocation, Vec<u8>)> {
+    let max_delta = geometry_search_delta(loc.modules_h, loc.tl.module_size);
+    for delta in 1..=max_delta {
+        for sign in [1i32, -1] {
+            let cand_h = loc.modules_h as i32 + sign * delta;
+            if !(25..=1000).contains(&cand_h) {
+                continue;
+            }
+            let cand = with_modules_h(loc, cand_h as u32);
+            // 格式信息 CRC 过滤：候选 modules_h 下格式区位置偏移，
+            // 绝大多数错误候选在此被廉价拒绝
+            if decode_format_info(pixels, img_width, img_height, &cand).is_err() {
+                continue;
+            }
+            if let Ok(v) =
+                decode_payload_at(pixels, img_width, img_height, &cand, info, encoding_mode, true)
+            {
+                return Some((cand, v));
+            }
+        }
+    }
+    None
+}
+
+/// 构造仅替换 modules_h 的 FrameLocation
+fn with_modules_h(loc: &FrameLocation, modules_h: u32) -> FrameLocation {
+    FrameLocation {
+        tl: FinderPattern {
+            center_x: loc.tl.center_x,
+            center_y: loc.tl.center_y,
+            module_size: loc.tl.module_size,
+        },
+        tr: FinderPattern {
+            center_x: loc.tr.center_x,
+            center_y: loc.tr.center_y,
+            module_size: loc.tr.module_size,
+        },
+        bl: FinderPattern {
+            center_x: loc.bl.center_x,
+            center_y: loc.bl.center_y,
+            module_size: loc.bl.module_size,
+        },
+        modules_per_side: loc.modules_w.max(modules_h),
+        modules_w: loc.modules_w,
+        modules_h,
+        module_pixels: loc.module_pixels,
+    }
+}
+
+/// 在指定位置解码载荷（可选严格模式）
+fn decode_payload_at(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+    info: &FormatInfo,
+    encoding_mode: &EncodingMode,
+    strict: bool,
 ) -> OptransResult<Vec<u8>> {
     if info.payload_bytes == 0 {
         return Ok(Vec::new());
@@ -268,8 +511,13 @@ pub fn decode_payload(
     // v0.6: 反向应用数据掩码（XOR 自反），恢复原始 RS 编码字节
     let encoded_data = crate::common::mask::apply_mask(&encoded_data);
 
-    // RS 解码
-    let decoded = rs_decode_data(&encoded_data)?;
+    // RS 解码（严格模式：任一块纠错失败即报错，作为几何裁决信号）
+    let rs = RsDecoder::new();
+    let decoded = if strict {
+        rs.decode_strict(&encoded_data)?
+    } else {
+        rs.decode(&encoded_data)?
+    };
 
     Ok(decoded)
 }
