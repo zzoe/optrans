@@ -5,13 +5,14 @@
 #                     用 nightly + build-std 现场编译标准库）
 # - macos:            aarch64/x86_64 双架构构建（接收端；发送端仅 Windows）
 #
-# 触发：push / PR 到 master，或手动运行。
+# 触发：push / PR 到 master、push v* tag（自动 Release）、或手动运行。
 
 name: CI
 
 on:
   push:
     branches: [master]
+    tags: ['v*']
   pull_request:
     branches: [master]
   workflow_dispatch:
@@ -122,3 +123,27 @@ jobs:
           name: optrans-macos
           path: dist/
           if-no-files-found: error
+
+  # 打 v* tag 时自动创建 GitHub Release，附带全部构建产物
+  release:
+    name: GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows-win8plus, windows-win7, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 创建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
