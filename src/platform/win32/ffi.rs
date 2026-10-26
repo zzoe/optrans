@@ -78,6 +78,8 @@ pub(crate) const WS_EX_TOPMOST: DWORD = 0x00000008;
 pub(crate) const WM_PAINT: UINT = 0x000F;
 pub(crate) const WM_CLOSE: UINT = 0x0010;
 pub(crate) const WM_DESTROY: UINT = 0x0002;
+/// 窗口销毁的最后一条非客户区消息：在此释放 USERDATA 上下文
+pub(crate) const WM_NCDESTROY: UINT = 0x0082;
 pub(crate) const WM_QUIT: UINT = 0x0012;
 pub(crate) const WM_ERASEBKGND: UINT = 0x0014;
 pub(crate) const WM_SETCURSOR: UINT = 0x0020;

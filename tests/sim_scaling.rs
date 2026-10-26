@@ -26,7 +26,7 @@ fn meta() -> MetaPayload {
 /// 发送端渲染（与 transmit.rs 相同的 Meta 二值渲染）
 fn render_sender(modules_w: u32, modules_h: u32) -> Vec<u8> {
     let frame = Frame::new_metadata(&meta(), 0).unwrap();
-    render_frame_default(&frame, MP, modules_w, modules_h, &GrayEncodingConfig::new(2), false)
+    render_frame_default(&frame, MP, modules_w, modules_h, &GrayEncodingConfig::new(2).unwrap(), false)
 }
 
 /// 合成"截屏"：黑底屏幕，帧图案从 (MARGIN, MARGIN) 开始，按 (scale_x, scale_y) 最近邻缩放
@@ -79,12 +79,22 @@ fn receiver_sees_meta_diag(screen: &[u8], w: i32, h: i32, verbose: bool) -> bool
         match decode_format_info(screen, w, h, loc) {
             Ok(info) => {
                 if info.frame_type == FrameType::Meta {
-                    if let Ok(f) = decode_frame(screen, w, h, loc, &EncodingMode::Auto) {
-                        if !f.payload.is_empty() {
+                    match decode_frame(screen, w, h, loc, &EncodingMode::Auto) {
+                        Ok(f) if !f.payload.is_empty() => {
                             if verbose {
                                 println!("[diag]   cand{} => META decoded", i);
                             }
                             return true;
+                        }
+                        Ok(_) => {
+                            if verbose {
+                                println!("[diag]   cand{} => META payload empty", i);
+                            }
+                        }
+                        Err(e) => {
+                            if verbose {
+                                println!("[diag]   cand{} => META decode err: {}", i, e);
+                            }
                         }
                     }
                 } else if verbose && i < 5 {
@@ -160,7 +170,7 @@ fn sim_data_frame_nonuniform() {
     )
     .unwrap();
     let pixels = render_frame_default(
-        &frame, MP, modules_w, modules_h, &GrayEncodingConfig::new(16), false,
+        &frame, MP, modules_w, modules_h, &GrayEncodingConfig::new(16).unwrap(), false,
     );
 
     let screen = compose_screen(

@@ -17,6 +17,6 @@ pub mod cli;
 pub mod common;
 pub mod decoder;
 pub mod encoder;
+pub mod platform;
 pub mod receiver;
 pub mod sender;
-pub mod win32;

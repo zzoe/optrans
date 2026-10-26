@@ -175,12 +175,12 @@ fn find_finder_at_corner(
 
                         // 验证找到的中心是否接近预期位置
                         if (center_x - expected_cx).abs() < (search_radius + 5 * m) as f64 {
-                            // 垂直验证（同时测量垂直模块尺寸）
-                            if let Some((v_ms, v_ms_alt)) = verify_finder_vertical_at(
+                            // 垂直验证（同时测量垂直模块尺寸并精修 Y 中心）
+                            if let Some((v_ms, v_ms_alt, center_y)) = verify_finder_vertical_at(
                                 pixels, w, h,
                                 center_x, scan_y as f64,
                             ) {
-                                return Some((center_x, scan_y as f64, module_size, v_ms, v_ms_alt));
+                                return Some((center_x, center_y, module_size, v_ms, v_ms_alt));
                             }
                         }
                     }
@@ -207,15 +207,16 @@ fn find_finder_at_corner(
 /// 在 cx 附近 ±4 像素（约 1 模块）的多列上扫描，
 /// 因为 finder 中心列全黑，必须偏移 1 模块才能看到 1:1:3:1:1 pattern。
 ///
-/// 返回 `Some((垂直模块尺寸, 备选垂直模块尺寸))` 如果验证通过
-/// （用于非均匀缩放下估算 modules_h），否则 `None`。
+/// 返回 `Some((垂直模块尺寸, 备选垂直模块尺寸, 亚像素 Y 中心))`
+/// （垂直模块尺寸用于非均匀缩放下估算 modules_h），否则 `None`。
+/// `亚像素 Y 中心` 用于精修候选的 center_y（见 check_vertical_pattern_sized）。
 fn verify_finder_vertical_at(
     pixels: &[u8],
     w: usize,
     h: usize,
     cx: f64,
     cy: f64,
-) -> Option<(f64, f64)> {
+) -> Option<(f64, f64, f64)> {
     let cx_i = cx as i32;
     let cy_i = cy as i32;
 
@@ -230,8 +231,10 @@ fn verify_finder_vertical_at(
     // 在 cx 附近 ±4 像素（约 1 模块）范围内扫描多列
     for dx in [-4i32, -2, 0, 2, 4] {
         let x_idx = ((cx_i + dx) as usize) * 4;
-        if let Some(v_ms) = check_vertical_pattern_sized(pixels, w, x_idx, y_start, y_end) {
-            return Some(v_ms);
+        if let Some((v_ms, v_ms_alt, center_y)) =
+            check_vertical_pattern_sized(pixels, w, x_idx, y_start, y_end)
+        {
+            return Some((v_ms, v_ms_alt, center_y));
         }
     }
 
@@ -269,9 +272,10 @@ pub fn locate_frame(pixels: &[u8], width: i32, height: i32) -> Option<FrameLocat
     let verified: Vec<FinderCandidate> = candidates
         .into_iter()
         .filter_map(|mut fp| {
-            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt)| {
+            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt, center_y)| {
                 fp.v_module_size = v_ms;
                 fp.v_module_size_alt = v_ms_alt;
+                fp.center_y = center_y;
                 fp
             })
         })
@@ -446,13 +450,14 @@ fn check_finder_ratio(counts: &[i32; 5]) -> bool {
 /// 寻找 1:1:3:1:1 比例。任一列匹配即通过。
 /// 注意：finder pattern 中心列全是黑色，必须扫描偏移 1 模块的列才能看到 pattern。
 ///
-/// 返回 `Some((垂直模块尺寸, 备选垂直模块尺寸))` 如果验证通过，否则 `None`。
+/// 返回 `Some((垂直模块尺寸, 备选垂直模块尺寸, 亚像素 Y 中心))` 如果验证通过，否则 `None`。
+/// Y 中心为游程边界推算的亚像素值，用于替换量化在扫描行格子上的 center_y。
 fn verify_finder_vertical(
     pixels: &[u8],
     w: usize,
     h: usize,
     fp: &FinderCandidate,
-) -> Option<(f64, f64)> {
+) -> Option<(f64, f64, f64)> {
     let cx = fp.center_x as i32;
     let cy = fp.center_y as i32;
     let ms = fp.module_size as i32;
@@ -480,8 +485,10 @@ fn verify_finder_vertical(
     let step = (ms / 2).max(1);
     for dx in (-ms..=ms).step_by(step as usize) {
         let x_idx = ((cx + dx) as usize) * 4;
-        if let Some(pair) = check_vertical_pattern_sized(pixels, w, x_idx, y_start, y_end) {
-            return Some(pair);
+        if let Some((v_ms, v_ms_alt, center_y)) =
+            check_vertical_pattern_sized(pixels, w, x_idx, y_start, y_end)
+        {
+            return Some((v_ms, v_ms_alt, center_y));
         }
     }
 
@@ -503,7 +510,8 @@ fn verify_finder_vertical(
                 }
             }
             if all_black {
-                return Some((fp.module_size, fp.module_size));
+                // 黑边截断场景无法亚像素精修，保留扫描行的 center_y
+                return Some((fp.module_size, fp.module_size, fp.center_y));
             }
         }
     }
@@ -511,21 +519,26 @@ fn verify_finder_vertical(
     None
 }
 
-/// 在指定列上做垂直 1:1:3:1:1 pattern 扫描，返回垂直模块尺寸
+/// 在指定列上做垂直 1:1:3:1:1 pattern 扫描，返回垂直模块尺寸与亚像素 Y 中心
 ///
-/// 返回 `(mid_ms, total_ms)` 两种估计：
+/// 返回 `(mid_ms, total_ms, center_y)`：
 /// - `mid_ms`: 内部 3 段总和 / 5（与水平方向 check_finder_ratio 一致）
 /// - `total_ms`: 全部 5 段总和 / 7（跨 7 模块平均，非整数缩放下量化误差更小）
+/// - `center_y`: finder 中心的亚像素 Y（由游程边界推算，与水平 center_x 同算法）
 ///
 /// 非整数缩放下单一估计可能量化偏差 ~4%（如 3.86→4.0），导致 modules_h
 /// 估算错 10+ 模块；两种估计生成备选候选，由格式信息 CRC 裁决。
+///
+/// 亚像素 Y 中心很关键：center_y 若取扫描行号，量化在扫描步长（3px）格子上，
+/// 数据采样网格按行累积偏移（顶端 ±1px 偏差 → 末端可达数像素），导致
+/// 小模块（缩放后 <3.5px）场景 RS 纠错超容整帧丢弃。
 fn check_vertical_pattern_sized(
     pixels: &[u8],
     w: usize,
     x_idx: usize,
     y_start: usize,
     y_end: usize,
-) -> Option<(f64, f64)> {
+) -> Option<(f64, f64, f64)> {
     let mut state_count = [0i32; 5];
     let mut state_idx = 0usize;
 
@@ -550,7 +563,13 @@ fn check_vertical_pattern_sized(
         } else {
             if state_idx == 4 {
                 if check_finder_ratio(&state_count) {
-                    return Some(sized_estimates(&state_count));
+                    // y 是 pattern 之后的第一个像素，pattern 最后像素在 y-1
+                    let center_y =
+                        (y as f64) - (state_count[4] as f64
+                            + state_count[3] as f64
+                            + state_count[2] as f64 / 2.0);
+                    let (ms, ms_alt) = sized_estimates(&state_count);
+                    return Some((ms, ms_alt, center_y));
                 }
                 for i in 0..4 {
                     state_count[i] = state_count[i + 1];
@@ -567,7 +586,11 @@ fn check_vertical_pattern_sized(
     }
 
     if state_idx == 4 && check_finder_ratio(&state_count) {
-        Some(sized_estimates(&state_count))
+        // 循环到 y_end 结束：pattern 之后第一个像素为 y_end + 1
+        let center_y = ((y_end + 1) as f64)
+            - (state_count[4] as f64 + state_count[3] as f64 + state_count[2] as f64 / 2.0);
+        let (ms, ms_alt) = sized_estimates(&state_count);
+        Some((ms, ms_alt, center_y))
     } else {
         None
     }
@@ -930,9 +953,10 @@ pub fn locate_frame_with_diag(
     let verified: Vec<FinderCandidate> = candidates
         .into_iter()
         .filter_map(|mut fp| {
-            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt)| {
+            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt, center_y)| {
                 fp.v_module_size = v_ms;
                 fp.v_module_size_alt = v_ms_alt;
+                fp.center_y = center_y;
                 fp
             })
         })
@@ -982,9 +1006,10 @@ pub fn locate_frame_all_with_diag(
     let verified: Vec<FinderCandidate> = candidates
         .into_iter()
         .filter_map(|mut fp| {
-            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt)| {
+            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt, center_y)| {
                 fp.v_module_size = v_ms;
                 fp.v_module_size_alt = v_ms_alt;
+                fp.center_y = center_y;
                 fp
             })
         })
@@ -1027,9 +1052,10 @@ pub fn locate_frame_all(
     let verified: Vec<FinderCandidate> = candidates
         .into_iter()
         .filter_map(|mut fp| {
-            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt)| {
+            verify_finder_vertical(pixels, w, h, &fp).map(|(v_ms, v_ms_alt, center_y)| {
                 fp.v_module_size = v_ms;
                 fp.v_module_size_alt = v_ms_alt;
+                fp.center_y = center_y;
                 fp
             })
         })

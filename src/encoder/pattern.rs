@@ -31,8 +31,15 @@ pub fn generate_finder_pattern() -> [[u8; 7]; 7] {
 /// - TL: (0, 0)
 /// - TR: (n_w - 7, 0)
 /// - BL: (0, n_h - 7)
+///
+/// M8: 尺寸小于 finder 时用 saturating_sub 防无符号下溢
+/// （release 模式下溢不 panic 但产生错误判定）。
 pub fn is_finder_module(col: u32, row: u32, n_w: u32, n_h: u32) -> bool {
     let s = 7; // finder pattern 尺寸
+    if n_w < s || n_h < s {
+        // 尺寸不足以容纳 finder，任何坐标都不在 finder 内
+        return false;
+    }
     // 左上角
     if col < s && row < s {
         return true;
@@ -53,7 +60,12 @@ pub fn is_finder_module(col: u32, row: u32, n_w: u32, n_h: u32) -> bool {
 /// 格式信息区：模块行 n_h-2 和 n_h-1（帧底部最后两行）
 /// 位于两个 finder pattern 之间（列 7..n_w-8）。
 /// v0.24: 从顶部移到帧末尾——底部最后渲染，格式信息完整=全帧已渲染（防撕裂）
+///
+/// M8: 尺寸不足时用 saturating_sub 防无符号下溢。
 pub fn is_format_module(col: u32, row: u32, n_w: u32, n_h: u32) -> bool {
+    if n_h < 2 || n_w < 14 {
+        return false;
+    }
     if row < n_h - 2 {
         return false;
     }

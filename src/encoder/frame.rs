@@ -12,6 +12,20 @@ use crate::encoder::reed_solomon::RsEncoder;
 /// 最大文件名长度（UTF-8 字节）
 const MAX_FILE_NAME_LEN: usize = 255;
 
+/// 载荷字节数上限：格式信息 payload_bytes 字段仅 21 bits（M9）
+const MAX_PAYLOAD_BYTES: usize = (1 << 21) - 1;
+
+/// 校验载荷长度可编码进 21 bits 的 payload_bytes 字段
+fn validate_payload_len(len: usize) -> OptransResult<u32> {
+    if len > MAX_PAYLOAD_BYTES {
+        return Err(OptransError::InvalidArgument(format!(
+            "载荷过长：{} 字节（最大 {} 字节，受格式信息 21 bits 字段限制）",
+            len, MAX_PAYLOAD_BYTES
+        )));
+    }
+    Ok(len as u32)
+}
+
 /// 构建完成的帧（含格式信息 + RS 编码后的数据）
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -77,11 +91,12 @@ impl Frame {
         payload.extend_from_slice(&block.index.to_le_bytes());
         payload.extend_from_slice(&block.data);
 
+        let pb = validate_payload_len(payload.len())?;
         let info = FormatInfo::new_data(
             seq,
             block.index,
             total_blocks,
-            payload.len() as u32,
+            pb,
             encoding_mode_bit,
         );
 
@@ -121,9 +136,10 @@ impl Frame {
         }
 
         let first_index = blocks.first().map(|b| b.index).unwrap_or(0);
+        let pb = validate_payload_len(payload.len())?;
         let info = FormatInfo::new_data(
             seq, first_index, total_blocks,
-            payload.len() as u32, encoding_mode_bit,
+            pb, encoding_mode_bit,
         );
 
         let encoder = RsEncoder::new();
@@ -158,12 +174,13 @@ impl Frame {
         parity_data: &[u8],
         encoding_mode_bit: u8,
     ) -> OptransResult<Frame> {
+        let pb = validate_payload_len(parity_data.len())?;
         let info = FormatInfo::new_parity(
             seq,
             group_idx,
             parity_idx,
             total_blocks,
-            parity_data.len() as u32,
+            pb,
             encoding_mode_bit,
         );
 

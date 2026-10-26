@@ -106,6 +106,11 @@ pub fn extract_format_modules_with_radius(
 ) -> Vec<u8> {
     let n_w = loc.modules_w as usize;
     let s = 7usize; // finder pattern 尺寸
+    // L5: 小尺寸防御——帧不足以容纳两个 finder + 格式区时无格式信息可提取
+    // （n_w < 14 或 n_h < 2 时 n_w - s / n_h - 2 会下溢）
+    if n_w < 2 * s || loc.modules_h < 2 {
+        return Vec::new();
+    }
     let start_col = s;
     let end_col = n_w - s;
 
@@ -167,6 +172,12 @@ pub fn extract_data_modules(
     let n_w = loc.modules_w as usize;
     let n_h = loc.modules_h as usize;
     let s = 7usize;
+
+    // L5: 小尺寸防御——帧不足以容纳 finder 时数据区提取无意义
+    // （is_in_finder 内 n_w - s / n_h - s 在小尺寸下下溢）
+    if n_w <= s || n_h <= s {
+        return Vec::new();
+    }
 
     let affine = AffineTransform::from_location(loc, loc.module_pixels);
 
@@ -263,10 +274,15 @@ fn sample_module_with_affine(
         }
         EncodingMode::Gray(_) => {
             // 单点采样：模块内像素值统一，窗口越界导致灰度分类错误
+            // M11: 2D 判界（镜像 sample_pixel_point）——负坐标经 wrapping 转 usize
+            // 会绕回巨大正数，仅靠 idx 长度判断会读到远处像素（甚至越界返回 0）
             let cx = px.round() as i32;
             let cy = py.round() as i32;
+            if cx < 0 || cx >= img_width || cy < 0 || cy >= img_height {
+                return 0;
+            }
             let w = img_width as usize;
-            let idx = ((cy as usize).wrapping_mul(w).wrapping_add(cx as usize)) * 4;
+            let idx = (cy as usize * w + cx as usize) * 4;
             if idx + 2 < pixels.len() {
                 let r = pixels[idx] as u32;
                 let g = pixels[idx + 1] as u32;
@@ -474,7 +490,7 @@ mod tests {
         let data: Vec<u8> = vec![0xAB, 0xCD, 0x12, 0x34];
 
         for levels in [2u32, 4, 8, 16] {
-            let config = crate::common::types::GrayEncodingConfig::new(levels);
+            let config = crate::common::types::GrayEncodingConfig::new(levels).unwrap();
             let (gray_values, original_len) =
                 crate::encoder::render::encode_gray_n(&data, &config);
             let decoded = decode_gray_n(&gray_values, levels, &config.thresholds, original_len);

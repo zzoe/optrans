@@ -155,8 +155,8 @@ fn format_module_index(col: usize, row: usize, n_w: usize, n_h: usize) -> usize 
 /// 否则使用 3× 重复（兼容窄帧）。
 fn encode_format_info_bits(info: &crate::common::types::FormatInfo, n_w: u32) -> Vec<u8> {
     // 动态计算重复次数：每份拷贝 120 bits (15 bytes × 8)，n 份 = 120*n
-    // 格式信息区 = 2 × (n_w - 14) 模块
-    let format_area_modules = 2 * (n_w as usize - 14);
+    // 格式信息区 = 2 × (n_w - 14) 模块（M8: saturating_sub 防小尺寸下溢）
+    let format_area_modules = 2 * (n_w as usize).saturating_sub(14);
     let copy_bits = FORMAT_INFO_WITH_CRC * 8; // 120
     let max_repetitions = format_area_modules / copy_bits; // 整数除，向下取整
     let repetitions = max_repetitions.min(5).max(1);
@@ -213,7 +213,14 @@ fn pack_format_info(info: &crate::common::types::FormatInfo, buf: &mut [u8]) {
     val |= seq << 2; // bits 2-17
     val |= bi << 18; // bits 18-49
     val |= tb << 50; // bits 50-81
-    val |= pb << 82; // bits 82-102 (21 bits)
+    // M9: payload_bytes 仅 21 bits，超限值静默截断会写入错误字段布局
+    // （高位溢出到 encoding_mode_bit 及以上）；掩码兜底 + debug_assert 暴露上游 bug
+    debug_assert!(
+        info.payload_bytes < (1 << 21),
+        "payload_bytes 超出 21 bits 上限: {}",
+        info.payload_bytes
+    );
+    val |= ((pb) & ((1u128 << 21) - 1)) << 82; // bits 82-102 (21 bits)
     val |= emb << 103; // bit 103: encoding_mode_bit
 
     // 104 bits → 13 bytes（小端序写入）
@@ -236,8 +243,11 @@ fn build_data_gray_sequence(
 ) -> Vec<u8> {
     let total_modules = n_w * n_h;
     let finder_modules = 3 * (7 * 7);
-    let format_modules = 2 * (n_w - 14);
-    let max_data_modules = total_modules - finder_modules - format_modules;
+    // M8: saturating 防小尺寸（n_w < 14）下溢，容量以 0 兜底
+    let format_modules = 2 * n_w.saturating_sub(14);
+    let max_data_modules = total_modules
+        .saturating_sub(finder_modules)
+        .saturating_sub(format_modules);
 
     // 应用数据掩码（XOR），打散大片同色区域
     let masked_payload = crate::common::mask::apply_mask(encoded_payload);
@@ -421,7 +431,7 @@ mod tests {
 
     #[test]
     fn test_encode_gray_2_roundtrip() {
-        let config = GrayEncodingConfig::new(2);
+        let config = GrayEncodingConfig::new(2).unwrap();
         let data: Vec<u8> = vec![0b10101010, 0b01010101, 0xFF];
         let (gray_values, original_len) = encode_gray_n(&data, &config);
 
@@ -432,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_encode_gray_4_roundtrip() {
-        let config = GrayEncodingConfig::new(4);
+        let config = GrayEncodingConfig::new(4).unwrap();
         let data: Vec<u8> = vec![0xE4, 0x00, 0xFF]; // 0xE4 = 11 10 01 00
         let (gray_values, original_len) = encode_gray_n(&data, &config);
         let decoded = decode_gray_direct_internal(&gray_values, 2, &config.thresholds, original_len);
@@ -441,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_encode_gray_8_roundtrip() {
-        let config = GrayEncodingConfig::new(8);
+        let config = GrayEncodingConfig::new(8).unwrap();
         let data: Vec<u8> = vec![0b111_110_10, 0b1_101_100_0];
         let (gray_values, original_len) = encode_gray_n(&data, &config);
         let decoded = decode_gray_direct_internal(&gray_values, 3, &config.thresholds, original_len);
@@ -450,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_encode_gray_16_roundtrip() {
-        let config = GrayEncodingConfig::new(16);
+        let config = GrayEncodingConfig::new(16).unwrap();
         let data: Vec<u8> = vec![0xAB, 0x12, 0xFF];
         let (gray_values, original_len) = encode_gray_n(&data, &config);
         let decoded = decode_gray_direct_internal(&gray_values, 4, &config.thresholds, original_len);
@@ -493,7 +503,7 @@ mod tests {
             format_info: info,
             encoded_payload: vec![0u8; 100],
         };
-        let config = GrayEncodingConfig::new(2);
+        let config = GrayEncodingConfig::new(2).unwrap();
         let n = MODULES_PER_SIDE_DEFAULT;
         let pixels = render_frame_default(&frame, 4, n, n, &config, false);
         assert_eq!(pixels.len(), 800 * 800 * 4);
@@ -508,7 +518,7 @@ mod tests {
         use crate::common::mask;
         use crate::decoder::extract;
 
-        let gray_config = GrayEncodingConfig::new(4);
+        let gray_config = GrayEncodingConfig::new(4).unwrap();
         let mp = 4u32;
         let n_w = 200u32;
         let n_h = 200u32;
@@ -579,7 +589,7 @@ mod tests {
             format_info: info,
             encoded_payload: vec![0u8; 100],
         };
-        let config = GrayEncodingConfig::new(2);
+        let config = GrayEncodingConfig::new(2).unwrap();
         let n_w: u32 = 160;
         let n_h: u32 = 90;
         let pixels = render_frame_default(&frame, 4, n_w, n_h, &config, false);

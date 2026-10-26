@@ -10,8 +10,8 @@
 //! 3. `GetDC(NULL)` + `CAPTUREBLT` — 含分层窗口（实验性）
 
 use crate::common::error::{OptransError, OptransResult};
-use crate::win32::ffi;
-use crate::win32::helpers::{check_hdc, last_error};
+use crate::platform::win32::ffi;
+use crate::platform::win32::helpers::{check_hdc, last_error};
 
 use log::warn;
 
@@ -131,6 +131,13 @@ pub fn capture_screen(x: i32, y: i32, w: i32, h: i32) -> OptransResult<(Vec<u8>,
     let r = do_capture(dc, x, y, w, h, SRCCOPY | CAPTUREBLT);
     unsafe { ffi::ReleaseDC(ffi::NULL as ffi::HWND, dc) };
     r.map(|p| (p.0, p.1, p.2, 3))
+}
+
+/// 主显示器尺寸（物理像素）
+pub fn screen_size() -> (i32, i32) {
+    let w = unsafe { ffi::GetSystemMetrics(ffi::SM_CXSCREEN) };
+    let h = unsafe { ffi::GetSystemMetrics(ffi::SM_CYSCREEN) };
+    (w, h)
 }
 
 pub fn capture_full_screen() -> OptransResult<(Vec<u8>, i32, i32)> {

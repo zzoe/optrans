@@ -16,6 +16,12 @@ pub enum OptransError {
     /// Win32 API 调用错误
     Win32(String),
 
+    /// 平台 API 调用错误（macOS 等）
+    Platform(String),
+
+    /// 当前平台不支持该操作
+    UnsupportedPlatform(&'static str),
+
     /// 帧解码错误
     FrameDecode(String),
 
@@ -52,6 +58,8 @@ impl fmt::Display for OptransError {
         match self {
             OptransError::Io(e) => write!(f, "IO 错误: {}", e),
             OptransError::Win32(msg) => write!(f, "Win32 错误: {}", msg),
+            OptransError::Platform(msg) => write!(f, "平台错误: {}", msg),
+            OptransError::UnsupportedPlatform(msg) => write!(f, "平台不支持: {}", msg),
             OptransError::FrameDecode(msg) => write!(f, "帧解码错误: {}", msg),
             OptransError::RsDecode(msg) => write!(f, "RS 解码错误: {}", msg),
             OptransError::ChecksumMismatch { expected, actual } => {

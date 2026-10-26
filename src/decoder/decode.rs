@@ -93,7 +93,8 @@ pub fn decode_format_info(
 
 /// v0.13: 根据帧模块宽度计算格式信息重复次数和所需最小比特数
 fn format_info_params(modules_w: u32) -> (usize, usize) {
-    let format_area = 2 * (modules_w as usize - 14);
+    // L5: saturating_sub 防小尺寸（modules_w < 14）下溢
+    let format_area = 2 * (modules_w as usize).saturating_sub(14);
     let copy_bits = 15 * 8; // 120 bits per copy
     let max_reps = (format_area / copy_bits).max(1);
     let reps = max_reps.min(5);
@@ -321,7 +322,8 @@ pub const MIN_REFINE_PAYLOAD: u32 = 8192;
 ///
 /// v0.29: 先严格解码（任一 RS 块纠错失败即失败）；失败时做 modules_h
 /// 几何搜索——格式信息区锚定在帧底部，其 CRC 对 modules_h 误差几乎不敏感，
-/// 唯一可靠的裁决信号是中部数据行的 RS 纠错成败。搜索仍失败则回退宽容解码。
+/// 唯一可靠的裁决信号是中部数据行的 RS 纠错成败。
+/// 全部失败则整帧报错（由块级 FEC 兜底），绝不混入未纠错数据。
 pub fn decode_payload(
     pixels: &[u8],
     img_width: i32,
@@ -340,11 +342,12 @@ pub fn decode_payload(
         other => other.clone(),
     };
 
-    // 1. 原始位置严格解码（正常路径，无额外开销）
-    if let Ok(v) = decode_payload_at(pixels, img_width, img_height, loc, info, &actual_mode, true)
+    // 1. 原始位置解码（正常路径，无额外开销）
+    let first_err = match decode_payload_at(pixels, img_width, img_height, loc, info, &actual_mode)
     {
-        return Ok(v);
-    }
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
 
     // 2. 几何搜索修正 modules_h 量化误差
     if let Some((_, payload)) =
@@ -353,8 +356,9 @@ pub fn decode_payload(
         return Ok(payload);
     }
 
-    // 3. 回退宽容解码（保持旧行为：部分损坏也尽量返回数据）
-    decode_payload_at(pixels, img_width, img_height, loc, info, &actual_mode, false)
+    // 3. 全部失败：整帧丢弃交给 FEC，失败计数周期告警（M12）
+    note_decode_failure(&first_err);
+    Err(first_err)
 }
 
 /// 几何精修（引擎侧入口）：返回修正后的 FrameLocation
@@ -378,7 +382,7 @@ pub fn refine_frame_geometry(
         other => other.clone(),
     };
     // 原始位置已正确
-    if decode_payload_at(pixels, img_width, img_height, loc, info, &actual_mode, true).is_ok() {
+    if decode_payload_at(pixels, img_width, img_height, loc, info, &actual_mode).is_ok() {
         return Some(loc.clone());
     }
     search_refined_geometry(pixels, img_width, img_height, loc, info, &actual_mode)
@@ -411,7 +415,7 @@ fn search_refined_geometry(
                 continue;
             }
             if let Ok(v) =
-                decode_payload_at(pixels, img_width, img_height, &cand, info, encoding_mode, true)
+                decode_payload_at(pixels, img_width, img_height, &cand, info, encoding_mode)
             {
                 return Some((cand, v));
             }
@@ -445,7 +449,9 @@ fn with_modules_h(loc: &FrameLocation, modules_h: u32) -> FrameLocation {
     }
 }
 
-/// 在指定位置解码载荷（可选严格模式）
+/// 在指定位置解码载荷
+///
+/// 任一 RS 块纠错失败即整体报错（[`RsDecoder::decode`]），不返回半损坏数据。
 fn decode_payload_at(
     pixels: &[u8],
     img_width: i32,
@@ -453,7 +459,6 @@ fn decode_payload_at(
     loc: &FrameLocation,
     info: &FormatInfo,
     encoding_mode: &EncodingMode,
-    strict: bool,
 ) -> OptransResult<Vec<u8>> {
     if info.payload_bytes == 0 {
         return Ok(Vec::new());
@@ -489,7 +494,10 @@ fn decode_payload_at(
     let relevant_modules = &module_values[..encoded_bits];
     let encoded_data = match encoding_mode {
         EncodingMode::Gray(levels) => {
-            let config = GrayEncodingConfig::new(*levels);
+            // 非法级数（非 2/4/8/16）不可能来自合法发送端，报错而非静默降级
+            let config = GrayEncodingConfig::new(*levels).map_err(|e| {
+                OptransError::FrameDecode(format!("非法灰度级数 {}: {}", levels, e))
+            })?;
             extract::decode_gray_n(relevant_modules, *levels, &config.thresholds, encoded_bytes)
         }
         _ => {
@@ -511,15 +519,28 @@ fn decode_payload_at(
     // v0.6: 反向应用数据掩码（XOR 自反），恢复原始 RS 编码字节
     let encoded_data = crate::common::mask::apply_mask(&encoded_data);
 
-    // RS 解码（严格模式：任一块纠错失败即报错，作为几何裁决信号）
+    // RS 解码：任一块纠错失败即报错（坏块混入会毒化 FEC，见 RsDecoder 文档）
     let rs = RsDecoder::new();
-    let decoded = if strict {
-        rs.decode_strict(&encoded_data)?
-    } else {
-        rs.decode(&encoded_data)?
-    };
+    let decoded = rs.decode(&encoded_data)?;
 
     Ok(decoded)
+}
+
+/// 载荷解码失败计数（M12）：整帧丢弃由 FEC 兜底是正常路径，
+/// 但持续高频失败意味着几何/显示质量问题，需要周期性告警而不是静默。
+static DECODE_FAIL_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// 记录一次载荷解码失败；首次与每累计 100 次输出一条 warn
+fn note_decode_failure(err: &OptransError) {
+    use std::sync::atomic::Ordering;
+    let n = DECODE_FAIL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(100) {
+        log::warn!(
+            "载荷解码失败（累计 {} 次，本帧交由 FEC 恢复）: {}",
+            n,
+            err
+        );
+    }
 }
 
 /// 完整解码一帧（格式信息 + 载荷）
@@ -571,8 +592,11 @@ pub fn parse_meta_payload(payload: &[u8]) -> OptransResult<MetaPayload> {
             "元数据格式错误：文件名超出边界".to_string(),
         ));
     }
-    let file_name = String::from_utf8(payload[offset..offset + name_len].to_vec())
+    let raw_name = String::from_utf8(payload[offset..offset + name_len].to_vec())
         .map_err(|e| OptransError::FrameDecode(format!("文件名 UTF-8 解码失败: {}", e)))?;
+    // 清洗文件名：剥离目录成分并拒绝非法名，防止路径穿越写文件
+    let file_name = crate::common::types::sanitize_file_name(&raw_name)
+        .map_err(|e| OptransError::FrameDecode(format!("文件名不合法: {}", e)))?;
     offset += name_len;
 
     if offset + 8 > payload.len() {

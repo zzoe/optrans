@@ -1,0 +1,12 @@
+//! Win32 平台实现
+//!
+//! 手工 FFI 声明与辅助函数，不依赖外部 Windows crate：
+//! - **ffi**: Win32 API 绑定（窗口创建、GDI、截屏等）
+//! - **helpers**: Win32 辅助函数（字符串转换、错误处理、HDC 检查、DPI 感知）
+//! - **capture**: GDI BitBlt 屏幕截取（RDP 三级回退）
+//! - **window**: 无边框全屏发送窗口（GDI 位图渲染）
+
+pub mod ffi;
+pub mod helpers;
+pub mod capture;
+pub mod window;

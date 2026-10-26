@@ -2,23 +2,21 @@
 //!
 //! 解析 CLI 参数并分派到发送端或接收端逻辑。
 
-use log::info;
+use log::{info, warn};
 use optrans::cli::{self, Command};
 use optrans::common::constants;
 use optrans::common::error::OptransResult;
 use optrans::common::types::validate_module_pixels;
-use optrans::win32::ffi;
-
-/// 声明进程 DPI 感知，使 GetSystemMetrics 返回物理像素而非逻辑像素。
-fn enable_dpi_awareness() {
-    unsafe { ffi::SetProcessDPIAware() };
-}
 
 fn main() -> OptransResult<()> {
     pretty_env_logger::formatted_builder()
         .filter_level(log::LevelFilter::Info)
         .init();
-    enable_dpi_awareness();
+    // 声明进程 DPI 感知，使截屏/尺寸返回物理像素而非逻辑像素。
+    // 失败时几何换算会错位（表现为接收端永远解不出帧），必须告警。
+    if !optrans::platform::set_process_dpi_aware() {
+        warn!("设置 DPI 感知失败，多显示器/高 DPI 环境下几何换算可能错位");
+    }
     let cmd = cli::parse_command();
 
     match cmd {

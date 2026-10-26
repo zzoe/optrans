@@ -2,7 +2,7 @@
 //!
 //! 提供宽字符串转换、错误处理等工具函数。
 
-use crate::win32::ffi;
+use crate::platform::win32::ffi;
 
 /// 将 Rust 字符串（UTF-8）转换为 Windows 宽字符串（UTF-16 LE）
 ///
@@ -100,6 +100,14 @@ pub fn check_hdc(hdc: ffi::HDC) -> crate::common::error::OptransResult<ffi::HDC>
         )));
     }
     Ok(hdc)
+}
+
+/// 声明进程 DPI 感知（PROCESS_SYSTEM_DPI_AWARE），
+/// 使 GetSystemMetrics/截屏均返回物理像素而非 DPI 虚拟化的逻辑像素。
+///
+/// 返回 false 表示设置失败（此时几何换算可能错位，调用方应告警）。
+pub fn set_process_dpi_aware() -> bool {
+    unsafe { ffi::SetProcessDPIAware() != 0 }
 }
 
 /// RAII 守卫：在存活期间阻止系统睡眠、熄屏与锁屏。

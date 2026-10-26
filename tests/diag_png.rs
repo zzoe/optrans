@@ -4,7 +4,10 @@ use optrans::decoder::decode::{decode_format_info, decode_format_info_with_geome
 use optrans::decoder::locate::locate_frame_all_with_diag;
 use optrans::common::types::EncodingMode;
 
-fn load_png(path: &str) -> (Vec<u8>, i32, i32) {
+/// 加载 PNG 为 RGBA 像素缓冲区。
+///
+/// 不支持的颜色类型（Palette/GrayAlpha 等）不 panic，返回 None 由调用方跳过（L1）。
+fn load_png(path: &str) -> Option<(Vec<u8>, i32, i32)> {
     let data = std::fs::read(path).expect("读取 png 失败");
     let decoder = png::Decoder::new(std::io::Cursor::new(data));
     let mut reader = decoder.read_info().expect("png 解码失败");
@@ -32,9 +35,12 @@ fn load_png(path: &str) -> (Vec<u8>, i32, i32) {
             }
             out
         }
-        other => panic!("不支持的 png 颜色类型: {:?}", other),
+        other => {
+            eprintln!("[skip] 不支持的 png 颜色类型: {:?}", other);
+            return None;
+        }
     };
-    (pixels, w, h)
+    Some((pixels, w, h))
 }
 
 /// 打印指定行的游程（run-length）序列，观察 finder 1:1:3:1:1 结构
@@ -88,7 +94,10 @@ fn diag_ascii_map() {
     if !std::path::Path::new(path).exists() {
         return;
     }
-    let (pixels, w, h) = load_png(path);
+    let (pixels, w, h) = match load_png(path) {
+        Some(v) => v,
+        None => return,
+    };
     eprintln!("[map] {}x{}", w, h);
     let block = 32;
     let mut y = 0;
@@ -114,7 +123,10 @@ fn diag_texture_map() {
     if !std::path::Path::new(path).exists() {
         return;
     }
-    let (pixels, w, h) = load_png(path);
+    let (pixels, w, h) = match load_png(path) {
+        Some(v) => v,
+        None => return,
+    };
     eprintln!("[tex] {}x{} 每格=64px 字符=黑像素占比(0:' ' 1-24:'.' 25-49:':' 50-74:'+' 75-99:'*' 100:'#')", w, h);
     let block = 64;
     let mut y = 0;
@@ -158,7 +170,10 @@ fn diag_pixel_structure() {
     if !std::path::Path::new(path).exists() {
         return;
     }
-    let (pixels, w, h) = load_png(path);
+    let (pixels, w, h) = match load_png(path) {
+        Some(v) => v,
+        None => return,
+    };
     eprintln!("[diag] 尺寸 {}x{}", w, h);
     // TL finder 区域行游程
     for y in [90, 100, 110, 117, 125, 135, 145, 160] {
@@ -177,11 +192,19 @@ fn diag_real_screenshot() {
         eprintln!("[diag] 1.png 不存在，跳过");
         return;
     }
-    let (pixels, w, h) = load_png(path);
+    let (pixels, w, h) = match load_png(path) {
+        Some(v) => v,
+        None => return,
+    };
     eprintln!("[diag] 截图尺寸: {}x{}", w, h);
 
     let cands = locate_frame_all_with_diag(&pixels, w, h);
     eprintln!("[diag] 候选数: {}", cands.len());
+    // L1: 补最小断言——真实截图必含 finder 候选；否则空跑测试等于没测
+    assert!(
+        !cands.is_empty(),
+        "1.png 应至少定位到一个 finder 候选，实际 0 个（定位回归）"
+    );
     for (i, (loc, diag)) in cands.iter().enumerate().take(8) {
         eprintln!(
             "[diag] cand{}: tl=({:.1},{:.1}) tr=({:.1},{:.1}) bl=({:.1},{:.1}) ms={:.2} modules={}x{} found={} verified={}",

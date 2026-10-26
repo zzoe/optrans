@@ -29,19 +29,19 @@ impl RsDecoder {
     ///
     /// # 返回
     /// 解码后的原始数据
-    pub fn decode(&self, encoded: &[u8]) -> OptransResult<Vec<u8>> {
-        self.decode_inner(encoded, false)
-    }
-
-    /// 严格模式解码：任一 RS 块纠错失败即返回错误
     ///
-    /// 用于几何精修裁决（v0.29）：采样网格错位时中部数据行的 RS 块必然
-    /// 大面积纠错失败，严格模式把这种失败显式暴露出来作为裁决信号。
-    pub fn decode_strict(&self, encoded: &[u8]) -> OptransResult<Vec<u8>> {
-        self.decode_inner(encoded, true)
+    /// 任一 RS 块纠错失败即返回 `Err`——绝不把未纠错的原始块字节混入结果。
+    /// 坏块混入会流入 FEC 层并阻断块级恢复（坏块被视为"已收到"永不覆盖），
+    /// 使本可恢复的传输降级为失败。宁可让本帧缺席，交给块级 FEC 兜底。
+    ///
+    /// 几何精修裁决（v0.29）也依赖这一语义：采样网格错位时中部数据行的
+    /// RS 块必然大面积纠错失败，失败被显式暴露出来作为裁决信号；
+    /// 解码成功即可反证几何正确。
+    pub fn decode(&self, encoded: &[u8]) -> OptransResult<Vec<u8>> {
+        self.decode_inner(encoded)
     }
 
-    fn decode_inner(&self, encoded: &[u8], strict: bool) -> OptransResult<Vec<u8>> {
+    fn decode_inner(&self, encoded: &[u8]) -> OptransResult<Vec<u8>> {
         if encoded.len() < 4 {
             return Err(OptransError::RsDecode(
                 "编码数据太短，无法读取长度头".to_string(),
@@ -91,22 +91,13 @@ impl RsDecoder {
 
             // 尝试纠错解码：decoder.correct() 返回 Result<Buffer, DecoderError>
             // Buffer 实现了 Deref<Target=[u8]>，包含 [已纠正数据 | ECC]
-            let corrected = match self.decoder.correct(block, None) {
-                Ok(buffer) => buffer,
-                Err(_) => {
-                    if strict {
-                        return Err(OptransError::RsDecode(format!(
-                            "RS 块 {} 纠错失败（共 {} 块）",
-                            block_idx, num_blocks
-                        )));
-                    }
-                    // 纠错失败，使用原始数据（可能部分损坏）
-                    // 提取前 217 字节作为数据
-                    let data_len = std::cmp::min(RS_DATA_LEN, total_len - block_idx * RS_DATA_LEN);
-                    result.extend_from_slice(&block[..data_len]);
-                    continue;
-                }
-            };
+            // 纠错失败直接报错，绝不混入未纠错字节（见 decode 文档）
+            let corrected = self.decoder.correct(block, None).map_err(|e| {
+                OptransError::RsDecode(format!(
+                    "RS 块 {} 纠错失败（共 {} 块）: {:?}",
+                    block_idx, num_blocks, e
+                ))
+            })?;
 
             // 提取纠正后的数据部分
             let data_len = std::cmp::min(RS_DATA_LEN, total_len - block_idx * RS_DATA_LEN);

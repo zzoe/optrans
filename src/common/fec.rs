@@ -23,6 +23,10 @@ use reed_solomon::{Decoder, Encoder};
 pub struct FecEncoder {
     /// 复用 reed-solomon 编码器（ecc_len = m）
     encoder: Encoder,
+    /// 数据分片数 k（实际生效的参数，而非全局常量）
+    k: usize,
+    /// 校验分片数 m
+    m: usize,
 }
 
 impl FecEncoder {
@@ -32,17 +36,14 @@ impl FecEncoder {
     }
 
     /// 创建指定参数的 FEC 编码器
+    ///
+    /// `data_shards`(k) 与 `parity_shards`(m) 均会真正生效（保存为实例字段）。
     pub fn with_params(data_shards: usize, parity_shards: usize) -> OptransResult<Self> {
-        if data_shards + parity_shards > 255 {
-            return Err(OptransError::InvalidArgument(format!(
-                "FEC 参数超出 GF(2^8) 上限: k={} + m={} = {} > 255",
-                data_shards,
-                parity_shards,
-                data_shards + parity_shards
-            )));
-        }
+        validate_fec_params(data_shards, parity_shards)?;
         Ok(FecEncoder {
             encoder: Encoder::new(parity_shards),
+            k: data_shards,
+            m: parity_shards,
         })
     }
 
@@ -58,8 +59,8 @@ impl FecEncoder {
     /// 逐字节位置 i 做 RS(k+m, k) 编码：取 k 个数据分片在第 i 列的字节
     /// 作为消息，encode 生成 m 个校验字节，写入 m 个校验分片的第 i 列。
     pub fn encode(&self, data_shards: &[Vec<u8>]) -> OptransResult<Vec<Vec<u8>>> {
-        let k = FEC_DATA_SHARDS;
-        let m = FEC_PARITY_SHARDS;
+        let k = self.k;
+        let m = self.m;
 
         if data_shards.len() != k {
             return Err(OptransError::InvalidArgument(format!(
@@ -105,7 +106,12 @@ impl FecEncoder {
 
 impl Default for FecEncoder {
     fn default() -> Self {
-        Self::new().expect("FEC 编码器初始化失败")
+        // 常量参数必过校验（128 + 64 = 192 ≤ 255），无需 expect
+        Self {
+            encoder: Encoder::new(FEC_PARITY_SHARDS),
+            k: FEC_DATA_SHARDS,
+            m: FEC_PARITY_SHARDS,
+        }
     }
 }
 
@@ -113,6 +119,10 @@ impl Default for FecEncoder {
 pub struct FecDecoder {
     /// 复用 reed-solomon 解码器（ecc_len = m）
     decoder: Decoder,
+    /// 数据分片数 k（实际生效的参数，而非全局常量）
+    k: usize,
+    /// 校验分片数 m
+    m: usize,
 }
 
 impl FecDecoder {
@@ -122,17 +132,14 @@ impl FecDecoder {
     }
 
     /// 创建指定参数的 FEC 解码器
+    ///
+    /// `data_shards`(k) 与 `parity_shards`(m) 均会真正生效（保存为实例字段）。
     pub fn with_params(data_shards: usize, parity_shards: usize) -> OptransResult<Self> {
-        if data_shards + parity_shards > 255 {
-            return Err(OptransError::InvalidArgument(format!(
-                "FEC 参数超出 GF(2^8) 上限: k={} + m={} = {} > 255",
-                data_shards,
-                parity_shards,
-                data_shards + parity_shards
-            )));
-        }
+        validate_fec_params(data_shards, parity_shards)?;
         Ok(FecDecoder {
             decoder: Decoder::new(parity_shards),
+            k: data_shards,
+            m: parity_shards,
         })
     }
 
@@ -151,8 +158,8 @@ impl FecDecoder {
         &self,
         shards: &mut [Option<Vec<u8>>],
     ) -> OptransResult<Vec<Vec<u8>>> {
-        let k = FEC_DATA_SHARDS;
-        let m = FEC_PARITY_SHARDS;
+        let k = self.k;
+        let m = self.m;
 
         if shards.len() != k + m {
             return Err(OptransError::InvalidArgument(format!(
@@ -227,8 +234,32 @@ impl FecDecoder {
 
 impl Default for FecDecoder {
     fn default() -> Self {
-        Self::new().expect("FEC 解码器初始化失败")
+        // 常量参数必过校验（128 + 64 = 192 ≤ 255），无需 expect
+        Self {
+            decoder: Decoder::new(FEC_PARITY_SHARDS),
+            k: FEC_DATA_SHARDS,
+            m: FEC_PARITY_SHARDS,
+        }
     }
+}
+
+/// 校验 FEC 参数合法性：k、m 至少为 1，且 k+m ≤ 255（GF(2^8) 上限）
+fn validate_fec_params(data_shards: usize, parity_shards: usize) -> OptransResult<()> {
+    if data_shards == 0 || parity_shards == 0 {
+        return Err(OptransError::InvalidArgument(format!(
+            "FEC 参数必须均为正数: k={} m={}",
+            data_shards, parity_shards
+        )));
+    }
+    if data_shards + parity_shards > 255 {
+        return Err(OptransError::InvalidArgument(format!(
+            "FEC 参数超出 GF(2^8) 上限: k={} + m={} = {} > 255",
+            data_shards,
+            parity_shards,
+            data_shards + parity_shards
+        )));
+    }
+    Ok(())
 }
 
 /// 计算给定数据块数需要的 FEC 组数
@@ -356,6 +387,51 @@ mod tests {
 
         let decoder = FecDecoder::new().unwrap();
         assert!(decoder.reconstruct_data(&mut shards).is_err());
+    }
+
+    #[test]
+    fn test_fec_custom_params_roundtrip() {
+        // 自定义参数 k=8 m=4 必须真正生效：丢 4 个分片可恢复，5 个则失败
+        let k = 8;
+        let m = 4;
+        let shard_size = 64;
+        let encoder = FecEncoder::with_params(k, m).unwrap();
+        let data: Vec<Vec<u8>> = (0..k)
+            .map(|i| vec![((i * 31) % 256) as u8; shard_size])
+            .collect();
+        let parity = encoder.encode(&data).unwrap();
+        assert_eq!(parity.len(), m);
+
+        // 丢 3 个数据 + 1 个校验 = 4 个（= m，可恢复）
+        let mut shards: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
+        shards.extend(parity.iter().cloned().map(Some));
+        shards[0] = None;
+        shards[3] = None;
+        shards[7] = None;
+        shards[k + 1] = None;
+
+        let decoder = FecDecoder::with_params(k, m).unwrap();
+        let recovered = decoder.reconstruct_data(&mut shards).unwrap();
+        for (i, s) in recovered.iter().enumerate() {
+            assert_eq!(s, &data[i], "分片 {} 恢复错误", i);
+        }
+
+        // 丢 5 个（> m）应失败
+        let mut shards2: Vec<Option<Vec<u8>>> = data.iter().cloned().map(Some).collect();
+        shards2.extend(parity.iter().cloned().map(Some));
+        for i in 0..5 {
+            shards2[i] = None;
+        }
+        assert!(decoder.reconstruct_data(&mut shards2).is_err());
+    }
+
+    #[test]
+    fn test_fec_params_reject_invalid() {
+        assert!(FecEncoder::with_params(0, 4).is_err());
+        assert!(FecEncoder::with_params(4, 0).is_err());
+        assert!(FecEncoder::with_params(200, 100).is_err());
+        assert!(FecDecoder::with_params(0, 4).is_err());
+        assert!(FecDecoder::with_params(200, 100).is_err());
     }
 
     #[test]

@@ -8,39 +8,61 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::common::constants::RGBA_CHANNELS;
 use crate::common::error::{OptransError, OptransResult};
-use crate::win32::ffi;
-use crate::win32::helpers::{check_hwnd, last_error, to_wide};
+use crate::platform::win32::ffi;
+use crate::platform::win32::helpers::{last_error, to_wide};
 
 use log::info;
 
 /// 窗口额外内存中存储用户数据的偏移（64 位指针 = 8 字节）
 const USERDATA_OFFSET: i32 = 0;
 
-/// 全局标志：窗口是否已关闭
-static WINDOW_CLOSED: AtomicBool = AtomicBool::new(false);
+/// `RegisterClassExW` 失败但类已存在（如重复创建窗口）时可安全忽略
+const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
 
-/// 发送端窗口结构
-pub struct SenderWindow {
-    /// 窗口句柄
-    hwnd: ffi::HWND,
-    /// 窗口宽度（像素，= 屏幕宽度 screen_w）
+/// 窗口上下文：随窗口生命周期存在的可变状态（M7+L4）。
+///
+/// # 指针契约
+/// 通过 `Box::into_raw` 将指针存入窗口额外内存（USERDATA），
+/// `wnd_proc` 在消息处理期间以 `&mut WindowContext` 访问；
+/// `WM_NCDESTROY`（窗口销毁的最后一条消息）中 `Box::from_raw` 取回并释放。
+/// `WM_PAINT` 之后不再有消息访问该指针，`SenderWindow::drop` 中兜底释放
+/// （仅当 WM_NCDESTROY 未走到时），因此指针在整个消息流内始终有效。
+struct WindowContext {
+    /// 位图缓冲区（RGBA，width × height），首地址在窗口存活期间不变
+    bitmap_buffer: Vec<u8>,
+    /// 窗口是否已被用户关闭（WM_CLOSE / WM_DESTROY）
+    closed: bool,
+    /// 窗口宽度（像素）
     width: i32,
-    /// 窗口高度（像素，= 屏幕高度 screen_h）
+    /// 窗口高度（像素）
     height: i32,
     /// 每模块像素数（用于从 modules 反算帧像素尺寸）
     module_pixels: u32,
     /// 帧边距像素数
     frame_margin: u32,
     /// 水平方向模块数
-    pub modules_per_side_w: u32,
+    modules_w: u32,
     /// 垂直方向模块数
-    pub modules_per_side_h: u32,
-    /// 位图缓冲区（RGBA，width × height = screen_w × screen_h）
-    bitmap_buffer: Vec<u8>,
+    modules_h: u32,
+}
+
+/// 从窗口 USERDATA 取回上下文指针。
+///
+/// # Safety
+/// 调用方须处于 wnd_proc 消息处理中（指针契约见 [`WindowContext`]）。
+unsafe fn ctx_ptr(hwnd: ffi::HWND) -> *mut WindowContext {
+    unsafe { ffi::GetWindowLongPtrW(hwnd, USERDATA_OFFSET) as *mut WindowContext }
+}
+
+/// 发送端窗口结构
+pub struct SenderWindow {
+    /// 窗口句柄
+    hwnd: ffi::HWND,
+    /// 窗口上下文（USERDATA 同指针；Drop 时兜底释放）
+    ctx: *mut WindowContext,
 }
 
 /// 窗口过程回调
@@ -55,51 +77,55 @@ unsafe extern "system" fn wnd_proc(
             let mut ps: ffi::PAINTSTRUCT = unsafe { std::mem::zeroed() };
             let hdc = unsafe { ffi::BeginPaint(hwnd, &mut ps) };
             if hdc != ffi::NULL as ffi::HDC {
-                // 获取窗口关联的位图缓冲区（通过 cbWndExtra 分配的额外窗口内存）
-                let pixels_ptr =
-                    unsafe { ffi::GetWindowLongPtrW(hwnd, USERDATA_OFFSET) } as *const u8;
-                if !pixels_ptr.is_null() {
+                // 获取窗口关联的上下文（通过 cbWndExtra 分配的额外窗口内存）
+                let ctx = unsafe { ctx_ptr(hwnd) };
+                if !ctx.is_null() {
+                    let ctx = unsafe { &mut *ctx };
                     let mut rect: ffi::RECT = unsafe { std::mem::zeroed() };
                     unsafe { ffi::GetClientRect(hwnd, &mut rect) };
                     let w = rect.right - rect.left;
                     let h = rect.bottom - rect.top;
 
-                    // 构建 BITMAPINFO
-                    let bmi_header = ffi::BITMAPINFOHEADER {
-                        biSize: std::mem::size_of::<ffi::BITMAPINFOHEADER>() as ffi::DWORD,
-                        biWidth: w,
-                        biHeight: -h, // 负值 = 自上而下
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        biCompression: ffi::BI_RGB,
-                        ..Default::default()
-                    };
+                    // 尺寸校验：客户区被系统改变（DPI 切换等）时跳过绘制，
+                    // 防止 SetDIBitsToDevice 以错误 stride 读越界
+                    if w > 0 && h > 0 && w == ctx.width && h == ctx.height {
+                        // 构建 BITMAPINFO
+                        let bmi_header = ffi::BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<ffi::BITMAPINFOHEADER>() as ffi::DWORD,
+                            biWidth: w,
+                            biHeight: -h, // 负值 = 自上而下
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: ffi::BI_RGB,
+                            ..Default::default()
+                        };
 
-                    let bmi = ffi::BITMAPINFO {
-                        bmiHeader: bmi_header,
-                        bmiColors: [ffi::RGBQUAD {
-                            rgbBlue: 0,
-                            rgbGreen: 0,
-                            rgbRed: 0,
-                            rgbReserved: 0,
-                        }],
-                    };
+                        let bmi = ffi::BITMAPINFO {
+                            bmiHeader: bmi_header,
+                            bmiColors: [ffi::RGBQUAD {
+                                rgbBlue: 0,
+                                rgbGreen: 0,
+                                rgbRed: 0,
+                                rgbReserved: 0,
+                            }],
+                        };
 
-                    unsafe {
-                        ffi::SetDIBitsToDevice(
-                            hdc,
-                            0,
-                            0,
-                            w as ffi::DWORD,
-                            h as ffi::DWORD,
-                            0,
-                            0,
-                            0,
-                            h as ffi::UINT,
-                            pixels_ptr as *const c_void,
-                            &bmi,
-                            ffi::DIB_RGB_COLORS,
-                        );
+                        unsafe {
+                            ffi::SetDIBitsToDevice(
+                                hdc,
+                                0,
+                                0,
+                                w as ffi::DWORD,
+                                h as ffi::DWORD,
+                                0,
+                                0,
+                                0,
+                                h as ffi::UINT,
+                                ctx.bitmap_buffer.as_ptr() as *const c_void,
+                                &bmi,
+                                ffi::DIB_RGB_COLORS,
+                            );
+                        }
                     }
                 }
                 unsafe { ffi::EndPaint(hwnd, &ps) };
@@ -126,15 +152,24 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
-        ffi::WM_DESTROY => {
-            WINDOW_CLOSED.store(true, Ordering::SeqCst);
+        ffi::WM_DESTROY | ffi::WM_CLOSE => {
+            let ctx = unsafe { ctx_ptr(hwnd) };
+            if !ctx.is_null() {
+                unsafe { (*ctx).closed = true };
+            }
             unsafe { ffi::PostQuitMessage(0) };
             0
         }
-        ffi::WM_CLOSE => {
-            WINDOW_CLOSED.store(true, Ordering::SeqCst);
-            unsafe { ffi::PostQuitMessage(0) };
-            0
+        ffi::WM_NCDESTROY => {
+            // 窗口销毁的最后一条消息：取回并释放上下文（指针契约见 WindowContext）
+            let ctx = unsafe { ctx_ptr(hwnd) };
+            if !ctx.is_null() {
+                unsafe {
+                    let _ = Box::from_raw(ctx);
+                    ffi::SetWindowLongPtrW(hwnd, USERDATA_OFFSET, 0);
+                }
+            }
+            unsafe { ffi::DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         _ => unsafe { ffi::DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
@@ -149,15 +184,26 @@ impl SenderWindow {
     pub fn create(module_pixels: u32, frame_margin: u32) -> OptransResult<Self> {
         let screen_w = unsafe { ffi::GetSystemMetrics(ffi::SM_CXSCREEN) };
         let screen_h = unsafe { ffi::GetSystemMetrics(ffi::SM_CYSCREEN) };
-        let modules_w = (screen_w as u32 - frame_margin * 2) / module_pixels;
-        let modules_h = (screen_h as u32 - frame_margin * 2) / module_pixels;
+        if screen_w <= 0 || screen_h <= 0 {
+            return Err(OptransError::WindowCreation(format!(
+                "GetSystemMetrics 返回非法屏幕尺寸: {}x{}",
+                screen_w, screen_h
+            )));
+        }
+        // L3: saturating_sub 防止边距大于屏幕时下溢
+        let modules_w = (screen_w as u32).saturating_sub(frame_margin * 2) / module_pixels;
+        let modules_h = (screen_h as u32).saturating_sub(frame_margin * 2) / module_pixels;
         Self::create_sized(module_pixels, modules_w, modules_h, frame_margin)
     }
 
     /// 创建指定模块尺寸的居中窗口（动态帧尺寸）
     pub fn create_sized(module_pixels: u32, modules_w: u32, modules_h: u32, frame_margin: u32) -> OptransResult<Self> {
-        // 重置全局标志
-        WINDOW_CLOSED.store(false, Ordering::SeqCst);
+        if modules_w == 0 || modules_h == 0 {
+            return Err(OptransError::WindowCreation(format!(
+                "模块尺寸为 0: modules={}x{} (module_pixels={})",
+                modules_w, modules_h, module_pixels
+            )));
+        }
 
         let hinstance = unsafe { ffi::GetModuleHandleW(ptr::null()) };
         if hinstance == ffi::NULL as ffi::HINSTANCE {
@@ -171,28 +217,31 @@ impl SenderWindow {
         let window_title = to_wide("optrans - Optical Transfer");
 
         // 窗口尺寸 = 帧图案尺寸 + 2×frame_margin 边距
-        let window_w = (modules_w * module_pixels + frame_margin * 2) as i32;
-        let window_h = (modules_h * module_pixels + frame_margin * 2) as i32;
+        // L3: saturating 链防止超大参数溢出为负
+        let window_w = (modules_w as usize)
+            .saturating_mul(module_pixels as usize)
+            .saturating_add(frame_margin as usize * 2)
+            .min(i32::MAX as usize) as i32;
+        let window_h = (modules_h as usize)
+            .saturating_mul(module_pixels as usize)
+            .saturating_add(frame_margin as usize * 2)
+            .min(i32::MAX as usize) as i32;
 
         // 居中显示
         let screen_w = unsafe { ffi::GetSystemMetrics(ffi::SM_CXSCREEN) };
         let screen_h = unsafe { ffi::GetSystemMetrics(ffi::SM_CYSCREEN) };
+        if screen_w <= 0 || screen_h <= 0 {
+            return Err(OptransError::WindowCreation(format!(
+                "GetSystemMetrics 返回非法屏幕尺寸: {}x{}",
+                screen_w, screen_h
+            )));
+        }
         let win_x = ((screen_w - window_w) / 2).max(0);
         let win_y = ((screen_h - window_h) / 2).max(0);
 
-        let modules_per_side_w = modules_w;
-        let modules_per_side_h = modules_h;
-
-        if modules_per_side_w == 0 || modules_per_side_h == 0 {
-            return Err(OptransError::WindowCreation(format!(
-                "模块尺寸为 0: modules={}x{} (module_pixels={})",
-                modules_w, modules_h, module_pixels
-            )));
-        }
-
-        // 帧图案实际像素尺寸（= modules_per_side × module_pixels，≤ 窗口尺寸 - 2×FRAME_MARGIN_PX）
-        let adjusted_w = (modules_per_side_w * module_pixels) as i32;
-        let adjusted_h = (modules_per_side_h * module_pixels) as i32;
+        // 帧图案实际像素尺寸（= modules × module_pixels，≤ 窗口尺寸 - 2×frame_margin）
+        let adjusted_w = (modules_w * module_pixels) as i32;
+        let adjusted_h = (modules_h * module_pixels) as i32;
 
         // 注册窗口类 —— 显式初始化所有字段
         let wc = ffi::WNDCLASSEXW {
@@ -212,10 +261,14 @@ impl SenderWindow {
 
         let atom = unsafe { ffi::RegisterClassExW(&wc) };
         if atom == 0 {
-            return Err(OptransError::WindowCreation(format!(
-                "RegisterClassExW 失败: {}",
-                last_error()
-            )));
+            // M7: 类已注册（如重复创建窗口）可安全复用，无需报错
+            let err = unsafe { ffi::GetLastError() };
+            if err != ERROR_CLASS_ALREADY_EXISTS {
+                return Err(OptransError::WindowCreation(format!(
+                    "RegisterClassExW 失败: {}",
+                    last_error()
+                )));
+            }
         }
 
         // 创建窗口（居中显示，尺寸 = window_w × window_h）
@@ -236,27 +289,29 @@ impl SenderWindow {
             )
         };
 
-        check_hwnd(hwnd)?;
-
-        // 分配位图缓冲区（全屏尺寸 = screen_w × screen_h，初始化为全黑）
-        let bitmap_buffer =
-            vec![0u8; (window_w as usize) * (window_h as usize) * RGBA_CHANNELS];
-
-        // 将位图缓冲区指针存储到窗口额外内存中
-        unsafe {
-            ffi::SetWindowLongPtrW(hwnd, USERDATA_OFFSET, bitmap_buffer.as_ptr() as isize);
+        if hwnd == ffi::NULL as ffi::HWND {
+            return Err(OptransError::WindowCreation(format!(
+                "CreateWindowExW 失败: {}",
+                last_error()
+            )));
         }
 
-        let mut window = SenderWindow {
-            hwnd,
+        // 分配窗口上下文（位图缓冲区初始化为全黑），Box::into_raw 存入 USERDATA
+        let ctx = Box::into_raw(Box::new(WindowContext {
+            bitmap_buffer: vec![0u8; (window_w as usize) * (window_h as usize) * RGBA_CHANNELS],
+            closed: false,
             width: window_w,
             height: window_h,
             module_pixels,
             frame_margin,
-            modules_per_side_w,
-            modules_per_side_h,
-            bitmap_buffer,
-        };
+            modules_w,
+            modules_h,
+        }));
+        unsafe {
+            ffi::SetWindowLongPtrW(hwnd, USERDATA_OFFSET, ctx as isize);
+        }
+
+        let mut window = SenderWindow { hwnd, ctx };
 
         // 渲染醒目的初始帧：全黑底色 + 白色窗口边缘边框
         window.render_initial_frame();
@@ -272,7 +327,7 @@ impl SenderWindow {
             "全屏窗口已显示 (0,0) {}×{}，帧图案 {}×{}（{}px边距），modules=({}w×{}h), module_pixels={}",
             window_w, window_h, adjusted_w, adjusted_h,
             frame_margin,
-            modules_per_side_w, modules_per_side_h, module_pixels
+            modules_w, modules_h, module_pixels
         );
 
         Ok(window)
@@ -280,9 +335,12 @@ impl SenderWindow {
 
     /// 渲染初始可见帧（全黑 + 白色窗口边缘边框），确保用户能看到窗口
     fn render_initial_frame(&mut self) {
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let buf = &mut self.bitmap_buffer;
+        // SAFETY: ctx 由 create_sized 分配且有效，未销毁前不释放
+        let ctx = unsafe { &mut *self.ctx };
+
+        let w = ctx.width as usize;
+        let h = ctx.height as usize;
+        let buf = &mut ctx.bitmap_buffer;
 
         // 填充整个缓冲区为黑色
         buf.fill(0);
@@ -305,13 +363,9 @@ impl SenderWindow {
             }
         }
 
-        // 更新窗口用户数据指针（缓冲区地址未变，但显式更新以策安全）
+        // 缓冲区首地址存入窗口额外内存（wnd_proc 通过 USERDATA 取回）
         unsafe {
-            ffi::SetWindowLongPtrW(
-                self.hwnd,
-                USERDATA_OFFSET,
-                self.bitmap_buffer.as_ptr() as isize,
-            );
+            ffi::SetWindowLongPtrW(self.hwnd, USERDATA_OFFSET, self.ctx as isize);
         }
     }
 
@@ -320,13 +374,15 @@ impl SenderWindow {
     /// 帧像素（adjusted_w × adjusted_h）居中写入 bitmap_buffer，四周留黑边。
     /// `pixels` 是 adjusted_w × adjusted_h 的 RGBA 像素数据。
     pub fn update_bitmap(&mut self, pixels: &[u8]) {
-        let window_w = self.width as usize;
-        let frame_w = (self.modules_per_side_w * self.module_pixels) as usize;
-        let frame_h = (self.modules_per_side_h * self.module_pixels) as usize;
-        let margin = self.frame_margin as usize;
+        // SAFETY: ctx 由 create_sized 分配且有效，未销毁前不释放
+        let ctx = unsafe { &mut *self.ctx };
+        let window_w = ctx.width as usize;
+        let frame_w = (ctx.modules_w * ctx.module_pixels) as usize;
+        let frame_h = (ctx.modules_h * ctx.module_pixels) as usize;
+        let margin = ctx.frame_margin as usize;
 
         // 清空整个缓冲区为黑色
-        self.bitmap_buffer.fill(0);
+        ctx.bitmap_buffer.fill(0);
 
         // 将帧像素逐行写入 bitmap_buffer，起始偏移 (margin, margin)
         let expected_len = frame_w * frame_h * RGBA_CHANNELS;
@@ -343,16 +399,7 @@ impl SenderWindow {
             let row_data = &pixels[row_start..row_end];
             let dst_start = dst_base + row * dst_stride;
             let dst_end = dst_start + row_data.len();
-            self.bitmap_buffer[dst_start..dst_end].copy_from_slice(row_data);
-        }
-
-        // 更新窗口用户数据指针
-        unsafe {
-            ffi::SetWindowLongPtrW(
-                self.hwnd,
-                USERDATA_OFFSET,
-                self.bitmap_buffer.as_ptr() as isize,
-            );
+            ctx.bitmap_buffer[dst_start..dst_end].copy_from_slice(row_data);
         }
 
         // 触发 WM_PAINT
@@ -418,8 +465,10 @@ impl SenderWindow {
             }
         }
 
-        // 检查窗口是否已关闭
-        if WINDOW_CLOSED.load(Ordering::SeqCst) {
+        // 检查窗口是否已关闭（M7+L4: 读窗口上下文而非全局标志）
+        // SAFETY: ctx 由 create_sized 分配且有效，未销毁前不释放
+        let closed = unsafe { (*self.ctx).closed };
+        if closed {
             return false;
         }
 
@@ -460,9 +509,17 @@ impl Drop for SenderWindow {
         unsafe { ffi::ShowCursor(ffi::TRUE) };
         if self.hwnd != ffi::NULL as ffi::HWND {
             unsafe {
+                // DestroyWindow 触发 WM_NCDESTROY，wnd_proc 中已释放上下文并将
+                // USERDATA 清零；仅当 DestroyWindow 未能送达消息（窗口已由系统
+                // 销毁）时 USERDATA 仍非零，此时兜底释放。
                 ffi::DestroyWindow(self.hwnd);
+                let ctx = ffi::GetWindowLongPtrW(self.hwnd, USERDATA_OFFSET) as *mut WindowContext;
+                if !ctx.is_null() {
+                    drop(Box::from_raw(ctx));
+                }
             }
             self.hwnd = ffi::NULL as ffi::HWND;
+            self.ctx = ptr::null_mut();
         }
     }
 }

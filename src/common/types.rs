@@ -47,6 +47,20 @@ pub enum EncodingMode {
 
 // ─── 灰度编码配置 ───
 
+/// 合法灰度级数（位宽直映射仅支持 2/4/8/16 级）
+pub const VALID_GRAY_LEVELS: [u32; 4] = [2, 4, 8, 16];
+
+/// 校验灰度级数是否合法（M8：入口校验，非法值不得进入灰度表构建）
+pub fn validate_gray_levels(levels: u32) -> crate::common::error::OptransResult<()> {
+    if !VALID_GRAY_LEVELS.contains(&levels) {
+        return Err(crate::common::error::OptransError::InvalidArgument(format!(
+            "灰度级数必须是 {:?} 之一，当前值: {}",
+            VALID_GRAY_LEVELS, levels
+        )));
+    }
+    Ok(())
+}
+
 /// 灰度编码配置
 #[derive(Debug, Clone)]
 pub struct GrayEncodingConfig {
@@ -60,19 +74,30 @@ pub struct GrayEncodingConfig {
 
 impl GrayEncodingConfig {
     /// 根据级数创建配置
-    pub fn new(levels: u32) -> Self {
+    ///
+    /// M8：`levels` 必须是 [`VALID_GRAY_LEVELS`] 之一，
+    /// 非法值（尤其 0/1，会使 `levels-1` 下溢、除零）返回 `Err`。
+    pub fn new(levels: u32) -> crate::common::error::OptransResult<Self> {
+        validate_gray_levels(levels)?;
         let gray_table = Self::build_gray_table(levels);
         let thresholds = Self::build_thresholds(&gray_table);
-        GrayEncodingConfig {
+        Ok(GrayEncodingConfig {
             levels,
             gray_table,
             thresholds,
-        }
+        })
     }
 
     /// N 级等间距灰度值表
+    ///
+    /// 调用方须先通过 [`validate_gray_levels`]（[`GrayEncodingConfig::new`] 已内置）。
     pub fn build_gray_table(levels: u32) -> Vec<u8> {
-        if levels == 2 {
+        debug_assert!(
+            VALID_GRAY_LEVELS.contains(&levels),
+            "非法灰度级数: {}",
+            levels
+        );
+        if levels <= 2 {
             return vec![0, 255];
         }
         let step = 255.0 / (levels - 1) as f64;
@@ -112,11 +137,12 @@ impl GrayEncodingConfig {
 ///   (max 2,097,151，16 级灰度单帧可达 ~256KB)
 /// - encoding_mode_bit: 1 bit (bit 103)
 /// 总计：104 bits（13 bytes）
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FormatInfo {
-    /// 帧类型：0=Meta, 1=Data, 2=EOT
+    /// 帧类型：0=Meta, 1=Data, 2=EOT, 3=FecParity
     pub frame_type: FrameType,
-    /// 帧序号，从 0 递增，接收端用于去重
+    /// 帧序号，从 0 递增（u16 会回绕）；接收端用于漏帧告警，
+    /// 去重由 collector 的块级 first-write-wins 负责（不依赖序号）
     pub frame_sequence: u16,
     /// 数据块索引（元数据帧/EOT 帧填 0）
     pub block_index: u32,
@@ -340,4 +366,85 @@ pub fn validate_module_pixels(pixels: u32) -> crate::common::error::OptransResul
         )));
     }
     Ok(())
+}
+
+/// 清洗来自光学信道的文件名，防止路径穿越/任意位置写文件。
+///
+/// 规则：
+/// - 剥离所有目录成分（`/`、`\` 分隔），只保留最后的纯文件名
+/// - 拒绝空名、`.`、`..`
+/// - 拒绝含 `:`（盘符/NTFS 流）、控制字符或 Windows 非法字符的名称
+/// - 拒绝 Windows 保留设备名（CON、NUL 等）
+pub fn sanitize_file_name(name: &str) -> crate::common::error::OptransResult<String> {
+    // 1. 剥离目录成分（unix 与 windows 分隔符都处理）
+    let base = name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim();
+
+    // 2. 基本合法性
+    if base.is_empty() || base == "." || base == ".." {
+        return Err(crate::common::error::OptransError::InvalidArgument(format!(
+            "文件名无效: {:?}",
+            name
+        )));
+    }
+
+    // 3. 非法字符（含 : 防盘符/NTFS 流）
+    if base.contains(|c: char| {
+        c.is_control() || matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|')
+    }) {
+        return Err(crate::common::error::OptransError::InvalidArgument(format!(
+            "文件名含非法字符: {:?}",
+            name
+        )));
+    }
+
+    // 4. Windows 保留设备名（含带扩展名形式，如 NUL.txt）
+    let stem = base.split('.').next().unwrap_or("").to_ascii_uppercase();
+    const RESERVED: [&str; 22] = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&stem.as_str()) {
+        return Err(crate::common::error::OptransError::InvalidArgument(format!(
+            "文件名为系统保留名: {:?}",
+            name
+        )));
+    }
+
+    Ok(base.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_file_name;
+
+    #[test]
+    fn test_sanitize_file_name_strips_directories() {
+        assert_eq!(sanitize_file_name("a/b.txt").unwrap(), "b.txt");
+        assert_eq!(sanitize_file_name("..\\..\\evil.exe").unwrap(), "evil.exe");
+        assert_eq!(sanitize_file_name("../../etc/passwd").unwrap(), "passwd");
+        assert_eq!(sanitize_file_name("\\\\srv\\share\\y").unwrap(), "y");
+        assert_eq!(sanitize_file_name("plain.bin").unwrap(), "plain.bin");
+    }
+
+    #[test]
+    fn test_sanitize_file_name_rejects_traversal() {
+        // 仅目录成分的名称、空名
+        assert!(sanitize_file_name("..").is_err());
+        assert!(sanitize_file_name("../..").is_err());
+        assert!(sanitize_file_name("").is_err());
+        assert!(sanitize_file_name("/").is_err());
+        assert!(sanitize_file_name(".").is_err());
+        // 盘符/NTFS 流、非法字符
+        assert!(sanitize_file_name("C:").is_err());
+        assert!(sanitize_file_name("file:stream").is_err());
+        assert!(sanitize_file_name("a*b").is_err());
+        assert!(sanitize_file_name("a\u{7}b").is_err());
+        // Windows 保留设备名
+        assert!(sanitize_file_name("NUL").is_err());
+        assert!(sanitize_file_name("con.txt").is_err());
+    }
 }

@@ -64,6 +64,18 @@ impl FileAssembler {
             }
         }
 
+        // 按 file_size 截断：末块可能因 FEC 恢复而补零到 block_size，
+        // 或块本身带 padding，必须截掉尾部填充后再校验
+        let file_size = self.meta.file_size as usize;
+        if data.len() < file_size {
+            return Err(OptransError::IncompleteTransfer {
+                missing: (0..(total_blocks as u32))
+                    .filter(|i| !self.blocks.contains_key(i))
+                    .collect(),
+            });
+        }
+        data.truncate(file_size);
+
         // SHA-256 校验
         let mut hasher = Sha256::new();
         hasher.update(&data);
@@ -101,4 +113,56 @@ fn hex_str(data: &[u8]) -> String {
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::MetaPayload;
+
+    fn meta_for(file_size: u64, total_blocks: u32, data: &[u8]) -> MetaPayload {
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash = hasher.finalize();
+        let mut sha256 = [0u8; 32];
+        sha256.copy_from_slice(&hash);
+        MetaPayload {
+            file_name: "test.bin".to_string(),
+            file_size,
+            sha256,
+            total_blocks,
+            fec_k: 128,
+            fec_m: 64,
+            fec_groups: 1,
+            fec_shard_size: 8,
+        }
+    }
+
+    #[test]
+    fn test_finalize_truncates_last_block_padding() {
+        // block_size=8、file_size=13：末块含 3 字节补零（FEC 恢复场景）
+        let content = b"hello world!!"; // 13 bytes
+        let mut block0 = Vec::from(&content[..8]);
+        block0.resize(8, 0);
+        let mut block1 = Vec::from(&content[8..]);
+        block1.resize(8, 0); // 补零到 block_size
+
+        let meta = meta_for(13, 2, content);
+        let mut asm = FileAssembler::new(meta);
+        asm.add_block(0, block0);
+        asm.add_block(1, block1);
+        let out = asm.finalize().expect("补零末块必须按 file_size 截断后通过 SHA");
+        assert_eq!(out, content.to_vec());
+    }
+
+    #[test]
+    fn test_finalize_short_data_fails() {
+        // 拼接后长度 < file_size：视为缺块
+        let content = b"hello world!!";
+        let meta = meta_for(20, 2, content);
+        let mut asm = FileAssembler::new(meta);
+        asm.add_block(0, b"hello wo".to_vec());
+        asm.add_block(1, b"rld!!".to_vec());
+        assert!(asm.finalize().is_err());
+    }
 }

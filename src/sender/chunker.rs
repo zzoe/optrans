@@ -95,6 +95,131 @@ fn chunk_data_with_size(data: &[u8], block_size: usize) -> Vec<BlockData> {
     blocks
 }
 
+/// 文件流式扫描结果（M10：第一遍读，不驻留文件内容）
+///
+/// 只记录文件元信息与每块长度（8B/块），块数据由第二遍读按需加载。
+pub struct FileScan {
+    /// 文件名（不含目录）
+    pub file_name: String,
+    /// 文件总字节数
+    pub file_size: u64,
+    /// 全文件 SHA-256
+    pub sha256: [u8; 32],
+    /// 每块字节数（最后一块可能小于 block_size；空文件为空表）
+    pub block_sizes: Vec<usize>,
+}
+
+impl FileScan {
+    /// 总块数
+    pub fn total_blocks(&self) -> u32 {
+        self.block_sizes.len() as u32
+    }
+}
+
+/// 流式扫描文件：逐块读取计算 SHA-256 与块长度表，不驻留块数据（M10）
+///
+/// 与 [`read_file_with_block_size`] 的分块语义一致（`block_size == 0` 视为 0 块）。
+pub fn scan_file(path: &Path, block_size: usize) -> OptransResult<FileScan> {
+    if !path.exists() {
+        return Err(OptransError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("文件不存在: {:?}", path),
+        )));
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| OptransError::InvalidArgument(format!("无法获取文件名: {:?}", path)))?;
+
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut block_sizes: Vec<usize> = Vec::new();
+    let mut file_size = 0u64;
+
+    if block_size > 0 {
+        let mut buf = vec![0u8; block_size];
+        loop {
+            // 与 chunk_data_with_size 一致：按 block_size 切块，末块取剩余
+            let mut filled = 0usize;
+            while filled < block_size {
+                let n = {
+                    use std::io::Read;
+                    file.read(&mut buf[filled..])?
+                };
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+            if filled == 0 {
+                break;
+            }
+            hasher.update(&buf[..filled]);
+            block_sizes.push(filled);
+            file_size += filled as u64;
+            if filled < block_size {
+                break;
+            }
+        }
+    }
+
+    let hash_result = hasher.finalize();
+    let mut sha256 = [0u8; 32];
+    sha256.copy_from_slice(&hash_result);
+
+    Ok(FileScan {
+        file_name,
+        file_size,
+        sha256,
+        block_sizes,
+    })
+}
+
+/// 按块序号范围读取块数据（第二遍读，M10）
+///
+/// 返回 `[start_block, start_block + count)` 的块列表；超出文件末尾的块被截断。
+pub fn read_blocks_range(
+    path: &Path,
+    block_size: usize,
+    start_block: u32,
+    count: u32,
+) -> OptransResult<Vec<BlockData>> {
+    let mut file = fs::File::open(path)?;
+    {
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(start_block as u64 * block_size as u64))?;
+    }
+
+    let mut blocks = Vec::with_capacity(count as usize);
+    let mut buf = vec![0u8; block_size.max(1)];
+    for i in 0..count {
+        let mut filled = 0usize;
+        if block_size > 0 {
+            use std::io::Read;
+            while filled < block_size {
+                let n = file.read(&mut buf[filled..])?;
+                if n == 0 {
+                    break;
+                }
+                filled += n;
+            }
+        }
+        if filled == 0 {
+            break;
+        }
+        blocks.push(BlockData {
+            index: start_block + i,
+            data: buf[..filled].to_vec(),
+        });
+        if filled < block_size {
+            break;
+        }
+    }
+    Ok(blocks)
+}
+
 /// 计算数据的 SHA-256 哈希值
 pub fn compute_sha256(data: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
