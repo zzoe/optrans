@@ -31,8 +31,13 @@ use log::{debug, info, warn};
 /// 首帧 / 末帧驻留时间（ms）
 const BOUNDARY_DWELL_MS: u64 = 100;
 
-/// 有效的灰度级数（2 的幂，bit 直映射）
-const VALID_GRAY_LEVELS: [u32; 4] = [2, 4, 8, 16];
+/// EOT 帧驻留时间（ms）
+///
+/// 必须是帧间隔的十几倍：远程桌面链路实测丢帧 ~40%，EOT 只驻留一个帧周期
+/// 时有近一半概率整帧被编码器丢掉，接收端永远等不到结束信号（实测症状：
+/// 数据全部收齐后仍持续截屏，只能 Ctrl+C）。1.5s ≈ 15 个帧周期，全丢概率
+/// 可忽略。
+const EOT_DWELL_MS: u64 = 1500;
 
 /// 将字节数组格式化为十六进制字符串
 fn hex_str(data: &[u8]) -> String {
@@ -345,8 +350,8 @@ pub fn run_send(path: PathBuf, gray_levels: u32) -> OptransResult<()> {
     debug!("  [EOT] seq={}", eot_frame.sequence());
 
     // EOT 帧驻留，确保接收端有充足时间检测
-    info!("EOT 帧驻留 {}ms，等待接收端确认...", BOUNDARY_DWELL_MS);
-    window.wait_with_message_pump(BOUNDARY_DWELL_MS);
+    info!("EOT 帧驻留 {}ms，等待接收端确认...", EOT_DWELL_MS);
+    window.wait_with_message_pump(EOT_DWELL_MS);
     info!("发送完成，窗口即将关闭");
 
     Ok(())

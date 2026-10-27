@@ -255,6 +255,104 @@ fn sim_gray4_auto_detect_levels() {
     assert_eq!(f.payload.len(), frame.format_info.payload_bytes as usize);
 }
 
+/// 回归：模式位被抹成 0 的 4 级灰度帧仍能解码。
+///
+/// 现场症状：远端视频编码把格式信息里的模式位量化成 0，接收端按二值解，
+/// 直接报「需要 N modules，实际 99961 modules」——灰度帧永远进不了 RS 裁决。
+/// Auto 必须在「容量不足」时回退到灰度级数重试。
+#[test]
+fn sim_gray4_with_binary_mode_bit_falls_back() {
+    use optrans::common::types::BlockData;
+
+    let modules_w = 502u32;
+    let modules_h = 304u32;
+    let block = BlockData {
+        index: 0,
+        data: vec![0xA5u8; 20_000],
+    };
+    // 故意写 encoding_mode_bit = 0（二值），但按 4 级灰度渲染
+    let frame = Frame::new_data_merged(&[&block], 1, 1, 0).unwrap();
+    assert_eq!(frame.format_info.encoding_mode_bit, 0);
+    let pixels = render_frame_default(
+        &frame,
+        MP,
+        modules_w,
+        modules_h,
+        &GrayEncodingConfig::new(4).unwrap(),
+        false,
+    );
+    let screen = compose_screen(
+        &pixels,
+        modules_w as usize * MP as usize,
+        modules_h as usize * MP as usize,
+        2048, 1280, 1.0, 1.0,
+    );
+
+    let mut decoded = None;
+    for (loc, _) in locate_frame_all_with_diag(&screen, 2048, 1280) {
+        if let Ok(f) = decode_frame(&screen, 2048, 1280, &loc, &EncodingMode::Auto) {
+            if f.frame_type == FrameType::Data && !f.payload.is_empty() {
+                decoded = Some(f);
+                break;
+            }
+        }
+    }
+    let f = decoded.expect("模式位为 0 的 4 级灰度帧应回退到灰度解码");
+    assert_eq!(f.encoding_mode, EncodingMode::Gray(4));
+    assert_eq!(f.payload.len(), frame.format_info.payload_bytes as usize);
+}
+
+/// 回归：链路把黑电平抬到 76（限制范围 YUV 未展开）时，4 级灰度仍能解码。
+///
+/// 现场症状：理想阈值（43/128/213）下最暗一档（76）> 43 被判成第二档，
+/// 全帧整体错位，四个级数全部 RS 失败。自适应标定应把阈值拉回实测的
+/// 簇心中点（≈106/166/225）。
+#[test]
+fn sim_gray4_with_lifted_black_level() {
+    use optrans::common::types::BlockData;
+
+    let modules_w = 502u32;
+    let modules_h = 304u32;
+    let block = BlockData {
+        index: 0,
+        data: vec![0x3Cu8; 20_000],
+    };
+    let frame = Frame::new_data_merged(&[&block], 1, 1, 1).unwrap();
+    let mut pixels = render_frame_default(
+        &frame,
+        MP,
+        modules_w,
+        modules_h,
+        &GrayEncodingConfig::new(4).unwrap(),
+        false,
+    );
+    // 模拟远程桌面：黑 0 → 76，白 255 → 255，中间线性压缩
+    for p in pixels.chunks_exact_mut(4) {
+        for c in 0..3 {
+            p[c] = (76.0 + p[c] as f64 * 179.0 / 255.0).round() as u8;
+        }
+    }
+    let screen = compose_screen(
+        &pixels,
+        modules_w as usize * MP as usize,
+        modules_h as usize * MP as usize,
+        2048, 1280, 1.0, 1.0,
+    );
+
+    let mut decoded = None;
+    for (loc, _) in locate_frame_all_with_diag(&screen, 2048, 1280) {
+        if let Ok(f) = decode_frame(&screen, 2048, 1280, &loc, &EncodingMode::Auto) {
+            if f.frame_type == FrameType::Data && !f.payload.is_empty() {
+                decoded = Some(f);
+                break;
+            }
+        }
+    }
+    let f = decoded.expect("黑电平抬升后 4 级灰度帧应能自适应标定解码");
+    assert_eq!(f.encoding_mode, EncodingMode::Gray(4));
+    assert_eq!(f.payload.len(), frame.format_info.payload_bytes as usize);
+}
+
 /// 回归：TL 中心测量偏低半个模块时，格式区（锚定 BL）仍可解码，
 /// 但数据区（从帧顶部起算）全错 → 载荷 RS 失败。
 /// 原点微扫应能找回载荷，并修正 finder 位置。

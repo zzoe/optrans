@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 /// optrans（Optical Transfer）— 通过屏幕视觉编码传输文件
 #[derive(Parser, Debug)]
-#[command(name = "optrans", about = "通过屏幕视觉编码在远程桌面两端传输文件")]
+#[command(name = "optrans", version, about = "通过屏幕视觉编码在远程桌面两端传输文件")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

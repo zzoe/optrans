@@ -216,6 +216,85 @@ fn calc_gray_module_count(byte_count: usize, levels: u32) -> usize {
     }
 }
 
+/// 按本帧实测灰度分布自适应标定判界阈值
+///
+/// 理想阈值（0..255 等分）只适用于本地显示器直连。远程桌面视频链路会把
+/// 黑电平抬高（限制范围 YUV 16-235 未展开时黑≈76）、白电平压缩，整条
+/// 亮度轴被平移缩放——此时最暗一档会落进第二档的区间，全帧数据整体错位，
+/// RS 必然失败。实测症状：4 级帧在理想阈值下所有级数都解不出。
+///
+/// 做法：对数据模块的亮度直方图做一维 k-means（初值为等距分布），
+/// 用相邻簇心的中点作判界。纯本地链路下簇心回到 0/85/170/255，
+/// 结果与理想阈值一致，不会退化。
+fn calibrate_thresholds(values: &[u8], levels: u32, fallback: &[u8]) -> Vec<u8> {
+    let lv = levels as usize;
+    if lv < 2 {
+        return fallback.to_vec();
+    }
+    let mut hist = [0u32; 256];
+    for &v in values {
+        hist[v as usize] += 1;
+    }
+    let total: u32 = values.len() as u32;
+    if total == 0 {
+        return fallback.to_vec();
+    }
+
+    // 取 2%/98% 分位作为黑/白参考，忽略极端离群像素
+    let quantile = |q: f64| -> f64 {
+        let target = (total as f64 * q).max(1.0) as u32;
+        let mut acc = 0u32;
+        for (v, &n) in hist.iter().enumerate() {
+            acc += n;
+            if acc >= target {
+                return v as f64;
+            }
+        }
+        255.0
+    };
+    let lo = quantile(0.02);
+    let hi = quantile(0.98);
+    if hi - lo < 32.0 {
+        // 动态范围太窄，说明这帧本来就没希望，别用坏标定覆盖理想阈值
+        return fallback.to_vec();
+    }
+
+    let mut centers: Vec<f64> = (0..lv)
+        .map(|i| lo + (hi - lo) * i as f64 / (lv - 1) as f64)
+        .collect();
+    for _ in 0..8 {
+        let mut sums = vec![0.0f64; lv];
+        let mut counts = vec![0.0f64; lv];
+        for (v, &n) in hist.iter().enumerate() {
+            if n == 0 {
+                continue;
+            }
+            let val = v as f64;
+            let mut best = 0usize;
+            let mut best_d = f64::MAX;
+            for (i, &c) in centers.iter().enumerate() {
+                let d = (val - c).abs();
+                if d < best_d {
+                    best_d = d;
+                    best = i;
+                }
+            }
+            sums[best] += val * n as f64;
+            counts[best] += n as f64;
+        }
+        for i in 0..lv {
+            if counts[i] > 0.0 {
+                centers[i] = sums[i] / counts[i];
+            }
+        }
+    }
+    centers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    (0..lv - 1)
+        .map(|i| ((centers[i] + centers[i + 1]) / 2.0).round().clamp(0.0, 255.0) as u8)
+        .collect()
+}
+
 /// 几何搜索半径绝对上限（模块数），防止极端情况搜索失控
 const MAX_GEOMETRY_DELTA_CAP: i32 = 120;
 
@@ -523,7 +602,10 @@ fn decode_payload_at(
             let config = GrayEncodingConfig::new(*levels).map_err(|e| {
                 OptransError::FrameDecode(format!("非法灰度级数 {}: {}", levels, e))
             })?;
-            extract::decode_gray_n(relevant_modules, *levels, &config.thresholds, encoded_bytes)
+            // 理想阈值会被链路的黑电平抬升打穿（最暗一档掉进第二档区间），
+            // 用本帧实测分布标定后再判界。
+            let thresholds = calibrate_thresholds(relevant_modules, *levels, &config.thresholds);
+            extract::decode_gray_n(relevant_modules, *levels, &thresholds, encoded_bytes)
         }
         _ => {
             let mut data = Vec::with_capacity(encoded_bytes);
@@ -568,12 +650,92 @@ fn note_decode_failure(err: &OptransError) {
     }
 }
 
+/// 「数据模块装不下」判定：只有这种情况才值得改用灰度级数重试
+fn is_module_shortage(e: &OptransError) -> bool {
+    matches!(e, OptransError::FrameDecode(m) if m.starts_with("数据模块值不足"))
+}
+
+/// 首次识别成功时打印一次编码模式，便于现场判断链路质量
+fn log_once_mode(mode: &EncodingMode) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        log::info!("载荷编码模式自动识别: {:?}", mode);
+    }
+}
+
+/// 自动模式载荷解码：二值优先，必要时按 16/8/4/2 级灰度重试
+///
+/// 模式位只是提示，不能当硬门。远端视频编码的量化/抖动可能把该位抹成 0，
+/// 此时二值解码会因「8 bit/字节装不下」直接失败，灰度帧将永远被丢弃
+/// （实测症状：`需要 197912 modules，实际 99961 modules`）。
+///
+/// 只在失败原因是**容量不足**时才回退到灰度：坏帧（RS 失败）不重试，
+/// 否则每帧要多跑 4 次模块提取 + RS，直接拖垮接收流水线。
+fn decode_payload_auto(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+    info: &FormatInfo,
+) -> OptransResult<(EncodingMode, Vec<u8>)> {
+    let mut first_err: Option<OptransError> = None;
+
+    if info.encoding_mode_bit == 0 {
+        let binary = EncodingMode::Binary;
+        match decode_payload(pixels, img_width, img_height, loc, info, &binary) {
+            Ok(p) => return Ok((binary, p)),
+            Err(e) if is_module_shortage(&e) => first_err = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+
+    // 由密到疏尝试：通道质量好时首选 16 级（帧数最少）
+    let mut tried: Vec<String> = Vec::new();
+    for &levels in crate::common::types::VALID_GRAY_LEVELS.iter().rev() {
+        let mode = EncodingMode::Gray(levels);
+        match decode_payload(pixels, img_width, img_height, loc, info, &mode) {
+            Ok(p) => {
+                log_once_mode(&mode);
+                return Ok((mode, p));
+            }
+            Err(e) => {
+                // 逐级记录失败原因：现场只能看到每 100 次一条的告警，
+                // 不写清各级结果就无法区分「没试」和「试了都不过 RS」
+                tried.push(format!("{}级:{}", levels, brief_error(&e)));
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+    }
+
+    if tried.is_empty() {
+        return Err(first_err
+            .unwrap_or_else(|| OptransError::FrameDecode("载荷解码失败".to_string())));
+    }
+    Err(OptransError::FrameDecode(format!(
+        "各灰度级数均未通过 RS: {}",
+        tried.join(" | ")
+    )))
+}
+
+/// 截断错误文本，避免逐级汇总时日志过长
+fn brief_error(e: &OptransError) -> String {
+    let s = e.to_string();
+    if s.chars().count() > 40 {
+        s.chars().take(40).collect::<String>() + "…"
+    } else {
+        s
+    }
+}
+
 /// 完整解码一帧（格式信息 + 载荷）
 ///
-/// `EncodingMode::Auto` 时按格式信息的模式位判定：二值帧直接解；
-/// 灰度帧的**级数不在格式信息里**（只有 1 bit 模式位），故依次尝试
-/// 16/8/4/2 级，由载荷的 RS 校验裁决——发送端可用 `--gray-levels`
-/// 按显示链路质量调整级数，接收端无需同步配置。
+/// `EncodingMode::Auto` 时先按模式位试二值，容量不足再依次尝试
+/// 16/8/4/2 级灰度，由载荷的 RS 校验裁决——灰度级数不在格式信息里
+/// （只有 1 bit 模式位），发送端可用 `--gray-levels` 按显示链路质量
+/// 调整级数，接收端无需同步配置。
 pub fn decode_frame(
     pixels: &[u8],
     img_width: i32,
@@ -584,36 +746,8 @@ pub fn decode_frame(
     let format_info = decode_format_info(pixels, img_width, img_height, loc)?;
 
     let (actual_mode, payload) = match encoding_mode {
-        EncodingMode::Auto if format_info.encoding_mode_bit == 0 => {
-            let mode = EncodingMode::Binary;
-            let payload = decode_payload(pixels, img_width, img_height, loc, &format_info, &mode)?;
-            (mode, payload)
-        }
         EncodingMode::Auto => {
-            let mut first_err: Option<OptransError> = None;
-            let mut found: Option<(EncodingMode, Vec<u8>)> = None;
-            // 由密到疏尝试：通道质量好时首选 16 级（帧数最少）
-            for &levels in crate::common::types::VALID_GRAY_LEVELS.iter().rev() {
-                let mode = EncodingMode::Gray(levels);
-                match decode_payload(pixels, img_width, img_height, loc, &format_info, &mode) {
-                    Ok(p) => {
-                        found = Some((mode, p));
-                        break;
-                    }
-                    Err(e) => {
-                        if first_err.is_none() {
-                            first_err = Some(e);
-                        }
-                    }
-                }
-            }
-            match found {
-                Some(v) => v,
-                None => {
-                    return Err(first_err
-                        .unwrap_or_else(|| OptransError::FrameDecode("载荷解码失败".to_string())));
-                }
-            }
+            decode_payload_auto(pixels, img_width, img_height, loc, &format_info)?
         }
         other => {
             let payload = decode_payload(pixels, img_width, img_height, loc, &format_info, other)?;

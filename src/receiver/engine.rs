@@ -550,12 +550,19 @@ fn run_capture_loop(
     // 几乎不敏感，定位出的 modules_h 可能偏 ±10+ 模块；首个大载荷数据帧
     // 用严格 RS 解码裁决修正，后续所有帧复用正确位置。
     let mut geometry_refined = false;
+    // 截屏耗时统计：发送端帧间隔 100ms，捕获慢于 100ms 就会结构性漏帧，
+    // 而漏帧率直接决定 FEC 冗余能否压缩。现场只看「跳过 N 帧」无法区分
+    // 是链路丢帧还是自身截屏拖慢，故每 25 帧报一次均值/峰值。
+    let mut cap_count: u64 = 0;
+    let mut cap_total: u64 = 0;
+    let mut cap_max: u64 = 0;
     loop {
         if done.load(Ordering::SeqCst) {
             drop(tx);
             return Ok(());
         }
 
+        let cap_start = std::time::Instant::now();
         let (pixels, img_w, img_h) = match if use_virtual_desktop {
             capture_virtual_desktop()
         } else {
@@ -567,6 +574,20 @@ fn run_capture_loop(
                 continue;
             }
         };
+        let cap_ms = cap_start.elapsed().as_millis() as u64;
+        cap_count += 1;
+        cap_total += cap_ms;
+        cap_max = cap_max.max(cap_ms);
+        if cap_count.is_multiple_of(25) {
+            info!(
+                "截屏耗时: 平均 {}ms，最大 {}ms（{} 次，画面 {}x{}）",
+                cap_total / cap_count,
+                cap_max,
+                cap_count,
+                img_w,
+                img_h
+            );
+        }
 
         let info = match decode_format_info(&pixels, img_w, img_h, &loc) {
             Ok(i) => i,
