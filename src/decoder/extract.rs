@@ -180,6 +180,7 @@ pub fn extract_data_modules(
     }
 
     let affine = AffineTransform::from_location(loc, loc.module_pixels);
+    let module_size = mean_module_size(loc);
 
     let mut values = Vec::with_capacity(payload_bits);
 
@@ -206,6 +207,7 @@ pub fn extract_data_modules(
                 col,
                 row,
                 encoding_mode,
+                module_size,
             );
             values.push(module_val);
         }
@@ -238,7 +240,7 @@ fn is_in_finder(col: usize, row: usize, n_w: usize, n_h: usize) -> bool {
 /// 采样单个模块的值（根据编码模式选择采样策略）
 ///
 /// - Binary 模式：3×3 均值 + 阈值 128 → 0 或 1
-/// - Gray 模式：单像素 → 原始灰度值 (0-255)，所有级别统一单点抗模块越界
+/// - Gray 模式：模块内面积均值 → 原始灰度值 (0-255)
 pub fn sample_module(
     pixels: &[u8],
     img_width: i32,
@@ -249,13 +251,60 @@ pub fn sample_module(
     encoding_mode: &EncodingMode,
 ) -> u8 {
     let affine = AffineTransform::from_location(loc, loc.module_pixels);
-    sample_module_with_affine(pixels, img_width, img_height, &affine, module_col, module_row, encoding_mode)
+    let module_size = mean_module_size(loc);
+    sample_module_with_affine(
+        pixels,
+        img_width,
+        img_height,
+        &affine,
+        module_col,
+        module_row,
+        encoding_mode,
+        module_size,
+    )
+}
+
+/// 采样窗口可用的模块尺寸：取水平/垂直两个方向的较小值
+///
+/// 非均匀缩放下（如垂直 0.9625）两轴模块尺寸不同，finder 的
+/// 1:1:3:1:1 游程只测得到水平方向；若按水平值选窗口，垂直方向会越界
+/// 压到相邻模块。由 finder 跨度反推两轴尺寸后取小值。
+pub(crate) fn mean_module_size(loc: &FrameLocation) -> f64 {
+    if loc.modules_w > 7 && loc.modules_h > 7 {
+        let sx = (loc.tr.center_x - loc.tl.center_x).abs() / (loc.modules_w as f64 - 7.0);
+        let sy = (loc.bl.center_y - loc.tl.center_y).abs() / (loc.modules_h as f64 - 7.0);
+        if sx > 0.5 && sy > 0.5 {
+            return sx.min(sy);
+        }
+    }
+    loc.tl.module_size
+}
+
+/// 灰度采样的窗口边长（像素）
+///
+/// 灰度最窄级距只有 12（16 级 @ 179 动态范围），单像素采样把整条链路的
+/// 像素噪声直接灌进判界：实测 16 级帧在第 12 个 RS 块就越过纠错上限
+/// （19/255），而前面 11 块完全正确——典型的逐模块随机误判。
+///
+/// 窗口必须完全落在模块内，否则相邻模块的极值会污染均值（权重 1/n²，
+/// 影响远大于噪声）。中心取整误差 0.5px + 半宽 n/2，要求 m ≥ n + 1：
+/// - m ≥ 7px → 5×5（σ 降 5 倍）
+/// - m ≥ 5px → 3×3（σ 降 3 倍）
+/// - m ≥ 4px → 2×2（σ 降 2 倍，偶数窗口向右下偏半像素仍在模块内）
+/// - m < 4px → 单点
+pub(crate) fn gray_sample_window(module_size: f64) -> i32 {
+    if module_size >= 7.0 {
+        5
+    } else if module_size >= 5.0 {
+        3
+    } else if module_size >= 4.0 {
+        2
+    } else {
+        1
+    }
 }
 
 /// 使用预计算的仿射变换采样单个模块（避免重复计算仿射参数）
-///
-/// v0.19.4: 灰度级 ≤4 时用 3×3 均值（与二值相同窗口大小），避免 5×5 窗口
-/// 跨模块重叠；灰度级 >4 时才用 5×5 中值抗噪。
 #[inline]
 fn sample_module_with_affine(
     pixels: &[u8],
@@ -265,6 +314,7 @@ fn sample_module_with_affine(
     module_col: usize,
     module_row: usize,
     encoding_mode: &EncodingMode,
+    module_size: f64,
 ) -> u8 {
     let (px, py) = affine.to_pixel(module_col, module_row);
 
@@ -273,7 +323,7 @@ fn sample_module_with_affine(
             sample_module_binary_at(pixels, img_width, img_height, px, py)
         }
         EncodingMode::Gray(_) => {
-            // 单点采样：模块内像素值统一，窗口越界导致灰度分类错误
+            let n = gray_sample_window(module_size);
             // M11: 2D 判界（镜像 sample_pixel_point）——负坐标经 wrapping 转 usize
             // 会绕回巨大正数，仅靠 idx 长度判断会读到远处像素（甚至越界返回 0）
             let cx = px.round() as i32;
@@ -281,15 +331,19 @@ fn sample_module_with_affine(
             if cx < 0 || cx >= img_width || cy < 0 || cy >= img_height {
                 return 0;
             }
-            let w = img_width as usize;
-            let idx = (cy as usize * w + cx as usize) * 4;
-            if idx + 2 < pixels.len() {
-                let r = pixels[idx] as u32;
-                let g = pixels[idx + 1] as u32;
-                let b = pixels[idx + 2] as u32;
-                ((r * 299 + g * 587 + b * 114) / 1000) as u8
+            if n <= 1 {
+                let w = img_width as usize;
+                let idx = (cy as usize * w + cx as usize) * 4;
+                if idx + 2 < pixels.len() {
+                    let r = pixels[idx] as u32;
+                    let g = pixels[idx + 1] as u32;
+                    let b = pixels[idx + 2] as u32;
+                    ((r * 299 + g * 587 + b * 114) / 1000) as u8
+                } else {
+                    0
+                }
             } else {
-                0
+                sample_pixel_region_luma(pixels, img_width, img_height, cx, cy, n)
             }
         }
     }
@@ -315,19 +369,45 @@ fn sample_pixel_region_mean(
     py: f64,
     radius: i32,
 ) -> u8 {
+    let avg = sample_pixel_region_luma(
+        pixels,
+        img_width,
+        img_height,
+        px.round() as i32,
+        py.round() as i32,
+        2 * radius + 1,
+    );
+    // 约定：白色像素 → 1，黑色像素 → 0（与编码器 gray_table=[0,255] 对应：digit 0→黑，digit 1→白）
+    if avg < 128 { 0 } else { 1 }
+}
+
+/// 在像素坐标周围取 n×n 区域的亮度均值（越界像素忽略）
+///
+/// n 为偶数时窗口向右下偏半像素，仍落在模块内部。
+fn sample_pixel_region_luma(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    cx: i32,
+    cy: i32,
+    n: i32,
+) -> u8 {
     let w = img_width as usize;
-    let cx = px.round() as i32;
-    let cy = py.round() as i32;
+    let lo = -(n - 1) / 2;
+    let hi = lo + n - 1;
 
     let mut sum: u32 = 0;
     let mut count: u32 = 0;
 
-    for dy in -radius..=radius {
-        for dx in -radius..=radius {
+    for dy in lo..=hi {
+        for dx in lo..=hi {
             let sx = cx + dx;
             let sy = cy + dy;
             if sx >= 0 && sx < img_width && sy >= 0 && sy < img_height {
                 let idx = (sy as usize * w + sx as usize) * 4;
+                if idx + 2 >= pixels.len() {
+                    continue;
+                }
                 let r = pixels[idx] as u32;
                 let g = pixels[idx + 1] as u32;
                 let b = pixels[idx + 2] as u32;
@@ -340,14 +420,7 @@ fn sample_pixel_region_mean(
     if count == 0 {
         return 0;
     }
-
-    let avg = sum / count;
-    // 约定：白色像素 → 1，黑色像素 → 0（与编码器 gray_table=[0,255] 对应：digit 0→黑，digit 1→白）
-    if avg < 128 {
-        0
-    } else {
-        1
-    }
+    (sum / count) as u8
 }
 
 // ─── 多级分类器 ───

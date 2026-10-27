@@ -656,11 +656,17 @@ fn is_module_shortage(e: &OptransError) -> bool {
 }
 
 /// 首次识别成功时打印一次编码模式，便于现场判断链路质量
-fn log_once_mode(mode: &EncodingMode) {
+fn log_once_mode(mode: &EncodingMode, module_size: f64) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::Relaxed) {
-        log::info!("载荷编码模式自动识别: {:?}", mode);
+        log::info!(
+            "载荷编码模式自动识别: {:?}（模块 {:.2}px，灰度采样窗口 {}×{}）",
+            mode,
+            module_size,
+            crate::decoder::extract::gray_sample_window(module_size),
+            crate::decoder::extract::gray_sample_window(module_size)
+        );
     }
 }
 
@@ -691,12 +697,13 @@ fn decode_payload_auto(
     }
 
     // 由密到疏尝试：通道质量好时首选 16 级（帧数最少）
+    let module_size = crate::decoder::extract::mean_module_size(loc);
     let mut tried: Vec<String> = Vec::new();
     for &levels in crate::common::types::VALID_GRAY_LEVELS.iter().rev() {
         let mode = EncodingMode::Gray(levels);
         match decode_payload(pixels, img_width, img_height, loc, info, &mode) {
             Ok(p) => {
-                log_once_mode(&mode);
+                log_once_mode(&mode, module_size);
                 return Ok((mode, p));
             }
             Err(e) => {

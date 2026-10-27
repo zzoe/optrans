@@ -536,6 +536,17 @@ fn run_capture_loop(
         warn_no_signal(scan_start, &mut last_warn, &diag);
     }
     let mut loc = meta_loc.unwrap();
+    // 帧几何一次性输出：模块尺寸决定灰度采样窗口，也决定灰度级数能开到多少，
+    // 是现场判断「为什么某一级解不出」的第一手数据
+    let module_size = crate::decoder::extract::mean_module_size(&loc);
+    info!(
+        "帧几何: {}x{} 模块，模块尺寸 {:.2}px，灰度采样窗口 {}x{}",
+        loc.modules_w,
+        loc.modules_h,
+        module_size,
+        crate::decoder::extract::gray_sample_window(module_size),
+        crate::decoder::extract::gray_sample_window(module_size)
+    );
     if use_virtual_desktop {
         info!("发送端帧位于非主显示器，切换为虚拟桌面截屏");
     }

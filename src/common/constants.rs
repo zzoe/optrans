@@ -18,8 +18,13 @@ pub const FRAME_INTERVAL_MS: u64 = 100;
 /// 接收端 `locate_by_corners` 使用相同值计算 finder pattern 的预期位置。
 pub const FRAME_MARGIN_PX_DEFAULT: u32 = 20;
 
-/// 默认灰度级数（16 = 最高密度，帧数最少 → 漏帧风险最低）
-pub const GRAY_LEVELS_DEFAULT: u32 = 16;
+/// 默认灰度级数（8）
+///
+/// 级距 24（179 动态范围 / 7）在远程桌面视频编码下可稳定解码；
+/// 16 级的级距仅 12，与编码器量化步长同量级，会被抹平导致整帧卡在
+/// RS 纠错上限边缘（实测第 12 个 RS 块即越界）。级数越高帧数越少，
+/// 但可靠性优先：8 级比 4 级少 15% 帧数，且解码几乎不出错。
+pub const GRAY_LEVELS_DEFAULT: u32 = 8;
 
 // ─── 帧内 RS(255,217) 编码参数 ───
 

@@ -353,6 +353,72 @@ fn sim_gray4_with_lifted_black_level() {
     assert_eq!(f.payload.len(), frame.format_info.payload_bytes as usize);
 }
 
+/// 确定性伪随机噪声（LCG），用于模拟远程桌面的像素级噪声
+fn add_noise(pixels: &mut [u8], amp: i32, seed: u32) {
+    let mut s = seed ^ 0x9E37_79B9;
+    for p in pixels.chunks_exact_mut(4) {
+        for c in 0..3 {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let n = ((s >> 16) as i32).rem_euclid(2 * amp + 1) - amp;
+            p[c] = (p[c] as i32 + n).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// 回归：16 级灰度 + 像素级噪声（±10）仍能解码。
+///
+/// 16 级的级距只有 12（179 动态范围 / 15），单像素采样下 ±10 的噪声
+/// 会让 ~40% 的模块判错，远超 RS(255,217) 的 19/255 纠错上限。
+/// 采样改为模块内 3×3 均值后，噪声标准差降到 ~1/3，误判率落到 RS 能兜住的范围。
+#[test]
+fn sim_gray16_with_pixel_noise() {
+    use optrans::common::types::BlockData;
+
+    // 模块 4px（对应现场实测），采样窗口走 2×2
+    let modules_w = 502u32;
+    let modules_h = 304u32;
+    let block = BlockData {
+        index: 0,
+        data: vec![0x6Du8; 40_000],
+    };
+    let frame = Frame::new_data_merged(&[&block], 1, 1, 1).unwrap();
+    let mut pixels = render_frame_default(
+        &frame,
+        MP,
+        modules_w,
+        modules_h,
+        &GrayEncodingConfig::new(16).unwrap(),
+        false,
+    );
+    // 链路特征：黑电平抬到 76、白压到 255（级距 179/15 ≈ 12），
+    // 再叠加 ±10 的像素噪声
+    for p in pixels.chunks_exact_mut(4) {
+        for c in 0..3 {
+            p[c] = (76.0 + p[c] as f64 * 179.0 / 255.0).round() as u8;
+        }
+    }
+    add_noise(&mut pixels, 10, 0xC0FF_EE01);
+    let screen = compose_screen(
+        &pixels,
+        modules_w as usize * MP as usize,
+        modules_h as usize * MP as usize,
+        2048, 1280, 1.0, 1.0,
+    );
+
+    let mut decoded = None;
+    for (loc, _) in locate_frame_all_with_diag(&screen, 2048, 1280) {
+        if let Ok(f) = decode_frame(&screen, 2048, 1280, &loc, &EncodingMode::Auto) {
+            if f.frame_type == FrameType::Data && !f.payload.is_empty() {
+                decoded = Some(f);
+                break;
+            }
+        }
+    }
+    let f = decoded.expect("16 级灰度帧在 ±10 像素噪声下应能解码");
+    assert_eq!(f.encoding_mode, EncodingMode::Gray(16));
+    assert_eq!(f.payload.len(), frame.format_info.payload_bytes as usize);
+}
+
 /// 回归：TL 中心测量偏低半个模块时，格式区（锚定 BL）仍可解码，
 /// 但数据区（从帧顶部起算）全错 → 载荷 RS 失败。
 /// 原点微扫应能找回载荷，并修正 finder 位置。
