@@ -213,6 +213,48 @@ fn sim_uniform_125() {
     assert!(scenario("uniform1.25", 2048, 1280, 1.25, 1.25, 2560, 1600));
 }
 
+/// 回归：发送端用 4 级灰度时，接收端 Auto 模式应自动识别级数
+/// （格式信息只携带 1 bit 模式位，不含级数）。
+#[test]
+fn sim_gray4_auto_detect_levels() {
+    use optrans::common::types::BlockData;
+
+    let modules_w = 502u32;
+    let modules_h = 304u32;
+    let block = BlockData {
+        index: 0,
+        data: vec![0x5Au8; 20_000],
+    };
+    let frame = Frame::new_data_merged(&[&block], 1, 1, 1).unwrap();
+    let pixels = render_frame_default(
+        &frame,
+        MP,
+        modules_w,
+        modules_h,
+        &GrayEncodingConfig::new(4).unwrap(),
+        false,
+    );
+    let screen = compose_screen(
+        &pixels,
+        modules_w as usize * MP as usize,
+        modules_h as usize * MP as usize,
+        2048, 1280, 1.0, 1.0,
+    );
+
+    let mut decoded = None;
+    for (loc, _) in locate_frame_all_with_diag(&screen, 2048, 1280) {
+        if let Ok(f) = decode_frame(&screen, 2048, 1280, &loc, &EncodingMode::Auto) {
+            if f.frame_type == FrameType::Data && !f.payload.is_empty() {
+                decoded = Some(f);
+                break;
+            }
+        }
+    }
+    let f = decoded.expect("4 级灰度数据帧应能被 Auto 模式解码");
+    assert_eq!(f.encoding_mode, EncodingMode::Gray(4), "应自动识别为 4 级灰度");
+    assert_eq!(f.payload.len(), frame.format_info.payload_bytes as usize);
+}
+
 /// 回归：TL 中心测量偏低半个模块时，格式区（锚定 BL）仍可解码，
 /// 但数据区（从帧顶部起算）全错 → 载荷 RS 失败。
 /// 原点微扫应能找回载荷，并修正 finder 位置。

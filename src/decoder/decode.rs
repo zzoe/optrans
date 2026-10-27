@@ -569,6 +569,11 @@ fn note_decode_failure(err: &OptransError) {
 }
 
 /// 完整解码一帧（格式信息 + 载荷）
+///
+/// `EncodingMode::Auto` 时按格式信息的模式位判定：二值帧直接解；
+/// 灰度帧的**级数不在格式信息里**（只有 1 bit 模式位），故依次尝试
+/// 16/8/4/2 级，由载荷的 RS 校验裁决——发送端可用 `--gray-levels`
+/// 按显示链路质量调整级数，接收端无需同步配置。
 pub fn decode_frame(
     pixels: &[u8],
     img_width: i32,
@@ -578,13 +583,43 @@ pub fn decode_frame(
 ) -> OptransResult<DecodedFrame> {
     let format_info = decode_format_info(pixels, img_width, img_height, loc)?;
 
-    let actual_mode = match encoding_mode {
-        EncodingMode::Auto => detect_encoding_mode(&format_info),
-        other => other.clone(),
+    let (actual_mode, payload) = match encoding_mode {
+        EncodingMode::Auto if format_info.encoding_mode_bit == 0 => {
+            let mode = EncodingMode::Binary;
+            let payload = decode_payload(pixels, img_width, img_height, loc, &format_info, &mode)?;
+            (mode, payload)
+        }
+        EncodingMode::Auto => {
+            let mut first_err: Option<OptransError> = None;
+            let mut found: Option<(EncodingMode, Vec<u8>)> = None;
+            // 由密到疏尝试：通道质量好时首选 16 级（帧数最少）
+            for &levels in crate::common::types::VALID_GRAY_LEVELS.iter().rev() {
+                let mode = EncodingMode::Gray(levels);
+                match decode_payload(pixels, img_width, img_height, loc, &format_info, &mode) {
+                    Ok(p) => {
+                        found = Some((mode, p));
+                        break;
+                    }
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            match found {
+                Some(v) => v,
+                None => {
+                    return Err(first_err
+                        .unwrap_or_else(|| OptransError::FrameDecode("载荷解码失败".to_string())));
+                }
+            }
+        }
+        other => {
+            let payload = decode_payload(pixels, img_width, img_height, loc, &format_info, other)?;
+            (other.clone(), payload)
+        }
     };
-
-    let payload =
-        decode_payload(pixels, img_width, img_height, loc, &format_info, &actual_mode)?;
 
     Ok(DecodedFrame {
         frame_type: format_info.frame_type,
