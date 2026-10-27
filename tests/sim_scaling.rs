@@ -2,7 +2,9 @@
 //! 用于验证分辨率/缩放比例不一致是否导致接收端无法识别 Meta 帧。
 
 use optrans::common::types::{EncodingMode, FrameType, GrayEncodingConfig, MetaPayload};
-use optrans::decoder::decode::{decode_format_info, decode_frame};
+use optrans::decoder::decode::{
+    decode_format_info, decode_frame, decode_meta_origin_sweep,
+};
 use optrans::decoder::locate::locate_frame_all_with_diag;
 use optrans::encoder::frame::Frame;
 use optrans::encoder::render::render_frame_default;
@@ -209,4 +211,55 @@ fn sim_data_frame_nonuniform() {
 fn sim_uniform_125() {
     // 统一 1.25 缩放（整数模块 5px）——理论上可自适应
     assert!(scenario("uniform1.25", 2048, 1280, 1.25, 1.25, 2560, 1600));
+}
+
+/// 回归：TL 中心测量偏低半个模块时，格式区（锚定 BL）仍可解码，
+/// 但数据区（从帧顶部起算）全错 → 载荷 RS 失败。
+/// 原点微扫应能找回载荷，并修正 finder 位置。
+#[test]
+fn sim_meta_origin_sweep_recovers_tl_offset() {
+    let modules_w = 502u32;
+    let modules_h = 304u32;
+    let frame = Frame::new_metadata(&meta(), 0).unwrap();
+    let pixels = render_frame_default(
+        &frame,
+        MP,
+        modules_w,
+        modules_h,
+        &GrayEncodingConfig::new(2).unwrap(),
+        false,
+    );
+    let screen = compose_screen(
+        &pixels,
+        modules_w as usize * MP as usize,
+        modules_h as usize * MP as usize,
+        2048, 1280, 1.0, 1.0,
+    );
+
+    let cands = locate_frame_all_with_diag(&screen, 2048, 1280);
+    assert!(!cands.is_empty(), "应能定位到帧");
+    let loc = cands[0].0.clone();
+
+    // 模拟 TL 中心偏低 0.55 模块（BL 准确 → 格式区不受影响）
+    let mut perturbed = loc.clone();
+    perturbed.tl.center_y += 0.55 * loc.tl.module_size;
+
+    assert!(
+        decode_frame(&screen, 2048, 1280, &perturbed, &EncodingMode::Auto).is_err(),
+        "TL 偏移后载荷应解不出"
+    );
+    let info = decode_format_info(&screen, 2048, 1280, &perturbed)
+        .expect("格式区锚定 BL，偏移后仍应可解码");
+
+    let (fixed, decoded) = decode_meta_origin_sweep(&screen, 2048, 1280, &perturbed, &info)
+        .expect("原点微扫应找回载荷");
+    assert_eq!(
+        decoded.payload.len(),
+        frame.format_info.payload_bytes as usize,
+        "载荷长度应与发送端一致"
+    );
+    assert!(
+        (fixed.tl.center_y - loc.tl.center_y).abs() < 0.25 * loc.tl.module_size,
+        "微扫应把 TL 拉回真实位置附近"
+    );
 }

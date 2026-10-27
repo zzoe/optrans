@@ -65,9 +65,13 @@ fn is_near_uniform(pixels: &[u8]) -> bool {
 
 /// 将 CGImage 转为 top-down 4 字节/像素缓冲区
 ///
-/// CGBitmapContext 的内存首行对应用户坐标系 y=0，而 CG 默认坐标系 y 轴
-/// 向上（y=0 在底部）。必须先 Translate(0, h) + Scale(1, -1) 翻转 CTM，
-/// 再 DrawImage，才能得到 top-down 缓冲；否则结果垂直镜像、定位全部失败。
+/// CGBitmapContext 的内存首行天然对应图像顶行：用户坐标系原点在左下角，
+/// identity CTM 下把整幅图像绘入 (0,0,w,h) 正好让图像顶部落在内存首行。
+/// 因此**不需要**额外翻转 CTM。
+///
+/// 旧实现额外做了 `Translate(0,h) + Scale(1,-1)`，反而把缓冲变成 bottom-up，
+/// 接收端看到上下颠倒的屏幕（实测：mac 菜单栏出现在导出截图的底部、文字倒立），
+/// finder 与格式信息全部镜像 → 永不定位成功。
 fn cgimage_to_topdown(img: ffi::CGImageRef) -> OptransResult<(Vec<u8>, i32, i32)> {
     let w = unsafe { ffi::CGImageGetWidth(img) };
     let h = unsafe { ffi::CGImageGetHeight(img) };
@@ -99,8 +103,6 @@ fn cgimage_to_topdown(img: ffi::CGImageRef) -> OptransResult<(Vec<u8>, i32, i32)
     }
 
     unsafe {
-        ffi::CGContextTranslateCTM(ctx, 0.0, h as f64);
-        ffi::CGContextScaleCTM(ctx, 1.0, -1.0);
         ffi::CGContextDrawImage(
             ctx,
             ffi::CGRect {
@@ -249,16 +251,17 @@ pub fn capture_virtual_desktop() -> OptransResult<(Vec<u8>, i32, i32)> {
     }
 
     unsafe {
-        // 整体翻转 CTM：用户坐标变为 top-down
-        ffi::CGContextTranslateCTM(ctx, 0.0, canvas_h as f64);
-        ffi::CGContextScaleCTM(ctx, 1.0, -1.0);
+        // 不翻转 CTM（理由同 cgimage_to_topdown）。缓冲是 top-down，
+        // 而用户坐标 y 轴向上，故把「距顶部 off_y」换算成用户坐标原点：
+        // y_user = canvas_h - off_y - h。
         for p in &placed {
+            let y_user = canvas_h as f64 - p.off_y as f64 - p.h as f64;
             ffi::CGContextDrawImage(
                 ctx,
                 ffi::CGRect {
                     origin: ffi::CGPoint {
                         x: p.off_x as f64,
-                        y: p.off_y as f64,
+                        y: y_user,
                     },
                     size: ffi::CGSize {
                         width: p.w as f64,

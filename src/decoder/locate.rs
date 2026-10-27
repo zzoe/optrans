@@ -7,6 +7,10 @@
 
 use crate::common::types::{FinderPattern, FrameLocation};
 
+/// 定位候选上限（按像素面积降序截断）。到达上限说明候选被截断，
+/// 调用方诊断日志据此判断真帧是否可能被挤出列表。
+pub(crate) const MAX_CANDIDATES: usize = 100;
+
 /// locate_frame 的诊断统计信息
 #[derive(Debug, Clone)]
 pub struct LocateDiagnostics {
@@ -14,6 +18,40 @@ pub struct LocateDiagnostics {
     pub candidates_found: usize,
     /// 垂直验证通过的候选点数量
     pub candidates_verified: usize,
+    /// 验证通过候选的 module_size 最小值（无候选时 0.0）
+    pub ms_min: f64,
+    /// 验证通过候选的 module_size 最大值（无候选时 0.0）
+    pub ms_max: f64,
+    /// module_size 聚类后的簇数。真帧三 finder 若被拆进不同簇，
+    /// 三角搜索永远找不到组合（三角组=0），此字段用于诊断该场景。
+    pub ms_clusters: usize,
+}
+
+impl LocateDiagnostics {
+    fn new(found: usize, verified: usize, verified_cands: &[FinderCandidate]) -> Self {
+        let (ms_min, ms_max, ms_clusters) = ms_stats(verified_cands);
+        Self {
+            candidates_found: found,
+            candidates_verified: verified,
+            ms_min,
+            ms_max,
+            ms_clusters,
+        }
+    }
+}
+
+/// 验证通过候选的 ms 散布与聚类簇数（诊断用）
+fn ms_stats(verified: &[FinderCandidate]) -> (f64, f64, usize) {
+    if verified.is_empty() {
+        return (0.0, 0.0, 0);
+    }
+    let mut ms_min = f64::INFINITY;
+    let mut ms_max = f64::NEG_INFINITY;
+    for v in verified {
+        ms_min = ms_min.min(v.module_size);
+        ms_max = ms_max.max(v.module_size);
+    }
+    (ms_min, ms_max, cluster_by_module_size(verified).len())
 }
 
 // ─── v0.5: 角落定位（推荐） ───
@@ -679,51 +717,45 @@ fn find_three_corners(candidates: &[FinderCandidate]) -> Vec<FrameLocation> {
         return Vec::new();
     }
 
-    // 按 module_size 聚类，每组独立 O(n³)。
-    // 真帧 finder 的 ms 相近且与噪声候选的 ms 差异大（如 ms≈4 vs ms≈2），
-    // 聚类后真帧所在组 n 很小（~3-20），O(n³) 可忽略。
-    let clusters = cluster_by_module_size(candidates);
-
+    // v0.26: 全候选 O(n³) 搜索，不做 ms 预聚类。
+    // 旧实现按 module_size 聚类后仅在簇内搜三角形：远程压缩/模糊让三个
+    // 真 finder 的 ms 测量散布可达 ±30%（ms=2.0~8.0 混杂噪声的实测场景），
+    // 真帧三 finder 被拆进不同簇 → 三角组=0，永远定位失败。
+    // 约束 (e) 本身已做 ms 一致性过滤，预聚类纯属冗余且有害。
+    // 真实场景 verified 候选 ≤ 数百，C(n,3) 的廉价约束检查代价可接受；
+    // 极端噪声场景以迭代预算兜底（见 search_triangles）。
+    let refs: Vec<&FinderCandidate> = candidates.iter().collect();
     let mut all_results: Vec<(FrameLocation, f64)> = Vec::new();
+    search_triangles(&refs, &mut all_results);
 
-    for cluster in &clusters {
-        if cluster.len() < 3 {
-            continue;
-        }
-        search_triangles(cluster, &mut all_results);
-    }
-
-    // 排序：帧型候选始终排在前面（同类内按像素面积降序），
-    // 确保真帧优先被 decode 尝试，不被面积更大的假帧抢位。
-    // 剩下的按像素面积降序。
+    // 排序：像素面积降序（真帧 finder 间距最大，三角形面积几乎总是最大），
+    // 同面积时按 TL 距屏幕左上角距离升序（仅作 tiebreak）。
+    //
+    // v0.26 修复两处排序缺陷（远程桌面窗口内图案收不到的根因）：
+    // - 删除"帧型优先"硬编码范围（550-710×300-460 是 FRAME_MARGIN_PX=120
+    //   时代的 580×340），当前默认参数的帧是 502×310，从不匹配，纯噪声；
+    // - 删除按"距期望位置(34,34)"主排序——图案在远程桌面窗口内偏移时
+    //   真帧 TL 不在屏幕角落，会被挤出截断前的候选列表，永远解不出 Meta。
+    // 真假帧最终由解码阶段 CRC + payload 校验裁决，这里只保证真帧不被丢弃。
     all_results.sort_by(|a, b| {
-        // v0.15: 放宽帧型范围，覆盖 FRAME_MARGIN_PX=120 的 580×340
-        let a_is_frame = a.0.modules_w >= 550 && a.0.modules_w <= 710
-            && a.0.modules_h >= 300 && a.0.modules_h <= 460;
-        let b_is_frame = b.0.modules_w >= 550 && b.0.modules_w <= 710
-            && b.0.modules_h >= 300 && b.0.modules_h <= 460;
-        match (a_is_frame, b_is_frame) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal),
-        }
-    });
-    const MAX_CANDIDATES: usize = 50;
-    // v0.24.2: 先按距期望位置排序再截断——16 级灰度产生大量假候选时不会挤掉正确的
-    let margin = crate::common::constants::FRAME_MARGIN_PX_DEFAULT as f64;
-    let mp = crate::common::constants::MODULE_PIXELS_DEFAULT as f64;
-    let expected_x = margin + 3.5 * mp;
-    let expected_y = margin + 3.5 * mp;
-    all_results.sort_by(|(a_loc, _), (b_loc, _)| {
-        let da = (a_loc.tl.center_x - expected_x).abs() + (a_loc.tl.center_y - expected_y).abs();
-        let db = (b_loc.tl.center_x - expected_x).abs() + (b_loc.tl.center_y - expected_y).abs();
-        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                let da = a.0.tl.center_x.abs() + a.0.tl.center_y.abs();
+                let db = b.0.tl.center_x.abs() + b.0.tl.center_y.abs();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
     all_results.truncate(MAX_CANDIDATES);
     all_results.into_iter().map(|(loc, _)| loc).collect()
 }
 
-/// 按 module_size 聚类：排序后，相邻候选的 ms 差距 ≤0.5 归为同组
+/// 按 module_size 聚类：排序后，候选与簇均值差距 ≤ max(0.5px, 35%) 归为同组
+///
+/// v0.26 修复：原阈值为固定 ±0.5px，是 1:1 清晰缩放时代的取值。远程桌面
+/// 压缩/模糊后各 finder 的 ms 测量可差 15~20%（ms≈5.2 时 0.5px 仅约 10%），
+/// 真帧三 finder 被拆进不同簇，三角搜索无组合可试 → 三角组=0。
+/// 改为相对容差（簇均值的 35%），ms 3.8/4.6/5.4 的真帧三 finder 归入同簇。
 fn cluster_by_module_size(candidates: &[FinderCandidate]) -> Vec<Vec<&FinderCandidate>> {
     if candidates.is_empty() {
         return Vec::new();
@@ -737,24 +769,33 @@ fn cluster_by_module_size(candidates: &[FinderCandidate]) -> Vec<Vec<&FinderCand
 
     let mut clusters: Vec<Vec<&FinderCandidate>> = Vec::new();
     let mut current: Vec<&FinderCandidate> = vec![sorted[0]];
-    let mut group_start_ms = sorted[0].module_size;
+    let mut sum_ms = sorted[0].module_size;
+    let mut count = 1usize;
 
     for &cand in &sorted[1..] {
-        if (cand.module_size - group_start_ms).abs() <= 0.5 {
+        let mean = sum_ms / count as f64;
+        if (cand.module_size - mean).abs() <= (0.35 * mean).max(0.5) {
             current.push(cand);
+            sum_ms += cand.module_size;
+            count += 1;
         } else {
             clusters.push(current);
             current = vec![cand];
-            group_start_ms = cand.module_size;
+            sum_ms = cand.module_size;
+            count = 1;
         }
     }
     clusters.push(current);
     clusters
 }
 
-/// 对单个候选组做 O(n³) 三角搜索，结果追加到 results。
-/// v0.17: 每簇结果上限 200，防止大簇 O(n³) 膨胀（479→109M 次迭代 >400ms）。
-/// 真帧三角在迭代早期出现，提前截断不影响定位精度。
+/// 对候选组做 O(n³) 三角搜索，结果追加到 results。
+///
+/// v0.26: 迭代预算代替旧的"结果数达 200 即 return"早停。旧实现在噪声
+/// 三角形先被枚举到时提前退出，排在后面的真实三角形被连带丢弃（三角组=0
+/// 的隐性根因之一）。预算只限制计算量，不限制结果收集；真实场景
+/// verified ≤ 数百时 C(n,3) ≪ 预算，只有极端噪声才触顶（触顶保留已收集
+/// 结果，由排序+截断保证真帧不被丢）。
 fn search_triangles(
     candidates: &[&FinderCandidate],
     results: &mut Vec<(FrameLocation, f64)>,
@@ -764,14 +805,19 @@ fn search_triangles(
         return;
     }
 
-    const MAX_PER_CLUSTER: usize = 200;
-    let start_count = results.len();
+    const MAX_ITERATIONS: u64 = 25_000_000;
+    let mut iterations = 0u64;
 
-    for i in 0..n {
+    'budget: for i in 0..n {
         let a = candidates[i];
         for j in (i + 1)..n {
             let b = candidates[j];
             for k in (j + 1)..n {
+                iterations += 1;
+                if iterations > MAX_ITERATIONS {
+                    log::warn!("三角搜索超出迭代预算（候选过多），提前截断");
+                    break 'budget;
+                }
                 let c = candidates[k];
 
                 // 按 y 排序，top2 → TL/TR，bottom1 → BL
@@ -844,14 +890,18 @@ fn search_triangles(
                     continue;
                 }
 
-                // --- 约束 (e): module_size 相似（最大差值 < 0.15 × 均值） ---
+                // --- 约束 (e): module_size 相似（最大差值 < 0.45 × 均值） ---
+                // v0.26: 0.15→0.45。远程压缩/模糊后三 finder 的 ms 测量散布
+                // 实测可达 ±30%（ms=2.0~8.0 混杂噪声场景），过严的容差会拒绝
+                // 真三角形（三角组=0）。真假帧由 CRC + payload 校验裁决，
+                // 此约束只排除 ms 量级完全不同的噪声组合。
                 let avg_m =
                     (tl_cand.module_size + tr_cand.module_size + bl_cand.module_size) / 3.0;
                 let diff_tl = (tl_cand.module_size - avg_m).abs();
                 let diff_tr = (tr_cand.module_size - avg_m).abs();
                 let diff_bl = (bl_cand.module_size - avg_m).abs();
                 let max_diff = diff_tl.max(diff_tr).max(diff_bl);
-                if max_diff > 0.15 * avg_m {
+                if max_diff > 0.45 * avg_m {
                     continue;
                 }
 
@@ -917,10 +967,6 @@ fn search_triangles(
                         },
                         pixel_area,
                     ));
-                    // v0.17: 早停防止大簇 O(n³) 膨胀
-                    if results.len() - start_count >= MAX_PER_CLUSTER {
-                        return;
-                    }
                 }
             }
         }
@@ -972,10 +1018,7 @@ pub fn locate_frame_with_diag(
     results.into_iter().next().map(|loc| {
         (
             loc,
-            LocateDiagnostics {
-                candidates_found: candidate_count,
-                candidates_verified: verified_count,
-            },
+            LocateDiagnostics::new(candidate_count, verified_count, &verified),
         )
     })
 }
@@ -989,8 +1032,23 @@ pub fn locate_frame_all_with_diag(
     width: i32,
     height: i32,
 ) -> Vec<(FrameLocation, LocateDiagnostics)> {
+    locate_frame_all_with_stats(pixels, width, height).0
+}
+
+/// 定位帧并始终返回阶段统计（即使无候选）——诊断失败原因用：
+/// 候选=0 → 图案/对比度问题；候选>0 但验证=0 → 垂直结构失真；
+/// 验证>0 但三角组=0 → 三角约束被噪声/偏移破坏。
+pub fn locate_frame_all_with_stats(
+    pixels: &[u8],
+    width: i32,
+    height: i32,
+) -> (Vec<(FrameLocation, LocateDiagnostics)>, LocateDiagnostics) {
+    let empty_stats = |found: usize, verified: usize| {
+        LocateDiagnostics::new(found, verified, &[])
+    };
+
     if width < 50 || height < 50 {
-        return Vec::new();
+        return (Vec::new(), empty_stats(0, 0));
     }
 
     let w = width as usize;
@@ -1000,7 +1058,7 @@ pub fn locate_frame_all_with_diag(
     let candidate_count = candidates.len();
 
     if candidates.len() < 3 {
-        return Vec::new();
+        return (Vec::new(), empty_stats(candidate_count, 0));
     }
 
     let verified: Vec<FinderCandidate> = candidates
@@ -1017,18 +1075,16 @@ pub fn locate_frame_all_with_diag(
     let verified_count = verified.len();
 
     if verified.len() < 3 {
-        return Vec::new();
+        return (Vec::new(), empty_stats(candidate_count, verified_count));
     }
 
-    let diag = LocateDiagnostics {
-        candidates_found: candidate_count,
-        candidates_verified: verified_count,
-    };
+    let diag = LocateDiagnostics::new(candidate_count, verified_count, &verified);
 
-    find_three_corners(&verified)
+    let results = find_three_corners(&verified)
         .into_iter()
         .map(|loc| (loc, diag.clone()))
-        .collect()
+        .collect();
+    (results, diag)
 }
 
 /// 在像素缓冲区中定位帧，返回所有候选。

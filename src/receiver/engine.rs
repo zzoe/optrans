@@ -18,10 +18,10 @@ use log::{info, warn};
 use crate::common::error::{OptransError, OptransResult};
 use crate::common::types::{DecodedFrame, EncodingMode, FrameLocation, FrameType, IngestResult};
 use crate::decoder::decode::{
-    decode_format_info, decode_format_info_with_geometry, decode_frame, refine_frame_geometry,
-    MIN_REFINE_PAYLOAD,
+    decode_format_info, decode_format_info_with_geometry, decode_frame, decode_meta_origin_sweep,
+    refine_frame_geometry, MIN_REFINE_PAYLOAD,
 };
-use crate::decoder::locate::{locate_frame_all_with_diag, LocateDiagnostics};
+use crate::decoder::locate::{locate_frame_all_with_stats, LocateDiagnostics};
 use crate::platform::{self, capture_full_screen, capture_virtual_desktop};
 use crate::receiver::collect::FrameCollector;
 use crate::receiver::reassemble::FileAssembler;
@@ -242,26 +242,97 @@ fn flush_and_write(
 ///
 /// 优先主显示器（快）；主屏无候选且存在多显示器时，回退扫描整个虚拟桌面
 /// （发送端帧可能在副屏显示，如远程桌面窗口拖到副屏全屏）。
-fn scan_frame() -> Option<(Vec<u8>, i32, i32, Vec<(FrameLocation, LocateDiagnostics)>, bool)> {
-    if let Ok((pixels, w, h)) = capture_full_screen() {
-        let cands = locate_frame_all_with_diag(&pixels, w, h);
-        if !cands.is_empty() {
-            return Some((pixels, w, h, cands, false));
-        }
-        if platform::has_multiple_monitors() {
-            if let Ok((vp, vw, vh)) = capture_virtual_desktop() {
-                let cands = locate_frame_all_with_diag(&vp, vw, vh);
-                if !cands.is_empty() {
-                    return Some((vp, vw, vh, cands, true));
-                }
+///
+/// 失败时返回诊断消息（截屏/候选/验证/三角组阶段计数），由调用方节流输出，
+/// 便于区分权限缺失、缩放失真、假候选挤出等不同失败原因。
+fn scan_frame() -> Result<(Vec<u8>, i32, i32, Vec<(FrameLocation, LocateDiagnostics)>, bool), String> {
+    let (pixels, w, h) = capture_full_screen().map_err(|e| format!("截屏失败: {}", e))?;
+    let (cands, stats) = locate_frame_all_with_stats(&pixels, w, h);
+    if !cands.is_empty() {
+        return Ok((pixels, w, h, cands, false));
+    }
+    if platform::has_multiple_monitors() {
+        if let Ok((vp, vw, vh)) = capture_virtual_desktop() {
+            let (cands, _) = locate_frame_all_with_stats(&vp, vw, vh);
+            if !cands.is_empty() {
+                return Ok((vp, vw, vh, cands, true));
             }
         }
     }
-    None
+    Err(format!(
+        "定位失败: 三角组=0（水平候选={}, 垂直验证通过={}, ms={:.1}~{:.1}, 聚类簇数={}, 画面={}x{}）",
+        stats.candidates_found, stats.candidates_verified,
+        stats.ms_min, stats.ms_max, stats.ms_clusters, w, h
+    ))
+}
+
+/// 候选三角是否呈现「整屏帧」特征：三个 finder 分别靠近屏幕三个角
+///
+/// 发送端窗口最大化时真帧几乎铺满屏幕；噪声假三角很少同时满足三个角约束。
+/// 用于截图导出的触发判定与诊断日志。
+fn frame_shaped_candidate<'a>(
+    candidates: &'a [(FrameLocation, LocateDiagnostics)],
+    w: i32,
+    h: i32,
+) -> Option<&'a FrameLocation> {
+    let (wf, hf) = (w as f64, h as f64);
+    candidates
+        .iter()
+        .find(|(loc, _)| {
+            loc.tl.center_x < 0.2 * wf
+                && loc.tl.center_y < 0.2 * hf
+                && loc.tr.center_x > 0.8 * wf
+                && loc.tr.center_y < 0.2 * hf
+                && loc.bl.center_x < 0.2 * wf
+                && loc.bl.center_y > 0.8 * hf
+        })
+        .map(|(loc, _)| loc)
+}
+
+/// 把截屏导出为 PGM（灰度）供离线分析
+///
+/// 仅当环境变量 `OPTRANS_DUMP_SCREEN` 指定路径且该文件尚不存在时写一次，
+/// 避免反复覆盖。灰度即可——解码管线只依赖亮度。
+fn maybe_dump_screen(pixels: &[u8], w: i32, h: i32, want: bool) {
+    if !want {
+        return;
+    }
+    let Ok(path) = std::env::var("OPTRANS_DUMP_SCREEN") else {
+        return;
+    };
+    if path.is_empty() || std::path::Path::new(&path).exists() {
+        return;
+    }
+    use std::io::Write;
+    let Ok(mut file) = std::fs::File::create(&path) else {
+        warn!("无法创建截屏导出文件: {}", path);
+        return;
+    };
+    if write!(file, "P5\n{} {}\n255\n", w, h).is_err() {
+        warn!("截屏导出失败: {}", path);
+        return;
+    }
+    let mut row = Vec::with_capacity(w as usize);
+    for y in 0..h {
+        row.clear();
+        for x in 0..w {
+            let idx = ((y as usize * w as usize) + x as usize) * 4;
+            let lum = (pixels[idx] as u32 * 299
+                + pixels[idx + 1] as u32 * 587
+                + pixels[idx + 2] as u32 * 114)
+                / 1000;
+            row.push(lum as u8);
+        }
+        if file.write_all(&row).is_err() {
+            warn!("截屏导出失败: {}", path);
+            return;
+        }
+    }
+    warn!("截屏已导出（离线分析用）: {} ({}x{})", path, w, h);
 }
 
 /// 长时间未检测到发送端信号时输出诊断提示（节流：每 10 秒一次）
-fn warn_no_signal(start: std::time::Instant, last_warn: &mut Option<std::time::Instant>) {
+fn warn_no_signal(start: std::time::Instant, last_warn: &mut Option<std::time::Instant>, diag: &str) {
     let elapsed = start.elapsed();
     if elapsed.as_secs() < 10 {
         return;
@@ -275,10 +346,11 @@ fn warn_no_signal(start: std::time::Instant, last_warn: &mut Option<std::time::I
     }
     *last_warn = Some(std::time::Instant::now());
     warn!(
-        "已等待 {}s 未检测到发送端信号。请确认: ① 发送端窗口可见且未被遮挡; \
+        "已等待 {}s 未检测到发送端信号。[{}] 请确认: ① 发送端窗口可见且未被遮挡; \
          ② 多显示器环境下发送端帧所在屏幕在接收端可见; \
          ③ 远程桌面窗口缩放比例未导致图案严重失真",
-        elapsed.as_secs()
+        elapsed.as_secs(),
+        diag
     );
 }
 
@@ -299,14 +371,27 @@ fn run_capture_loop(
             return Ok(());
         }
 
-        let Some((pixels, img_w, img_h, candidates, is_virtual)) = scan_frame() else {
-            warn_no_signal(scan_start, &mut last_warn);
-            continue;
+        let (pixels, img_w, img_h, candidates, is_virtual) = match scan_frame() {
+            Ok(v) => v,
+            Err(diag) => {
+                warn_no_signal(scan_start, &mut last_warn, &diag);
+                continue;
+            }
         };
 
         let pixels_arc = Arc::new(pixels);
         let mut found = false;
-        for (loc, _) in &candidates {
+        let mut fmt_ok = 0usize;
+        let mut meta_seen = 0usize;
+        let mut payload_fail = 0usize;
+        // 原点微扫预算：每次扫描最多对 2 个 Meta 候选做微扫（49 次 RS 尝试/个）
+        let mut sweep_left = 2u32;
+        let mut sweep_fail = 0usize;
+        let mut probes: Vec<String> = Vec::new();
+        // 见到「合理 Meta 载荷长度」说明真帧就在屏上，此刻导出截图最有诊断价值
+        let mut saw_plausible_meta = false;
+
+        for (idx, (loc, _)) in candidates.iter().enumerate() {
             // 二维几何精修（v0.30）：小模块量化误差会让定位出的
             // modules_w/modules_h 漂移 ±15 模块，格式 CRC 全部失败；
             // 以格式信息 CRC 为裁决信号搜索正确几何，Meta 小载荷帧也能锁定。
@@ -315,35 +400,140 @@ fn run_capture_loop(
             else {
                 continue;
             };
+            fmt_ok += 1;
             if info.frame_type != FrameType::Meta {
                 continue;
             }
-            if let Ok(frame) = decode_frame(&pixels_arc, img_w, img_h, &refined_loc, &EncodingMode::Auto) {
-                if !frame.payload.is_empty() {
-                    if refined_loc.modules_w != loc.modules_w
-                        || refined_loc.modules_h != loc.modules_h
-                    {
-                        info!(
-                            "几何精修: {}x{} → {}x{}（模块尺寸量化误差修正）",
-                            loc.modules_w,
-                            loc.modules_h,
-                            refined_loc.modules_w,
-                            refined_loc.modules_h
-                        );
+            meta_seen += 1;
+            if info.payload_bytes > 0 && info.payload_bytes < 8192 {
+                saw_plausible_meta = true;
+            }
+
+            let mut decoded: Option<(FrameLocation, DecodedFrame)> = None;
+            match decode_frame(&pixels_arc, img_w, img_h, &refined_loc, &EncodingMode::Auto) {
+                Ok(frame) if !frame.payload.is_empty() => {
+                    decoded = Some((refined_loc.clone(), frame));
+                }
+                Ok(_) => {
+                    payload_fail += 1;
+                    if probes.len() < 3 {
+                        probes.push(format!(
+                            "#{} {}x{} pb={} => 载荷为空",
+                            idx, refined_loc.modules_w, refined_loc.modules_h, info.payload_bytes
+                        ));
                     }
-                    info!("编码模式: {:?}", frame.encoding_mode);
-                    let _ = tx.send(frame);
-                    meta_loc = Some(refined_loc);
-                    use_virtual_desktop = is_virtual;
-                    found = true;
-                    break;
+                }
+                Err(e) => {
+                    payload_fail += 1;
+                    if probes.len() < 3 {
+                        probes.push(format!(
+                            "#{} {}x{} pb={} ms={:.1} tl=({:.0},{:.0}) tr=({:.0},{:.0}) \
+                             bl=({:.0},{:.0}) => {}",
+                            idx,
+                            refined_loc.modules_w,
+                            refined_loc.modules_h,
+                            info.payload_bytes,
+                            loc.tl.module_size,
+                            loc.tl.center_x,
+                            loc.tl.center_y,
+                            loc.tr.center_x,
+                            loc.tr.center_y,
+                            loc.bl.center_x,
+                            loc.bl.center_y,
+                            e
+                        ));
+                    }
+                    // 兜底：格式 CRC 通过但载荷全错，通常是采样原点（TL 中心）
+                    // 偏半个模块——格式区锚定 BL 不受影响，数据区从顶部起算则全错。
+                    // 以载荷 RS 校验裁决做小步平移搜索。
+                    if sweep_left > 0 && info.payload_bytes > 0 && info.payload_bytes < 8192 {
+                        sweep_left -= 1;
+                        if let Some((swept_loc, frame)) =
+                            decode_meta_origin_sweep(&pixels_arc, img_w, img_h, &refined_loc, &info)
+                        {
+                            info!(
+                                "✓ 采样原点微调成功 (dx={:.1}px, dy={:.1}px)",
+                                swept_loc.tl.center_x - refined_loc.tl.center_x,
+                                swept_loc.tl.center_y - refined_loc.tl.center_y
+                            );
+                            decoded = Some((swept_loc, frame));
+                        } else {
+                            sweep_fail += 1;
+                        }
+                    }
                 }
             }
+
+            let Some((final_loc, frame)) = decoded else {
+                continue;
+            };
+
+            if final_loc.modules_w != loc.modules_w || final_loc.modules_h != loc.modules_h {
+                info!(
+                    "几何精修: {}x{} → {}x{}（模块尺寸量化误差修正）",
+                    loc.modules_w, loc.modules_h, final_loc.modules_w, final_loc.modules_h
+                );
+            }
+            info!("编码模式: {:?}", frame.encoding_mode);
+            let _ = tx.send(frame);
+            meta_loc = Some(final_loc);
+            use_virtual_desktop = is_virtual;
+            found = true;
+            break;
         }
         if found {
             info!("✓ Meta 帧解析成功，位置已锁定");
             break;
         }
+        // 有候选但解码失败：输出各阶段计数+候选详情（节流），不再静默重试。
+        // 导出时机：屏上出现整屏帧形状、见到合理载荷长度，或等待 25s 兜底。
+        let corner_frame = frame_shaped_candidate(&candidates, img_w, img_h);
+        let want_dump = saw_plausible_meta
+            || corner_frame.is_some()
+            || scan_start.elapsed().as_secs() >= 25;
+        maybe_dump_screen(&pixels_arc, img_w, img_h, want_dump);
+        let mut diag = format!(
+            "Meta 解码失败: 三角候选={}{}, 格式CRC通过={}, 其中Meta={}, 载荷校验失败={}, 原点微扫失败={}",
+            candidates.len(),
+            if candidates.len() >= crate::decoder::locate::MAX_CANDIDATES {
+                "(已截断)"
+            } else {
+                ""
+            },
+            fmt_ok,
+            meta_seen,
+            payload_fail,
+            sweep_fail
+        );
+        if !probes.is_empty() {
+            diag.push_str(" | ");
+            diag.push_str(&probes.join(" | "));
+        }
+        // 帧形候选（贴着三个角的大三角）单独诊断：它的格式解码结果决定
+        // 是「格式区采样偏」还是「真帧根本不在候选列表里」
+        if let Some(cf) = corner_frame {
+            let desc = match decode_format_info(&pixels_arc, img_w, img_h, cf) {
+                Ok(i) => format!(
+                    "{:?} seq={} pb={}",
+                    i.frame_type, i.frame_sequence, i.payload_bytes
+                ),
+                Err(e) => e.to_string(),
+            };
+            diag.push_str(&format!(
+                " | 帧形候选 {}x{} ms={:.2} tl=({:.0},{:.0}) tr=({:.0},{:.0}) bl=({:.0},{:.0}) 格式=> {}",
+                cf.modules_w,
+                cf.modules_h,
+                cf.tl.module_size,
+                cf.tl.center_x,
+                cf.tl.center_y,
+                cf.tr.center_x,
+                cf.tr.center_y,
+                cf.bl.center_x,
+                cf.bl.center_y,
+                desc
+            ));
+        }
+        warn_no_signal(scan_start, &mut last_warn, &diag);
     }
     let mut loc = meta_loc.unwrap();
     if use_virtual_desktop {

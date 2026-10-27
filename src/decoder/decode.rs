@@ -143,20 +143,32 @@ fn vote_and_check(raw_bits: &[u8], repetitions: usize) -> OptransResult<FormatIn
     );
 
     let crc_computed = crc16_xmodem(data_part);
+    // 假帧判定必须在 CRC 比较之前：CRC-16/XMODEM 对全零输入的校验值就是 0，
+    // 若先判断「计算值 != 收到值」再查全0/全1，全零数据会因 0 == 0 而放行，
+    // 解包成 Meta(0) + seq=0 + pb=0 的假帧（屏幕大片暗区的实测症状）。
+    if crc_received == 0x0000 || crc_received == 0xFFFF {
+        return Err(OptransError::InvalidFormatInfo(format!(
+            "假帧: CRC 全0/全1 (收到 0x{:04X})，定位到空白区域",
+            crc_received
+        )));
+    }
     if crc_computed != crc_received {
-        if crc_received == 0x0000 || crc_received == 0xFFFF {
-            return Err(OptransError::InvalidFormatInfo(format!(
-                "假帧: CRC 全0/全1 (收到 0x{:04X})，定位到空白区域",
-                crc_received
-            )));
-        }
         return Err(OptransError::InvalidFormatInfo(format!(
             "CRC 校验失败: 计算 0x{:04X}, 收到 0x{:04X}",
             crc_computed, crc_received
         )));
     }
 
-    unpack_format_info(data_part)
+    let info = unpack_format_info(data_part)?;
+    // 语义校验：除 EOT 外，合法帧的载荷必然非空（Meta 至少含文件名字段，
+    // Data/FecParity 至少含块头或分片）。CRC 偶然通过的全零/低熵假帧在此拦下。
+    if info.frame_type != FrameType::EOT && info.payload_bytes == 0 {
+        return Err(OptransError::InvalidFormatInfo(format!(
+            "假帧: {:?} 帧载荷长度为 0",
+            info.frame_type
+        )));
+    }
+    Ok(info)
 }
 
 /// 生成整体平移后的 FrameLocation（不依赖 Clone，逐字段构造）
@@ -244,8 +256,13 @@ pub fn decode_format_info_with_geometry(
     img_height: i32,
     loc: &FrameLocation,
 ) -> Option<(FormatInfo, FrameLocation)> {
-    if let Ok(info) = decode_format_info(pixels, img_width, img_height, loc) {
-        return Some((info, loc.clone()));
+    match decode_format_info(pixels, img_width, img_height, loc) {
+        Ok(info) => return Some((info, loc.clone())),
+        // 空白区域（全黑/全白）无论 modules_w 怎么调都是空白，搜索纯属浪费。
+        // 实测高噪声桌面下单次扫描有上百个此类候选，几何搜索可占 90% 扫描耗时，
+        // 而 Meta 帧仅在屏 100ms——扫描慢了直接错过真帧。
+        Err(e) if is_blank_region_error(&e) => return None,
+        Err(_) => {}
     }
     // 过小候选不可能是真帧（真实传输帧 ≥100 模块宽），无精修价值
     if loc.modules_w < 100 {
@@ -267,7 +284,15 @@ pub fn decode_format_info_with_geometry(
     None
 }
 
+/// 是否为「空白区域」类错误（全黑/全白采样），此类失败调几何无用
+fn is_blank_region_error(e: &OptransError) -> bool {
+    matches!(e, OptransError::InvalidFormatInfo(m) if m.starts_with("假帧"))
+}
+
 /// 廉价格式信息解码（无降级重试），供几何搜索批量裁决使用
+///
+/// 单点采样（radius=0）：比 3×3 快约 9 倍。几何搜索每候选最多上百次提取，
+/// 必须用最廉价的模式；命中后的载荷由 RS 校验兜底裁决，不会因单点采样引入误判。
 fn decode_format_info_fast(
     pixels: &[u8],
     img_width: i32,
@@ -275,7 +300,7 @@ fn decode_format_info_fast(
     loc: &FrameLocation,
 ) -> OptransResult<FormatInfo> {
     let raw_bits =
-        extract::extract_format_modules_with_radius(pixels, img_width, img_height, loc, 1);
+        extract::extract_format_modules_with_radius(pixels, img_width, img_height, loc, 0);
     let (repetitions, min_bits) = format_info_params(loc.modules_w);
     if raw_bits.len() < min_bits {
         return Err(OptransError::InvalidFormatInfo(format!(
@@ -571,6 +596,75 @@ pub fn decode_frame(
     })
 }
 
+/// 平移三个 finder 中心（整体平移采样原点）
+fn shift_finders(loc: &FrameLocation, dx: f64, dy: f64) -> FrameLocation {
+    let mut shifted = loc.clone();
+    shifted.tl.center_x += dx;
+    shifted.tl.center_y += dy;
+    shifted.tr.center_x += dx;
+    shifted.tr.center_y += dy;
+    shifted.bl.center_x += dx;
+    shifted.bl.center_y += dy;
+    shifted
+}
+
+/// Meta 帧采样原点微扫（兜底）
+///
+/// 格式信息锚定在帧底部两行（采样位置由 BL finder 决定），其 CRC 对 TL/TR
+/// 的中心误差不敏感；而数据载荷从帧顶部开始，采样网格原点就是 TL 中心。
+/// 远程缩放/模糊下 TL 中心可能偏半个模块，表现为「格式 CRC 通过、载荷 RS
+/// 全部超出纠错能力」——此时整帧被丢弃，Meta 帧因此永远解不出。
+///
+/// 本函数以初始位置为中心做小步平移搜索（±0.6 模块，步长 0.2），由载荷的
+/// RS 校验裁决（255 字节块可纠 19 字节，误判概率可忽略）。仅用于 Meta 帧：
+/// 载荷小（< 8KB），单次尝试只解一个 RS 块，代价可接受。
+///
+/// 返回 `Some((修正后的位置, 解码帧))`。
+pub fn decode_meta_origin_sweep(
+    pixels: &[u8],
+    img_width: i32,
+    img_height: i32,
+    loc: &FrameLocation,
+    info: &FormatInfo,
+) -> Option<(FrameLocation, DecodedFrame)> {
+    if info.payload_bytes == 0 {
+        return None;
+    }
+    let mode = detect_encoding_mode(info);
+    let ms = loc.tl.module_size.max(1.0);
+    const FRACS: [f64; 7] = [-0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6];
+
+    for &fx in &FRACS {
+        for &fy in &FRACS {
+            // 零偏移由调用方的常规解码路径覆盖
+            if fx == 0.0 && fy == 0.0 {
+                continue;
+            }
+            let cand = shift_finders(loc, fx * ms, fy * ms);
+            let Ok(payload) =
+                decode_payload_at(pixels, img_width, img_height, &cand, info, &mode)
+            else {
+                continue;
+            };
+            if payload.is_empty() {
+                continue;
+            }
+            return Some((
+                cand,
+                DecodedFrame {
+                    frame_type: info.frame_type,
+                    frame_sequence: info.frame_sequence,
+                    block_index: info.block_index,
+                    total_blocks: info.total_blocks,
+                    payload,
+                    encoding_mode: mode,
+                },
+            ));
+        }
+    }
+    None
+}
+
 /// 从解码后的元数据帧载荷中解析 MetaPayload
 pub fn parse_meta_payload(payload: &[u8]) -> OptransResult<MetaPayload> {
     if payload.is_empty() {
@@ -710,6 +804,54 @@ fn unpack_format_info(data: &[u8]) -> OptransResult<FormatInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_all_zero_format_bits_rejected() {
+        // 全零格式比特（屏幕大片暗区/纯色区的典型采样）。
+        // 回归：CRC-16/XMODEM 对全零数据的校验值是 0，与「收到 0」相等，
+        // 旧实现先比较 CRC 再查全0，导致解包成 Meta(0)+seq=0+pb=0 的假帧并放行。
+        let raw_bits = vec![0u8; 600];
+        let err = vote_and_check(&raw_bits, 5).unwrap_err();
+        assert!(
+            is_blank_region_error(&err),
+            "全零格式比特应被判为假帧: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_zero_payload_meta_rejected() {
+        // 构造 type=Meta、seq=1、payload_bytes=0、其余为 0 且 CRC 正确的格式信息：
+        // 真实发送端不会产生该组合（Meta 必含文件名等字段），应判为假帧。
+        let mut val: u128 = 0;
+        val |= 1u128 << 2; // seq=1，type 保持 Meta(0)
+        let mut data = [0u8; 13];
+        for i in 0..13 {
+            data[i] = ((val >> (i * 8)) & 0xFF) as u8;
+        }
+        let crc = crc16_xmodem(&data);
+        assert_ne!(crc, 0, "该构造的 CRC 应非零，才能触发语义校验分支");
+
+        let mut bytes = [0u8; 15];
+        bytes[..13].copy_from_slice(&data);
+        bytes[13..].copy_from_slice(&crc.to_le_bytes());
+
+        // 15 字节 → 120 bits，重复 5 份拆分
+        let mut raw_bits = Vec::with_capacity(600);
+        for _ in 0..5 {
+            for b in bytes {
+                for bit in 0..8 {
+                    raw_bits.push((b >> bit) & 1);
+                }
+            }
+        }
+        let err = vote_and_check(&raw_bits, 5).unwrap_err();
+        assert!(
+            is_blank_region_error(&err),
+            "载荷长度为 0 的 Meta 应判为假帧: {}",
+            err
+        );
+    }
 
     #[test]
     fn test_unpack_format_info_roundtrip() {

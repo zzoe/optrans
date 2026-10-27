@@ -93,10 +93,9 @@ fn frame_capacity_for_modules(
 
 /// 执行发送操作的主入口（仅 Windows：发送端需要全屏置顶窗口）
 #[cfg(target_os = "windows")]
-pub fn run_send(path: PathBuf) -> OptransResult<()> {
+pub fn run_send(path: PathBuf, gray_levels: u32) -> OptransResult<()> {
     let module_pixels = constants::MODULE_PIXELS_DEFAULT;
     let interval_ms = constants::FRAME_INTERVAL_MS;
-    let gray_levels = constants::GRAY_LEVELS_DEFAULT;
     let frame_margin = constants::FRAME_MARGIN_PX_DEFAULT;
     let enable_heartbeat = true;
 
@@ -355,7 +354,7 @@ pub fn run_send(path: PathBuf) -> OptransResult<()> {
 
 /// 发送端存根：非 Windows 平台不支持发送（需要全屏置顶窗口）
 #[cfg(not(target_os = "windows"))]
-pub fn run_send(_path: PathBuf) -> OptransResult<()> {
+pub fn run_send(_path: PathBuf, _gray_levels: u32) -> OptransResult<()> {
     Err(OptransError::UnsupportedPlatform(
         "发送端需要全屏置顶窗口，仅支持 Windows；请在 Windows 主机上执行 send",
     ))

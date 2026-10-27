@@ -1,7 +1,8 @@
 //! CLI 参数定义
 //!
 //! 用户仅需指定 send/receive + 文件路径。
-//! 所有调优参数（模块像素、帧间隔、灰度级数等）均为程序内部常量。
+//! 大多数调优参数（模块像素、帧间隔等）为程序内部常量；
+//! 灰度级数可按显示链路质量调整（`send --gray-levels`）。
 
 use clap::{Parser, Subcommand};
 
@@ -19,6 +20,10 @@ pub enum Command {
     Send {
         /// 待发送的文件路径
         path: std::path::PathBuf,
+        /// 灰度级数（2/4/8/16）。经远程桌面/视频编码传输时建议 4 或 2：
+        /// 16 级的级距仅 17，编码噪声会把级簇完全抹平，接收端无法恢复。
+        #[arg(long, default_value_t = crate::common::constants::GRAY_LEVELS_DEFAULT)]
+        gray_levels: u32,
     },
     /// 接收文件：从全屏截取视觉帧并解码复原文件
     Receive {

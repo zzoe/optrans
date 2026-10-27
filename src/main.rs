@@ -20,16 +20,16 @@ fn main() -> OptransResult<()> {
     let cmd = cli::parse_command();
 
     match cmd {
-        Command::Send { path } => {
+        Command::Send { path, gray_levels } => {
             validate_module_pixels(constants::MODULE_PIXELS_DEFAULT)?;
             info!("发送模式");
             info!("  文件: {:?}", path);
             info!("  模块像素: {}", constants::MODULE_PIXELS_DEFAULT);
             info!("  帧间隔: {}ms", constants::FRAME_INTERVAL_MS);
             info!("  帧边距: {}px", constants::FRAME_MARGIN_PX_DEFAULT);
-            info!("  灰度级数: {}", constants::GRAY_LEVELS_DEFAULT);
+            info!("  灰度级数: {}", gray_levels);
             info!("  心跳: 启用");
-            optrans::sender::transmit::run_send(path)
+            optrans::sender::transmit::run_send(path, gray_levels)
         }
         Command::Receive { output } => {
             validate_module_pixels(constants::MODULE_PIXELS_DEFAULT)?;
