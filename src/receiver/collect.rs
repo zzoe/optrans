@@ -258,6 +258,25 @@ impl FrameCollector {
                 shards.push(shard.cloned());
             }
 
+            // 诊断：重建要求「实际收到的数据块 + 校验分片 ≥ 本组数据块数」。
+            // 不足 k 的组会用零分片补齐（发送端也是零分片编码），这些零分片
+            // 计入 FecDecoder 的 present——直接透传会打出
+            // 「已收到 126 分片，至少需要 128」这种自相矛盾的数字
+            // （实测：2 块的小文件两块全丢、校验帧全丢时就是这样）。
+            let group_len = group_end - group_start;
+            let received_data = (group_start..group_end)
+                .filter(|i| self.data_blocks.contains_key(&(*i as u32)))
+                .count();
+            let received_parity = (0..m)
+                .filter(|p| self.parity_shards.contains_key(&(g as u16, *p as u16)))
+                .count();
+            if received_data + received_parity < group_len {
+                return Err(OptransError::FrameDecode(format!(
+                    "FEC 恢复组 {} 失败: 已收到数据块 {}/{}、校验分片 {}/{}，至少需要 {} 个可用分片",
+                    g, received_data, group_len, received_parity, m, group_len
+                )));
+            }
+
             // RS 解码恢复
             let recovered = match decoder.reconstruct_data(&mut shards) {
                 Ok(data) => data,
